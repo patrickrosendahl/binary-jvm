@@ -7,10 +7,19 @@ reference. Read both before starting.
 ## What this is
 
 A Binary Ninja **Architecture + BinaryView** plugin for Java `.class` bytecode — a **Python 3
-port** of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD). Single source file: `jvm.py`
-(~1560 lines); `__init__.py` just does `from .jvm import *`; `plugin.json` is the manifest.
-The upstream was Python-2-only. First-pass port is done (compiles under py3); it still needs
-to be loaded and validated inside Binary Ninja — see README TODO #1.
+port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD). The repo root
+*is* the plugin package (loaded by BN as package `binary-jvm`, relative imports only):
+
+| file | contents |
+| --- | --- |
+| `__init__.py` | registers architecture + calling convention + view |
+| `constants.py` | `ARCH_NAME`/`VIEW_NAME`, address layout (method bases, pool pseudo-memory `0xF0000000+idx*8`, `NUM_LOCAL_REGS`) |
+| `opcodes.py` | opcode tables, `decode_instruction`, descriptor helpers — **pure Python, no BN import** |
+| `classfile.py` | class-file parser (builds BN struct types), `JVMClassReader` (pool lookups), reader registry keyed by view handle |
+| `lifter.py` | LLIL lifting for every opcode (`InstructionIL`), intrinsics list |
+| `arch.py` | `JVM` Architecture (info/text/IL callbacks), registers, `JVMCallingConvention` |
+| `view.py` | `ClassView` (segments/functions per method, catch handlers, pool symbols, static-field data vars, switch comments) |
+| `plugin.json` | manifest |
 
 ## Environment (this machine)
 
@@ -38,14 +47,25 @@ to be loaded and validated inside Binary Ninja — see README TODO #1.
   types, registering architectures, poking the view during `init`), use the `bnrun` bridge for
   the full Python API inside the app.
 
-## Installing / reloading the plugin for a test
+## Testing workflow (fast → slow)
 
+1. **Offline check first** (no BN, ~1 s): `python3 tests/offline_lift_check.py` stubs `binaryninja`,
+   parses `mdg.jar`, decodes + lifts every instruction into a mock IL and checks decode tiling,
+   no `unimplemented`, and the per-instruction stack effect against an independent table.
+   `--all` runs every jar under `sample/` in parallel (≈47k classes, 11.6M instructions).
+2. **Live in BN without restart**: `bnrun tests/bn_dev_load.py` copies the package to
+   `/tmp/jvm_devN/`, renames arch/view to `JVM-devN` / `JVM Class devN` and registers them
+   (BN cannot unregister types, so every reload needs fresh names; older dev views are disabled).
+   Then `bnrun tests/bn_batch_check.py` (20 classes from `sample/extracted/` by default, per-class
+   timing). Views created this way are in-process but **not UI tabs**.
+3. ⚠️ **bnrun scripts cannot be interrupted** and run one at a time — a long batch blocks the bridge
+   (and every later bnrun/MCP call) until it finishes. Keep scripts small; take the usage lock.
+
+### Installing for real
 ```bash
 ln -s /Users/patrick/dev/binary-jvm "$HOME/Library/Application Support/Binary Ninja/plugins/binary-jvm"
 ```
-Then restart Binary Ninja (plugin registration — `JVM.register()` / `ClassView.register()` at
-import — happens once at startup; a reload of just the Python plugin is unreliable for
-architecture/view registration, so prefer a full restart after editing `jvm.py`).
+Then restart Binary Ninja (architecture/view registration happens once at startup).
 
 ## Samples
 
@@ -60,12 +80,12 @@ Start with a small standalone `.class` before throwing a big JAR at it.
 - **Downloaded external documentation goes in `docs/`** (e.g. `docs/java_opcodes.md`,
   `docs/references.md`) — not in chat or a scratch dir. When you fetch a spec page, save it
   there and link it from `docs/references.md`.
-- When editing `jvm.py`, grep the installed API source (path above) to confirm a signature
+- When editing the plugin, grep the installed API source (path above) to confirm a signature
   rather than assuming — the port already relies on several APIs being unchanged from the py2
   era; verify before adding new calls.
 - Keep the single-`.class` load path working as you add JAR support.
-- **Patching is explicitly out of scope** (README TODO #4) — don't invest in the
-  nop/branch-invert/assemble paths; they can be deleted.
+- **Patching is explicitly out of scope** (README TODO #4) — the nop/branch-invert/assemble
+  paths have been removed; don't re-add them.
 
 ## Git / remote
 

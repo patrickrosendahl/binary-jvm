@@ -11,10 +11,12 @@ This is a **Python 3 port** of [`Pusty/BinaryNinjaPlugins` → `binary-jvm`](htt
 
 ## Status
 
-**First-pass Python 3 conversion done** — `jvm.py` compiles under Python 3.12 and all the
-hard Python-2-only constructs (`str` vs `bytes` in the patch/assemble paths, `data[0]` being
-an `int`, the tuple return from `assemble`) are fixed. **It has not yet been loaded/tested
-inside Binary Ninja 6.1** — that is TODO #1.
+**Python 3 port done; lifter rewritten — every JVM opcode lifts to LLIL.** Tested live in
+Binary Ninja 6.1 (via the script bridge, dev-registered names) against ActiveTrader classes:
+methods decompile to Java-like HLIL (calls, string constants, static fields, switches,
+try/catch handlers). Offline, the decoder + lifter pass over the whole sample (≈47k classes,
+11.6M instructions) with no decode failures, no `unimplemented`, and per-instruction stack
+effects matching an independent table. Not yet installed as the real (non-dev) plugin + restart.
 
 See the roadmap below. **This README is the source of truth for the TODO list.**
 
@@ -30,7 +32,8 @@ ln -s "$(pwd)" ~/Library/Application\ Support/Binary\ Ninja/plugins/binary-jvm
 # Windows: %APPDATA%\Binary Ninja\plugins\binary-jvm
 ```
 
-Only `__init__.py`, `jvm.py`, `plugin.json` need to be on that path. Restart Binary Ninja (or
+The repo root is the plugin package (`__init__.py`, `constants.py`, `opcodes.py`,
+`classfile.py`, `lifter.py`, `arch.py`, `view.py`, `plugin.json`). Restart Binary Ninja (or
 reload plugins). Open a `.class` file → it should be recognized as **JVM Class Format**.
 
 ---
@@ -53,25 +56,33 @@ reload plugins). Open a `.class` file → it should be recognized as **JVM Class
       `JVMStructure.resultingType()`'s type-dedup using `itype.structure(...).members` — the
       `Type.structure` accessor shape may need a tweak; test and adjust.)
 
-### 2. Audit & expand opcode / IL coverage ⬜
-Of **202 named opcodes, ~50 fall through to `il.unimplemented()`** — including the ones that
-matter most for readable output:
-- **All conditional branches** (`ifeq/ifne/iflt/ifge/ifgt/ifle`, `if_icmp*`, `if_acmp*`,
-  `ifnull/ifnonnull`) — only `if_icmpne`/`if_icmpge` are lifted today.
-- **All method calls** (`invokevirtual/special/static/interface/dynamic`).
-- **Returns** except `ireturn` (`lreturn/freturn/dreturn/areturn/return`).
-- **Object/field ops**: `new`, `newarray`, `anewarray`, `getstatic/putstatic`,
-  `getfield/putfield`, `arraylength`, `athrow`, `checkcast`, `instanceof`.
-- **`tableswitch`/`lookupswitch`** (decoded, but lifted as indirect only).
-- **Comparisons** `lcmp`, `fcmpl/fcmpg`, `dcmpl/dcmpg`; `jsr/ret` (legacy).
+### 2. Opcode / IL coverage ✅ (lifter rewrite done — tickets jvm-2…jvm-11)
+All 202 opcodes decode, render and lift; nothing falls through to `unimplemented`.
+Design (see `lifter.py` / `arch.py`):
+- **Locals are registers** `l<n>` (8 bytes) / `l<n>_lo` (low 4 bytes) for slots 0–63 (covers
+  >99.9% of methods; higher `wide` slots fall back to pseudo memory at `0x8000`). The calling
+  convention passes arguments in `l0_lo…`, so methods get real parameter lists; returns go in
+  `r` (`rh:r` for long/double).
+- **Operand stack** is the real stack (`s`), 4-byte slots, long/double take two; operands are
+  popped into LLIL temps first (correct operand order; pops inside `if` conditions are avoided
+  because BN's stack analysis doesn't see them).
+- **Intrinsics** for `invoke*` (callee pool entry + receiver + args, arg/return sizes from the
+  descriptor), `getfield/putfield`, `new`, `*newarray`, `arraylength`, `checkcast`,
+  `instanceof`, `monitor*`, `athrow`, `fmod` (`frem/drem`).
+- **Static fields** are loads/stores of typed data vars at the pool pseudo-address
+  `0xF0000000 + idx*8`; `ldc` of int/float/long/double pushes the actual constant, strings/classes
+  push a pointer to the pool symbol (renders as `&"text"`).
+- **Branches** use labels / `jump(const)`; `tableswitch`/`lookupswitch` lift as compare chains
+  (BN recovers `switch` statements). `jsr` is a call that pops its pushed return address,
+  `ret` returns through the local. **Catch handlers** become their own functions
+  (`<method>$catch_<pc>`); tail-call translation is disabled per view so shared code isn't
+  turned into bogus tail calls.
+- Decoder fixes: switch padding (relative to the 4-byte-aligned method base) and signed
+  keys, `wide iinc` length, MethodHandle `reference_kind` u1, pool tags 17/19/20.
 
-Also review the **existing** lifts — several are known-suspect and should be checked against
-`docs/java_opcodes.md` / the JVM spec, e.g. `ineg/lneg/fneg/dneg` pass two operands to a unary
-negate, `ior/ lxor/ixor` use width 8 for 32-bit ops, and `lload_1/_2/_3` (and the `l/d`
-store/load aliases) index by `1/2/4/8` rather than the logical slot number.
-
-Ground truth: **`docs/java_opcodes.md`** (operand layout + stack effects) and the JVM spec
-(`docs/references.md`).
+Known cosmetic gaps: `lcmp`/`fcmp*`/`dcmp*` render as bool arithmetic
+(`(a > b ? 1 : 0) - (a < b ? 1 : 0) <= 0`); a stack slot reused for a ref and then a long gives
+`var.q` accessors; `jsr` subroutines show as `sub_…` calls with the return address argument.
 
 ### 3. JAR support ⬜ (design + implement)
 `.jar` = a ZIP of `.class` entries. A `.class`-only loader can't open them directly.
@@ -85,11 +96,9 @@ Decide and build a good story — options to weigh:
   user add more.
 Also handle nested resources and the manifest. Keep the single-`.class` path working.
 
-### 4. Patching — **NOT a goal** ⬜ (can be removed)
-Per project decision, interactive patching is out of scope. The ported
-`convert_to_nop`/`invert_branch`/`always_branch`/`is_*_patch_available` methods are harmless
-but unnecessary; feel free to delete them to shrink the surface. `assemble()` is only needed
-if we keep any patch/assemble UI — otherwise it can go too.
+### 4. Patching — **NOT a goal** ✅ (removed)
+Per project decision, interactive patching is out of scope; the ported
+`convert_to_nop`/`invert_branch`/`always_branch`/`assemble` paths have been deleted.
 
 ### 5. Analysis DB (`.bndb`) must persist renames + notes ⬜
 Requirement: a user renaming a function/symbol/variable and adding **comments/notes** must
