@@ -70,7 +70,8 @@ class MockIL:
 class Data:
     def __init__(self, b): self.b = b
     def read(self, off, n): return self.b[off:off+n]
-    def __len__(self): return len(self.b)
+    @property
+    def length(self): return len(self.b)  # like BinaryView: .length, no __len__
 
 # ---- independent stack-effect table (slots) ------------------------------------------------------
 EFFECT = {}

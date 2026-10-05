@@ -698,7 +698,7 @@ class JVMClassStructure(JVMStructure):
 class JVMClassReader():
     def __init__(self,vi,da):
         self.view = vi
-        self.data = da.read(0, len(da)) # read the file once; per-field reads through the view are slow
+        self.data = da.read(0, da.length) # read the file once; per-field reads through the view are slow
         self.idx = 0    
         self.classStruct = None
         self.constantPool = None
