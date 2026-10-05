@@ -5,7 +5,7 @@
 # undetermined or whose HLIL fails (set CHECK_LLIL = True to also scan LLIL for `unimplemented`).
 import os, time
 import binaryninja as b
-CLASS_DIR = globals().get("CLASS_DIR", "/Users/patrick/dev/binary-jvm/sample/extracted")
+CLASS_DIR = globals().get("CLASS_DIR", "/Users/patrick/dev/binary-jvm/sample/ActiveTraderDE_app/Contents/WorkingDir/current/lib/mdg")
 LIMIT = globals().get("LIMIT", 20)
 CHECK_LLIL = globals().get("CHECK_LLIL", False)
 vt = b.BinaryViewType[b._jvm_dev["ns"]["VIEW_NAME"]]

@@ -67,7 +67,7 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
 2. **Live in BN without restart**: `bnrun tests/bn_dev_load.py` copies the package to
    `/tmp/jvm_devN/`, renames arch/view to `JVM-devN` / `JVM Class devN` and registers them
    (BN cannot unregister types, so every reload needs fresh names; older dev views are disabled).
-   Then `bnrun tests/bn_batch_check.py` (20 classes from `sample/extracted/` by default, per-class
+   Then `bnrun tests/bn_batch_check.py` (20 classes from `lib/mdg/` by default, per-class
    timing). Views created this way are in-process but **not UI tabs**.
 3. bnrun scripts run one at a time. Always pass **`--timeout N`**; a running script can be stopped
    with `bnrun --cancel` (or Ctrl-C on the client), `bnrun --status` shows what is running.
@@ -89,8 +89,10 @@ waits for the bridge). The symlink is in place since 2026-10-06.
 `sample/ActiveTraderDE_app/Contents/WorkingDir/current/lib/…` — real-world test bytecode for
 loader / opcode-coverage / JAR work. If missing, re-copy an ActiveTrader.app bundle there.
 Start with a small standalone `.class` before throwing a big JAR at it.
-Favourite target: **`lib/mdg.jar`** (341 classes), extracted to `sample/extracted/` for
-single-class loading (`unzip -o -q …/mdg.jar -d sample/extracted`).
+Favourite target: **`lib/mdg.jar`** (341 classes). **JAR unpack convention** (BN can't open `.jar`
+yet, jvm-13): unpack next to the JAR into a dir named like it — `mdg.jar` → `lib/mdg/`
+(`unzip -o -q mdg.jar -d mdg`) — and open the `.class` files from there. `sample/extracted/` is a
+legacy copy of mdg.jar.
 
 ## Conventions
 

@@ -178,13 +178,24 @@ def chunks(paths, size=200):
     if chunk:
         yield chunk
 
+def unpacked_jar_dir(d):
+    """True inside foo/ when foo.jar sits next to it (the unpack convention) -- those classes are
+    already checked via the jar. Also skips the legacy sample/extracted/."""
+    parts = os.path.normpath(d).split(os.sep)
+    if "extracted" in parts:
+        return True
+    for i in range(1, len(parts)):
+        if os.path.exists(os.sep.join(parts[:i+1]) + ".jar"):
+            return True
+    return False
+
 def main(args):
     sample = os.path.join(ROOT, "sample")
     if not args:
         args = [os.path.join(sample, "ActiveTraderDE_app/Contents/WorkingDir/current/lib/mdg.jar")]
     elif args == ["--all"]:
         args = sorted(os.path.join(d, f) for d, _, fs in os.walk(sample) for f in fs
-                      if f.endswith((".jar", ".class")) and "/extracted/" not in d + "/")
+                      if f.endswith((".jar", ".class")) and not unpacked_jar_dir(d))
     t0 = time.time()
     total = new_stats()
     with multiprocessing.Pool() as pool:

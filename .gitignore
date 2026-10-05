@@ -9,3 +9,6 @@ __pycache__/
 *.bndb
 .idea/
 .vscode/
+
+# agent worktrees (Claude Code)
+.claude/worktrees/
