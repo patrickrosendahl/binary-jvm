@@ -69,8 +69,10 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
    (BN cannot unregister types, so every reload needs fresh names; older dev views are disabled).
    Then `bnrun tests/bn_batch_check.py` (20 classes from `sample/extracted/` by default, per-class
    timing). Views created this way are in-process but **not UI tabs**.
-3. ⚠️ **bnrun scripts cannot be interrupted** and run one at a time — a long batch blocks the bridge
-   (and every later bnrun/MCP call) until it finishes. Keep scripts small; take the usage lock.
+3. bnrun scripts run one at a time. Always pass **`--timeout N`**; a running script can be stopped
+   with `bnrun --cancel` (or Ctrl-C on the client), `bnrun --status` shows what is running.
+   Cancellation lands between Python bytecodes — a long native call (`update_analysis_and_wait()`)
+   finishes first — so keep batches small and take the usage lock.
 
 ### Installing for real
 ```bash

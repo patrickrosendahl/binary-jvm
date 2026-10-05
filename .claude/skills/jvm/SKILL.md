@@ -29,9 +29,10 @@ Generic Binary Ninja mechanics (MCP tools, `bnrun` bridge, usage lock) are in th
 3. Real install: symlink the repo into the BN plugins dir and ask the user to restart BN.
 
 ## Gotchas (learned the hard way)
-- **bnrun scripts run one at a time and (without the bridge's cancellation feature) cannot be
-  stopped** — an interrupted client leaves the script running and later scripts queue. Keep live
-  scripts to a few classes; put long runs in background subagents.
+- **bnrun scripts run one at a time.** Always use `bnrun --timeout N …`; stop a runaway script with
+  `bnrun --cancel` (Ctrl-C on the client also cancels), check with `bnrun --status`. A long native
+  call (`update_analysis_and_wait()`) can't be cut short, so keep live batches to a few classes and
+  put long runs in background subagents.
 - `bn.load()` / MCP `bn_open_item_open` pick Raw (or pop a dialog in the GUI) for a view type
   registered after startup — use `BinaryViewType[name].create(BinaryView.open(path))`.
 - Views created through the bridge are in-process, **not UI tabs**; open in the GUI for visual checks.
