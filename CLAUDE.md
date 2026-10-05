@@ -4,6 +4,12 @@ Guidance for Claude Code working in this repo. **The task list / roadmap lives i
 [`README.md`](README.md)** ("Roadmap / TODO") — this file is the environment + how-to-work
 reference. Read both before starting.
 
+**Project tracking:** tickets live in minitick project **`jvm`** (`jvm-N`; CLI
+`/Users/patrick/dev/minitick/.venv/bin/minitick … -p jvm`), documentation in miniwiki project
+**`jvm`** (`miniwiki tree jvm`; `tickets/` there is a read-only mirror of minitick). There is no
+code reviewer: finished tickets go straight to **RESOLVED** with a verification comment. The
+project skill **`.claude/skills/jvm/SKILL.md`** summarises the workflow and gotchas — load it.
+
 ## What this is
 
 A Binary Ninja **Architecture + BinaryView** plugin for Java `.class` bytecode — a **Python 3
@@ -46,6 +52,11 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
   `bn_string_list` / `bn_symbol_list`. For anything the `bn_*` tools don't cover (defining
   types, registering architectures, poking the view during `init`), use the `bnrun` bridge for
   the full Python API inside the app.
+- ⚠️ A view type registered after startup (dev loads) is **not** picked by `bn.load()` or MCP
+  `bn_open_item_open` (Raw / a GUI dialog instead) — create it explicitly with
+  `BinaryViewType[name].create(BinaryView.open(path))`. Such views are not UI tabs.
+- BN's file opener does **not** treat `.jar` as a ZIP container (asked Vector35/Jordan whether
+  `.jar` can be registered as a container) — extract classes for testing; see ticket jvm-13.
 
 ## Testing workflow (fast → slow)
 
@@ -74,6 +85,8 @@ Then restart Binary Ninja (architecture/view registration happens once at startu
 `sample/ActiveTraderDE_app/Contents/WorkingDir/current/lib/…` — real-world test bytecode for
 loader / opcode-coverage / JAR work. If missing, re-copy an ActiveTrader.app bundle there.
 Start with a small standalone `.class` before throwing a big JAR at it.
+Favourite target: **`lib/mdg.jar`** (341 classes), extracted to `sample/extracted/` for
+single-class loading (`unzip -o -q …/mdg.jar -d sample/extracted`).
 
 ## Conventions
 
