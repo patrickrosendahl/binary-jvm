@@ -47,6 +47,8 @@ def analyze_tables(view, dispatcher):
                 ad = " [Default Branch]"
             dispatcher.set_comment_at(p[1], "Branch Condition: "+str(p[0])+ad)
     
+ACC_STATIC = 0x0008
+
 class ClassView(BinaryView):
     name = VIEW_NAME
     long_name = "JVM Class Format"
@@ -123,6 +125,8 @@ class ClassView(BinaryView):
     def define_methods(self, classStruct):
         # each method with code gets its own segment, function and symbol
         names = set()
+        self.entry_address = 0  # the class-file header, unless some method qualifies (see below)
+        entry_rank = 3
         for method in classStruct.methods:
             if method.code_attribute is None:
                 continue
@@ -138,6 +142,15 @@ class ClassView(BinaryView):
             self.add_auto_segment(base, length, code.start_address, length, SegmentFlag.SegmentReadable | SegmentFlag.SegmentExecutable)
             self.add_function(base)
             self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, base, name))
+            # entry point: public static void main(String[]), else <clinit>, else the first method
+            if method.name == "main" and method.descriptor == "([Ljava/lang/String;)V" and method.access_flags & ACC_STATIC:
+                rank = 0
+            elif method.name == "<clinit>":
+                rank = 1
+            else:
+                rank = 2
+            if rank < entry_rank:
+                self.entry_address, entry_rank = base, rank
             # exception handlers are only reachable through the exception table: give each its own function
             for handler_pc in sorted({entry[2] for entry in code.exception_table}):
                 self.add_function(base+handler_pc)
@@ -147,7 +160,7 @@ class ClassView(BinaryView):
         return True
 
     def perform_get_entry_point(self):
-        return 0x10000000
+        return getattr(self, "entry_address", 0)
         
 
 

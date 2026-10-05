@@ -460,6 +460,7 @@ class JVMMethodInfo(JVMStructure):
                 self.code_attribute = self.attributes[i]
              
         self.name = str(self.classReader.constantPool.get(self.name_index))
+        self.descriptor = str(self.classReader.constantPool.get(self.descriptor_index))
 
 class JVMAttributeInfo(JVMStructure):
     
