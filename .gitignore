@@ -1,0 +1,11 @@
+# Local test material — large, not part of the plugin (see README "Samples")
+/sample/
+
+# Python / editor cruft
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.bndb
+.idea/
+.vscode/

@@ -1,0 +1,15 @@
+{
+    "pluginmetadataversion": 2,
+    "name": "Java Bytecode Disassembler",
+    "type": ["architecture", "binaryview"],
+    "api": ["python3"],
+    "description": "Java Bytecode Architecture + Java Class File BinaryView",
+    "longdescription": "Loads Java `.class` files (magic 0xCAFEBABE) as a BinaryView, exposes a `JVM` architecture that disassembles and (partially) lifts JVM bytecode to LLIL, and parses the full class-file structure (constant pool, fields, methods, attributes) into Binary Ninja types. Python 3 port of Pusty/BinaryNinjaPlugins binary-jvm.",
+    "license": {
+        "name": "0BSD"
+    },
+    "version": "2.0.0-dev",
+    "author": "Pusty (Python 3 port: patrick)",
+    "minimumbinaryninjaversion": 0,
+    "platforms": ["Darwin", "Linux", "Windows"]
+}
