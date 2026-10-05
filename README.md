@@ -66,8 +66,15 @@ Design (see `lifter.py` / `arch.py`):
 - **Operand stack** is the real stack (`s`), 4-byte slots, long/double take two; operands are
   popped into LLIL temps first (correct operand order; pops inside `if` conditions are avoided
   because BN's stack analysis doesn't see them).
-- **Intrinsics** for `invoke*` (callee pool entry + receiver + args, arg/return sizes from the
-  descriptor), `getfield/putfield`, `new`, `*newarray`, `arraylength`, `checkcast`,
+- **Invokes are real calls** (jvm-40): each Methodref/InterfaceMethodref/InvokeDynamic pool entry is
+  a data var at its pool pseudo-address typed as a function pointer built from the descriptor
+  (receiver first unless only `invokestatic`/`invokedynamic` use it), like an import-table slot; the
+  invoke pops its arguments into `a0…` (calling convention `jvm_call`, separate from the locals) and
+  lifts as `call([slot])`, the result comes back in `r` / `rh:r`. HLIL reads
+  `ValueGetter.getProperty(arg2, "CODEBASE", arg2)` (symbol short name `Class.method`, full JVM name
+  as full/raw name). Costs ~2–3× analysis time on call-heavy classes; `INVOKES_AS_CALLS = False` in
+  `constants.py` restores the intrinsic form. More than 32 arguments fall back to the intrinsic.
+- **Intrinsics** for `getfield/putfield`, `new`, `*newarray`, `arraylength`, `checkcast`,
   `instanceof`, `monitor*`, `athrow`, `fmod` (`frem/drem`).
 - **Static fields** are loads/stores of typed data vars at the pool pseudo-address
   `0xF0000000 + idx*8`; `ldc` of int/float/long/double pushes the actual constant, strings/classes
@@ -79,10 +86,14 @@ Design (see `lifter.py` / `arch.py`):
   turned into bogus tail calls.
 - Decoder fixes: switch padding (relative to the 4-byte-aligned method base) and signed
   keys, `wide iinc` length, MethodHandle `reference_kind` u1, pool tags 17/19/20.
+- The raw class file (typed as its structure) is mapped at `0x800000`, not 0 — at 0, every null
+  (`const 0`) was typed as a pointer to the class header.
 
 Known cosmetic gaps: `lcmp`/`fcmp*`/`dcmp*` render as bool arithmetic
 (`(a > b ? 1 : 0) - (a < b ? 1 : 0) <= 0`); a stack slot reused for a ref and then a long gives
-`var.q` accessors; `jsr` subroutines show as `sub_…` calls with the return address argument.
+`var.q` accessors; `jsr` subroutines show as `sub_…` calls with the return address argument; a
+long/double call result is shown re-assembled as `(retvar:4.d):(retvar.d)`; float/double call
+arguments/results are typed as int32/int64 at call sites (`jvm_call` has no float registers).
 
 ### 3. JAR support ⬜ (design + implement)
 `.jar` = a ZIP of `.class` entries. A `.class`-only loader can't open them directly.

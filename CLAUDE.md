@@ -19,11 +19,11 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
 | file | contents |
 | --- | --- |
 | `__init__.py` | registers architecture + calling convention + view |
-| `constants.py` | `ARCH_NAME`/`VIEW_NAME`, address layout (method bases, pool pseudo-memory `0xF0000000+idx*8`, `NUM_LOCAL_REGS`) |
+| `constants.py` | `ARCH_NAME`/`VIEW_NAME`, address layout (class file at `0x800000`, method bases, pool pseudo-memory `0xF0000000+idx*8`, `NUM_LOCAL_REGS`, `NUM_ARG_REGS`), `INVOKES_AS_CALLS` |
 | `opcodes.py` | opcode tables, `decode_instruction`, descriptor helpers — **pure Python, no BN import** |
 | `classfile.py` | class-file parser (builds BN struct types), `JVMClassReader` (pool lookups), reader registry keyed by view handle |
 | `lifter.py` | LLIL lifting for every opcode (`InstructionIL`), intrinsics list |
-| `arch.py` | `JVM` Architecture (info/text/IL callbacks), registers, `JVMCallingConvention` |
+| `arch.py` | `JVM` Architecture (info/text/IL callbacks), registers, calling conventions `jvm` (method args in `l<n>`) and `jvm_call` (invoke call sites, args in `a<n>`) |
 | `view.py` | `ClassView` (segments/functions per method, catch handlers, pool symbols, static-field data vars, switch comments) |
 | `plugin.json` | manifest |
 

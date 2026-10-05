@@ -21,6 +21,10 @@ def reader_for_il(il):
     except Exception:
         return None
 
+def arg_reg(index, size):
+    # a<n> is the 8-byte register of outgoing argument n, a<n>_lo its low 4 bytes
+    return ("a%d" if size == 8 else "a%d_lo") % index
+
 def local_reg(index, size):
     # l<n> is the 8-byte register of local slot n, l<n>_lo its low 4 bytes
     return ("l%d" if size == 8 else "l%d_lo") % index
@@ -293,6 +297,20 @@ def lift_invoke(kind):
         sizes = [slot_size(a) for a in args]
         if kind not in ("invokestatic", "invokedynamic"):
             sizes = [ADDR_SIZE] + sizes  # objectref
+        if INVOKES_AS_CALLS and len(sizes) <= NUM_ARG_REGS:
+            # a real call through the pool entry, which the view types as a function pointer (like an
+            # import table slot): arguments go to a<i> (receiver first), the result comes back in r / rh:r
+            for i in reversed(range(len(sizes))):
+                il.append(il.set_reg(sizes[i], arg_reg(i, sizes[i]), il.pop(sizes[i])))
+            il.append(il.call(il.load(ADDR_SIZE, pool_pointer(il, index))))
+            if ret != 'V':
+                if slot_size(ret) == 8:
+                    # HLIL renders this as (retvar:4.d):(retvar.d); a temp or two 4-byte pushes don't help
+                    push(il, 8, il.reg_split(4, "rh", "r"))
+                else:
+                    push(il, 4, il.reg(4, "r"))
+            return
+        # too many arguments for the argument registers: fall back to an intrinsic
         temps = [LLIL_TEMP(i) for i in range(len(sizes))]
         for i in reversed(range(len(sizes))):
             pop_temp(il, temps[i], sizes[i])

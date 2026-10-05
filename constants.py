@@ -6,8 +6,13 @@ VIEW_NAME = "JVM Class"
 ADDR_SIZE = 4
 NUM_LOCAL_REGS = 64  # locals 0..63 are registers (covers >99.9% of methods); higher wide-indexed locals live in pseudo memory
 LOCALS_ADDR = 0x8000
+NUM_ARG_REGS = 32  # outgoing call arguments a0..a31 (receiver included; covers >99.99% of sample descriptors)
+# invoke* as real calls through typed pool slots (readable `StringBuilder.append(sb, s)`); costs ~2-3x
+# analysis time on call-heavy classes. False = the older invokevirtual(...) intrinsics.
+INVOKES_AS_CALLS = True
 MAX_INSTR_LENGTH = 0x10000  # table/lookupswitch; reads stop at the end of the method's segment anyway
 
+CLASSFILE_BASE = 0x800000  # the raw class file (typed as its structure); not at 0, or null (const 0) would read as &header
 METHOD_BASE = 0x1000000    # method i's code is mapped at METHOD_BASE + METHOD_STRIDE*i
 METHOD_STRIDE = 0x100000
 

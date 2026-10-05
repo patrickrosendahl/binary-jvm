@@ -5,7 +5,7 @@
 import importlib.util, os, shutil, sys
 import binaryninja as _bn
 
-REPO = "/Users/patrick/dev/binary-jvm"
+REPO = globals().get("JVM_REPO", "/Users/patrick/dev/binary-jvm")  # prepend JVM_REPO = "..." to load another checkout (e.g. a worktree)
 _dev = getattr(_bn, "_jvm_dev", None)
 if _dev is None:
     _dev = _bn._jvm_dev = {"n": 0, "views": []}

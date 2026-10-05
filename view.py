@@ -3,12 +3,28 @@ import struct
 import traceback
 
 from binaryninja import (Architecture, BinaryView, Symbol, SymbolType, SegmentFlag, SectionSemantics, Settings,
-                         SettingsScope)
+                         SettingsScope, Type)
 
 from .constants import *
-from .opcodes import decode_instruction
+from .opcodes import decode_instruction, parse_method_descriptor
 from .classfile import *
 from .lifter import field_type
+
+METHOD_POOL_CLASSES = (JVMMethodReference, JVMInterfaceMethodReference, JVMInvokeDynamic)
+
+def call_value_type(ch):
+    # types at invoke call sites; float/double travel as int bits (jvm_call has no float registers)
+    if ch == 'V': return Type.void()
+    if ch in 'JD': return Type.int(8)
+    if ch in 'L[': return Type.pointer_of_width(ADDR_SIZE, Type.void())
+    return Type.int(4)
+
+def method_short_name(reader, content):
+    """'java/lang/StringBuilder.append' -> 'StringBuilder.append'; invokedynamic -> 'indy.<name>'"""
+    if isinstance(content, JVMInvokeDynamic):
+        return "indy." + str(reader.poolEntry(content.nat))
+    cls = str(reader.poolEntry(content.classReference))
+    return cls.rsplit("/", 1)[-1] + "." + str(reader.poolEntry(content.nameAndType))
 
 def completeUpdateWhenDone(event):
     for f in event.view.functions:
@@ -79,11 +95,9 @@ class ClassView(BinaryView):
             classStruct = JVMClassStructure(self.cR) # read class structure and add symbols
             self.cR.classStruct = classStruct
            
-            self.define_data_var(0,  classStruct.resultingType())
-                
-            
-            self.add_auto_segment(0, self.cR.index(), 0, self.cR.index(), SegmentFlag.SegmentReadable)
-            self.add_auto_section("<data>",0, self.cR.index(), SectionSemantics.ReadOnlyCodeSectionSemantics)
+            self.add_auto_segment(CLASSFILE_BASE, self.cR.index(), 0, self.cR.index(), SegmentFlag.SegmentReadable)
+            self.add_auto_section("<data>", CLASSFILE_BASE, self.cR.index(), SectionSemantics.ReadOnlyCodeSectionSemantics)
+            self.define_data_var(CLASSFILE_BASE, classStruct.resultingType())
             self.define_methods(classStruct)
             
             for i in range(len(self.cR.constantPool.poolContent)):
@@ -100,7 +114,8 @@ class ClassView(BinaryView):
                     t = SymbolType.DataSymbol
                
                 if t == SymbolType.ImportAddressSymbol:
-                    self.define_user_symbol(Symbol(t, pool_address(i), str(content), full_name=str(content)))
+                    self.define_user_symbol(Symbol(t, pool_address(i), method_short_name(self.cR, content),
+                                                   full_name=str(content), raw_name=str(content)))
                 else:
                     self.define_user_symbol(Symbol(t, pool_address(i), str(content), full_name="pool_"+str(i)))
                 
@@ -114,6 +129,8 @@ class ClassView(BinaryView):
                     desc = self.cR.memberDescriptor(i)
                     if desc:
                         self.define_data_var(pool_address(i), field_type(desc))
+
+            self.define_method_slots(classStruct)
 
             self.add_analysis_completion_event(completeUpdateWhenDone)
             
@@ -155,6 +172,44 @@ class ClassView(BinaryView):
             for handler_pc in sorted({entry[2] for entry in code.exception_table}):
                 self.add_function(base+handler_pc)
                 self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, base+handler_pc, "%s$catch_%x" % (name, handler_pc)))
+
+    def invoke_kinds(self, classStruct):
+        # pool index -> set of invoke opcodes that use it (decides whether the call has a receiver)
+        kinds = {}
+        for method in classStruct.methods:
+            if method.code_attribute is None:
+                continue
+            code = method.code_attribute.attribute
+            data = memoryview(self.cR.data)[code.start_address:code.end_address]
+            base = method_address(method.index)
+            off = 0
+            while off < len(data):
+                name, operand, length, value = decode_instruction(data[off:], base+off)
+                if name is None:
+                    break
+                if name.startswith("invoke"):
+                    kinds.setdefault(value[0] if isinstance(value, tuple) else value, set()).add(name)
+                off += length
+        return kinds
+
+    def define_method_slots(self, classStruct):
+        # invokes are lifted as call(load(pool slot)): type every method pool entry as a function pointer
+        # so call sites get parameters and return values
+        cc = Architecture[ARCH_NAME].calling_conventions["jvm_call"]
+        kinds = self.invoke_kinds(classStruct)
+        for i, content in enumerate(self.cR.constantPool.poolContent):
+            if not isinstance(content, METHOD_POOL_CLASSES):
+                continue
+            desc = self.cR.memberDescriptor(i)
+            if not desc:
+                continue
+            args, ret = parse_method_descriptor(desc)
+            params = [call_value_type(a) for a in args]
+            static = isinstance(content, JVMInvokeDynamic) or kinds.get(i, set()) <= {"invokestatic", "invokedynamic"} and i in kinds
+            if not static:
+                params = [Type.pointer_of_width(ADDR_SIZE, Type.void())] + params
+            func = Type.function(call_value_type(ret), params, calling_convention=cc)
+            self.define_data_var(pool_address(i), Type.pointer_of_width(ADDR_SIZE, func))
 
     def perform_is_executable(self):
         return True

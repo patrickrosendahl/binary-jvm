@@ -55,6 +55,10 @@ def _build_regs():
     for n in range(NUM_LOCAL_REGS):
         regs["l%d" % n] = RegisterInfo("l%d" % n, 8)
         regs["l%d_lo" % n] = RegisterInfo("l%d" % n, 4, 0)
+    # outgoing invoke arguments, one register per argument (receiver first)
+    for n in range(NUM_ARG_REGS):
+        regs["a%d" % n] = RegisterInfo("a%d" % n, 8)
+        regs["a%d_lo" % n] = RegisterInfo("a%d" % n, 4, 0)
     return regs
 
 class JVM(Architecture):
@@ -119,6 +123,19 @@ class JVMCallingConvention(CallingConvention):
     eligible_for_heuristics = False
 
 
+class JVMCallCallingConvention(CallingConvention):
+    # invoke* call sites: arguments in a<n> (4-byte values in a<n>_lo, like edi in rdi), so a call
+    # never clobbers the caller's locals l<n>
+    name = "jvm_call"
+    int_arg_regs = ["a%d" % n for n in range(NUM_ARG_REGS)]
+    # results like methods return them: r, or rh:r for long/double (an 8-byte return register yields no
+    # call outputs in BN 6.1 on this 32-bit architecture)
+    int_return_reg = "r"
+    high_int_return_reg = "rh"
+    caller_saved_regs = ["r", "rh"]
+    eligible_for_heuristics = False
+
+
 def register_arch():
     JVM.register()
     arch = Architecture[ARCH_NAME]
@@ -126,3 +143,4 @@ def register_arch():
     arch.register_calling_convention(cc)
     arch.default_calling_convention = cc
     arch.standalone_platform.default_calling_convention = cc
+    arch.register_calling_convention(JVMCallCallingConvention(arch, "jvm_call"))
