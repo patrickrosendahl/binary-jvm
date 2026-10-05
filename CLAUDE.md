@@ -4,6 +4,13 @@ Guidance for Claude Code working in this repo. **The task list / roadmap lives i
 [`README.md`](README.md)** ("Roadmap / TODO") — this file is the environment + how-to-work
 reference. Read both before starting.
 
+**⏸ Paused (2026-10-06).** Work stopped by decision: Binary Ninja will never generate really
+usable Java-level code (classes, exception handling, source-level structure), so further
+investment isn't worth it. The plugin is **unregistered** from Binary Ninja (plugin symlink
+removed, `files.container.excludedTransforms` reset). Details, what works and the known gaps:
+wiki `jvm/index.md`, ticket jvm-28; open tickets are labelled `paused`.
+To pick it up again, see "Installing for real" below and re-set the Universal exclusion.
+
 **Project tracking:** tickets live in minitick project **`jvm`** (`jvm-N`; CLI
 `/Users/patrick/dev/minitick/.venv/bin/minitick … -p jvm`), documentation in miniwiki project
 **`jvm`** (`miniwiki tree jvm`; `tickets/` there is a read-only mirror of minitick). There is no
@@ -80,7 +87,8 @@ ln -s /Users/patrick/dev/binary-jvm "$HOME/Library/Application Support/Binary Ni
 ```
 Then restart Binary Ninja (architecture/view registration happens once at startup) — with the
 user's OK via `/Users/patrick/dev/bn-script-bridge/bnrestart` (saves modified views, reopens files,
-waits for the bridge). The symlink is in place since 2026-10-06.
+waits for the bridge). **Currently not installed** (symlink removed 2026-10-06 when the project
+was paused); re-installing also needs `files.container.excludedTransforms = ["Universal"]` (jvm-39).
 
 ## Samples
 

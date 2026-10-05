@@ -5,6 +5,8 @@ description: Project skill for the binary-jvm Binary Ninja plugin (Java .class A
 
 # binary-jvm project workflow
 
+**Project paused (2026-10-06)** — plugin unregistered; see CLAUDE.md before resuming.
+
 Generic Binary Ninja mechanics (MCP tools, `bnrun` bridge, usage lock) are in the global
 `binaryninja-mcp` skill — load it for any BN work. This skill is the project layer on top.
 
@@ -27,7 +29,7 @@ directory named like the JAR without `.jar`**: `foo.jar` → `foo/`.
 cd <dir with the jar> && unzip -o -q mdg.jar -d mdg      # -> mdg/com/is_teledata/…/X.class
 ```
 Then open the individual `X.class`. Opening a `.class` also needs
-`files.container.excludedTransforms = ["Universal"]` (set on this machine), because BN's
+`files.container.excludedTransforms = ["Universal"]` (reset to `[]` while paused — set it again), because BN's
 Mach-O/Universal handling claims the shared `0xCAFEBABE` magic (jvm-39); BN may still make the
 Universal view active — switch to "JVM Class" (GUI: view dropdown; MCP: `bn_binary_view_set_active`).
 `tests/offline_lift_check.py --all` skips such `foo/` dirs (their classes are checked via the jar).
@@ -38,7 +40,8 @@ Universal view active — switch to "JVM Class" (GUI: view dropdown; MCP: `bn_bi
 2. Live, no restart: take the lock (`bnrun --lock --purpose …`), `bnrun tests/bn_dev_load.py`
    (registers `JVM-devN` / `JVM Class devN`; BN can't unregister types), then
    `bnrun tests/bn_batch_check.py` (20 classes) or a one-class dump. Release the lock after.
-3. Real install: the repo is symlinked as `plugins/binary-jvm` (since 2026-10-06); after changing
+3. Real install (**currently uninstalled — project paused 2026-10-06**, see CLAUDE.md): symlink the
+   repo as `plugins/binary-jvm` and set the Universal exclusion; after changing
    the plugin, restart BN with `/Users/patrick/dev/bn-script-bridge/bnrestart` (saves modified
    views, reopens files, waits for the bridge) — with the user's OK; see the binaryninja-mcp skill.
 

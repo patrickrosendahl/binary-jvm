@@ -11,12 +11,19 @@ This is a **Python 3 port** of [`Pusty/BinaryNinjaPlugins` → `binary-jvm`](htt
 
 ## Status
 
+> **⏸ Paused (2026-10-06).** Work stopped by decision: Binary Ninja will never generate really
+> usable Java-level code (classes, exception handling, source-level structure), so further
+> investment isn't worth it. The plugin is **unregistered** from Binary Ninja (plugin symlink
+> removed, `files.container.excludedTransforms` reset). Details, what works and the known gaps:
+> wiki `jvm/index.md`, ticket jvm-28; open tickets are labelled `paused`.
+
 **Python 3 port done; lifter rewritten — every JVM opcode lifts to LLIL.** Tested live in
 Binary Ninja 6.1 (via the script bridge, dev-registered names) against ActiveTrader classes:
 methods decompile to Java-like HLIL (calls, string constants, static fields, switches,
 try/catch handlers). Offline, the decoder + lifter pass over the whole sample (≈47k classes,
 11.6M instructions) with no decode failures, no `unimplemented`, and per-instruction stack
-effects matching an independent table. Not yet installed as the real (non-dev) plugin + restart.
+effects matching an independent table. All 341 `mdg.jar` classes analyse live in the installed
+plugin; invokes decompile as `Class.method(args)` calls (jvm-40).
 
 See the roadmap below. **This README is the source of truth for the TODO list.**
 
