@@ -78,7 +78,9 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
 ```bash
 ln -s /Users/patrick/dev/binary-jvm "$HOME/Library/Application Support/Binary Ninja/plugins/binary-jvm"
 ```
-Then restart Binary Ninja (architecture/view registration happens once at startup).
+Then restart Binary Ninja (architecture/view registration happens once at startup) — with the
+user's OK via `/Users/patrick/dev/bn-script-bridge/bnrestart` (saves modified views, reopens files,
+waits for the bridge). The symlink is in place since 2026-10-06.
 
 ## Samples
 

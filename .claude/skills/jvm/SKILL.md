@@ -26,7 +26,9 @@ Generic Binary Ninja mechanics (MCP tools, `bnrun` bridge, usage lock) are in th
 2. Live, no restart: take the lock (`bnrun --lock --purpose …`), `bnrun tests/bn_dev_load.py`
    (registers `JVM-devN` / `JVM Class devN`; BN can't unregister types), then
    `bnrun tests/bn_batch_check.py` (20 classes) or a one-class dump. Release the lock after.
-3. Real install: symlink the repo into the BN plugins dir and ask the user to restart BN.
+3. Real install: the repo is symlinked as `plugins/binary-jvm` (since 2026-10-06); after changing
+   the plugin, restart BN with `/Users/patrick/dev/bn-script-bridge/bnrestart` (saves modified
+   views, reopens files, waits for the bridge) — with the user's OK; see the binaryninja-mcp skill.
 
 ## Gotchas (learned the hard way)
 - **bnrun scripts run one at a time.** Always use `bnrun --timeout N …`; stop a runaway script with
