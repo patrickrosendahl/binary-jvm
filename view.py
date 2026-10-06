@@ -4,7 +4,7 @@ import traceback
 
 from binaryninja import (Architecture, BinaryView, Symbol, SymbolType, SegmentFlag, SectionSemantics, Settings,
                          SettingsScope, Type, TypeBuilder, FunctionParameter, ReturnValue, BaseStructure,
-                         CoreVariable, VariableSourceType, NamedTypeReferenceClass)
+                         CoreVariable, VariableSourceType, MetadataStoreFlag, NamedTypeReferenceClass)
 
 from .constants import *
 from .opcodes import decode_instruction
@@ -147,6 +147,31 @@ def name_locals(view, func, reader):
             (name, desc), _ = max(hits.items(), key=lambda kv: (kv[1], kv[0]))
             func.create_user_var(var, reader.jtypes.value_type(desc), name)
 
+def define_components(view, reader):
+    """jvm-41: component tree package -> class holding the methods, the class-file header and the
+    class's own static fields. Components are saved in a .bndb (and restored only after init), so
+    nothing is created when the class component already exists."""
+    cls = reader.classStruct
+    parts = cls.name.split("/")
+    if view.get_component_by_path("/" + "/".join(parts)) is not None:
+        return
+    parent = None
+    for i in range(len(parts)):
+        existing = view.get_component_by_path("/" + "/".join(parts[:i+1]))
+        parent = existing or view.create_component(parts[i], parent)
+    for method in cls.methods:
+        func = view.get_function_at(method_address(method.index)) if method.code_attribute else None
+        if func is not None:
+            parent.add_function(func)
+    addrs = [CLASSFILE_BASE]
+    for i, content in enumerate(reader.constantPool.poolContent):
+        if isinstance(content, JVMFieldReference) and str(reader.poolEntry(content.classReference)) == cls.name:
+            addrs.append(pool_address(i))
+    for addr in addrs:
+        var = view.get_data_var_at(addr)
+        if var is not None:
+            parent.add_data_variable(var)
+
 def completeUpdateWhenDone(event):
     view = event.view
     reader = reader_for_view(view)
@@ -154,6 +179,9 @@ def completeUpdateWhenDone(event):
         analyze_tables(view, f)
         if reader is not None:
             name_locals(view, f, reader)
+    if reader is not None and getattr(reader, "pending_components", False):
+        reader.pending_components = False
+        define_components(view, reader)
 
 def analyze_tables(view, dispatcher):
     table_jumps = []
@@ -258,6 +286,11 @@ class ClassView(BinaryView):
 
             self.define_method_slots(classStruct)
             self.type_methods(classStruct)
+            self.store_metadata(CLASS_METADATA_KEY, class_metadata(classStruct), MetadataStoreFlag.MetadataStorePersistent)
+            # reopened from a .bndb: its components are restored after init -- decide once analysis is done
+            self.cR.pending_components = self.file.has_database
+            if not self.cR.pending_components:
+                define_components(self, self.cR)
 
             self.add_analysis_completion_event(completeUpdateWhenDone)
             

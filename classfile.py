@@ -4,6 +4,8 @@ import struct
 
 from binaryninja import Type, TypeBuilder
 
+from .constants import method_address
+
 _type_cache = {}
 
 def _cached_type(key, make):
@@ -790,6 +792,7 @@ class JVMClassReader():
         self.structTypes = {}
         self.structTypeCount = {}
         self.jtypes = None                 # view.JavaTypes, set by the view
+        self.pending_components = False    # view: create components after analysis (reopened .bndb)
     def reset(self):
         self.idx = 0
     def unpack(self, fmt, size):
@@ -843,6 +846,32 @@ class JVMClassReader():
     def getBootstrap(self,index):
         if self.bootstrap_attribute == None: return None
         return self.bootstrap_attribute.attribute.bootstrap_methods[index]
+
+
+# jvm-41: class metadata stored in the view under this key (bv.query_metadata(CLASS_METADATA_KEY)).
+# Contract with the Pseudo-Java printer -- keep the keys. Missing strings are "" (Metadata has no None);
+# class names are dotted (java.lang.String); descriptors and member names are raw (<init>, (I)V).
+CLASS_METADATA_KEY = "jvm.class"
+
+def class_metadata(cls):
+    """{name, super, interfaces, access_flags, signature, source_file, inner_classes, fields, methods}"""
+    def d(name):
+        return name.replace("/", ".") if name else ""
+    return {
+        "name": d(cls.name),
+        "super": d(cls.super_name),
+        "interfaces": [d(i) for i in cls.interface_names],
+        "access_flags": cls.access_flags,
+        "signature": cls.generic_signature() or "",
+        "source_file": cls.source_file() or "",
+        "inner_classes": [{"inner": d(e["inner"]), "outer": d(e["outer"]), "name": e["name"] or "",
+                           "access_flags": e["access_flags"]} for e in cls.inner_classes()],
+        "fields": [{"name": f.name, "descriptor": f.descriptor, "access_flags": f.access_flags,
+                    "signature": f.generic_signature() or ""} for f in cls.fields],
+        "methods": [{"name": m.name, "descriptor": m.descriptor, "access_flags": m.access_flags,
+                     "address": method_address(m.index) if m.code_attribute is not None else 0,
+                     "signature": m.generic_signature() or ""} for m in cls.methods],
+    }
 
 
 # Registry of parsed classes, keyed by the core BinaryView handle, so the lifter can resolve
