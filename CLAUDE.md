@@ -72,12 +72,14 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
 2. **Live in BN without restart**: `bnrun tests/bn_dev_load.py` copies the package to
    `/tmp/jvm_devN/`, renames arch/view to `JVM-devN` / `JVM Class devN` and registers them
    (BN cannot unregister types, so every reload needs fresh names; older dev views are disabled).
-   Then `bnrun tests/bn_batch_check.py` (20 classes from `lib/mdg/` by default, per-class
-   timing). Views created this way are in-process but **not UI tabs**.
-3. bnrun scripts run one at a time. Always pass **`--timeout N`**; a running script can be stopped
+   Then `bnrun --parallel tests/bn_batch_check.py` (20 classes from `lib/mdg/` by default, per-class
+   timing); `bnrun --parallel tests/bn_golden.py` dumps reference HLIL + readability metrics. Views created this way are in-process but **not UI tabs**.
+3. bnrun has two lanes: serialized (default; UI work and global registration like `bn_dev_load.py`)
+   and `--parallel` (scripts on their own views, up to 4 at once, no lock). Always pass **`--timeout N`**; a running script can be stopped
    with `bnrun --cancel` (or Ctrl-C on the client), `bnrun --status` shows what is running.
    Cancellation lands between Python bytecodes — a long native call (`update_analysis_and_wait()`)
-   finishes first — so keep batches small and take the usage lock.
+   finishes first — so keep batches small. The usage lock is only needed for UI tabs
+   (`bv`/`bvs`/`--view`/`--main-thread` are refused without it).
 
 ### Installing for real
 ```bash

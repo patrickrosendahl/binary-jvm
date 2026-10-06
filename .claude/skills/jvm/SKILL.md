@@ -37,16 +37,19 @@ Universal view active — switch to "JVM Class" (GUI: view dropdown; MCP: `bn_bi
 ## Test loop (fast → slow)
 1. `python3 tests/offline_lift_check.py` (~1–2 s, mdg.jar; `--all` = every sample jar). Must
    report 0 decode/lift/unimplemented/stack/tiling failures. Run it after every lifter change.
-2. Live, no restart: take the lock (`bnrun --lock --purpose …`), `bnrun tests/bn_dev_load.py`
-   (registers `JVM-devN` / `JVM Class devN`; BN can't unregister types), then
-   `bnrun tests/bn_batch_check.py` (20 classes) or a one-class dump. Release the lock after.
+2. Live, no restart: `bnrun tests/bn_dev_load.py` (serialized lane: registers `JVM-devN` /
+   `JVM Class devN` globally; BN can't unregister types), then `bnrun --parallel
+   tests/bn_batch_check.py` (20 classes), `--parallel tests/bn_golden.py` or a one-class dump. These
+   only use their own views: **no usage lock** (it would only block other sessions). The lock is
+   needed only for UI tabs (`bv`/`bvs`/`--view`/`--main-thread`).
 3. Real install (**installed**): symlink the
    repo as `plugins/binary-jvm` and set the Universal exclusion; after changing
    the plugin, restart BN with `/Users/patrick/dev/bn-script-bridge/bnrestart` (saves modified
    views, reopens files, waits for the bridge) — with the user's OK; see the binaryninja-mcp skill.
 
 ## Gotchas (learned the hard way)
-- **bnrun scripts run one at a time.** Always use `bnrun --timeout N …`; stop a runaway script with
+- **bnrun lanes:** serialized by default (one at a time), `--parallel` for own-view scripts (up to 4
+  at once). Always use `bnrun --timeout N …`; stop a runaway script with
   `bnrun --cancel` (Ctrl-C on the client also cancels), check with `bnrun --status`. A long native
   call (`update_analysis_and_wait()`) can't be cut short, so keep live batches to a few classes and
   put long runs in background subagents.
