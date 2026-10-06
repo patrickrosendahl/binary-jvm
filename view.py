@@ -10,6 +10,7 @@ from .constants import *
 from .opcodes import decode_instruction
 from .classfile import *
 from .javatypes import dotted, split_method_descriptor, method_parameter_slots, slot_count
+from .methodinfo import method_info
 
 METHOD_POOL_CLASSES = (JVMMethodReference, JVMInterfaceMethodReference, JVMInvokeDynamic)
 
@@ -328,10 +329,20 @@ class ClassView(BinaryView):
                 rank = 2
             if rank < entry_rank:
                 self.entry_address, entry_rank = base, rank
-            # exception handlers are only reachable through the exception table: give each its own function
-            for handler_pc in sorted({entry[2] for entry in code.exception_table}):
-                self.add_function(base+handler_pc)
-                self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, base+handler_pc, "%s$catch_%x" % (name, handler_pc)))
+            # exception handlers are part of the method (the lifter models the exception edges, jvm-42);
+            # the exception table is kept for the Pseudo-Java printer: [[start_pc, end_pc, handler_pc,
+            # catch class ("" = any)], ...], pcs relative to the method's base
+            if code.exception_table:
+                func = self.get_function_at(base)
+                if func is not None:
+                    func.store_metadata("jvm.exception_table", [
+                        [start, end, handler, str(self.cR.poolEntry(catch)) if catch else ""]
+                        for start, end, handler, catch in code.exception_table])
+                    mi = method_info(self.cR, base)
+                    for handler in (mi.conflicts if mi is not None else ()):
+                        # a handler whose type test continues differently per try range (lifted as an
+                        # indirect jump; not seen in javac output)
+                        func.set_user_indirect_branches(base + handler, [(func.arch, t) for t in mi.conflict_targets(handler)])
 
     def invoke_kinds(self, classStruct):
         # pool index -> set of invoke opcodes that use it (decides whether the call has a receiver)

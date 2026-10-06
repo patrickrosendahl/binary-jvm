@@ -159,15 +159,71 @@ def lift_instruction(il, name, value, ctx):
     """lift one decoded instruction (the entry point for the architecture)"""
     ctx.stack = Stack(il, ctx.state)
     mi = ctx.method
-    if mi is not None:
-        off = ctx.addr - mi.base
-        if off in mi.fused_cmp:
-            lift_cmp_fused(il, name, ctx)
-            return
-        if off in mi.fused_if:
-            lift_if_fused(il, mi.fused_if[off], name, value, ctx)
-            return
-    InstructionIL[name](il, value, ctx)
+    if mi is None:
+        InstructionIL[name](il, value, ctx)
+        return
+    off = ctx.addr - mi.base
+    if off in mi.dispatch or off in mi.conflicts:
+        lift_handler_entry(il, ctx, off)
+    if off in mi.fused_cmp:
+        lift_cmp_fused(il, name, ctx)
+    elif off in mi.fused_if:
+        lift_if_fused(il, mi.fused_if[off], name, value, ctx)
+    else:
+        InstructionIL[name](il, value, ctx)
+    chain = mi.throw_sites.get(off)
+    if chain is not None and name != "athrow":
+        # a throw site inside a try range: a pending exception goes to the first handler of the range.
+        # exc is (re)defined explicitly: BN keeps a caller-saved register's variable across a call
+        il.append(il.intrinsic(["exc"], "__exception", []))
+        branch_if(il, il.compare_not_equal(ADDR_SIZE, il.reg(ADDR_SIZE, "exc"), il.const(ADDR_SIZE, 0)),
+                  mi.base + chain[0][0])
+
+# --- exceptions (jvm-42) ---
+# A throw site in a try range is followed by `exc = __exception(); if (exc != 0) goto <first handler of
+# its chain>`; athrow
+# there is `exc = value; goto handler`. Each handler's first instruction tests the type:
+# `if (!instanceof(exc, T)) goto <next handler>` (or `__propagate(exc)` + no_ret after the last one),
+# then moves the exception onto the operand stack: `st0_lo = exc; exc = 0`.
+
+def lift_handler_entry(il, ctx, off):
+    mi = ctx.method
+    exc = lambda: il.reg(ADDR_SIZE, "exc")
+    if off in mi.conflicts:
+        # reached through chains that continue differently (never seen in javac output): the intrinsic
+        # yields the next handler to try (0: caught here), the view lists the candidates as indirect branches
+        il.append(il.intrinsic([T0], "__catch_next", [exc()]))
+        go, caught = LowLevelILLabel(), LowLevelILLabel()
+        il.append(il.if_expr(il.compare_not_equal(ADDR_SIZE, il.reg(ADDR_SIZE, T0), il.const(ADDR_SIZE, 0)), go, caught))
+        il.mark_label(go)
+        il.append(il.jump(il.reg(ADDR_SIZE, T0)))
+        il.mark_label(caught)
+    else:
+        types, nxt = mi.dispatch[off]
+        if types:
+            temps = [LLIL_TEMP(i) for i in range(len(types))]
+            for t, name in zip(temps, types):
+                il.append(il.intrinsic([t], "instanceof", [exc(), pool_pointer(il, mi.class_index[name])]))
+            caught = il.reg(4, temps[0])
+            for t in temps[1:]:
+                caught = il.or_expr(4, caught, il.reg(4, t))
+            not_caught = il.compare_equal(4, caught, il.const(4, 0))
+            if nxt is None:
+                # the last handler of the chain: anything else leaves the method
+                prop, cont = LowLevelILLabel(), LowLevelILLabel()
+                il.append(il.if_expr(not_caught, prop, cont))
+                il.mark_label(prop)
+                il.append(il.intrinsic([], "__propagate", [exc()]))
+                il.append(il.no_ret())
+                il.mark_label(cont)
+            else:
+                branch_if(il, not_caught, mi.base + nxt)
+    # the exception is the handler's operand stack
+    if ctx.state is not None and len(ctx.state) == 1:
+        il.append(il.set_reg(ADDR_SIZE, stack_reg(0, ADDR_SIZE), exc()))
+    else:
+        il.append(il.push(ADDR_SIZE, exc()))
+    il.append(il.set_reg(ADDR_SIZE, "exc", il.const(ADDR_SIZE, 0)))
 
 # --- lifters: each takes (il, operand, ctx) and appends its own instructions ---
 
@@ -530,8 +586,14 @@ def lift_object_op(name, with_class, size):
 
 def lift_athrow(il, v, ctx):
     obj = ctx.pop(ADDR_SIZE)
-    il.append(il.intrinsic([], "athrow", [obj()]))
-    il.append(il.no_ret())
+    mi = ctx.method
+    chain = mi.throw_sites.get(ctx.addr - mi.base) if mi is not None else None
+    if chain is not None:
+        il.append(il.set_reg(ADDR_SIZE, "exc", obj()))
+        branch(il, mi.base + chain[0][0])
+    else:
+        il.append(il.intrinsic([], "__propagate", [obj()]))
+        il.append(il.no_ret())
 
 def lift_wide(il, v, ctx):
     name = InstructionNames[v[0]]
@@ -542,7 +604,7 @@ def lift_wide(il, v, ctx):
 
 INTRINSICS = ["invokevirtual", "invokespecial", "invokestatic", "invokeinterface", "invokedynamic",
               "getfield", "putfield", "new", "newarray", "anewarray", "multianewarray", "arraylength",
-              "athrow", "checkcast", "instanceof", "monitorenter", "monitorexit", "fmod"]
+              "checkcast", "instanceof", "monitorenter", "monitorexit", "fmod", "__exception", "__propagate", "__catch_next"]
 
 InstructionIL = {
     "nop":         lambda il, v, ctx: il.append(il.nop()),

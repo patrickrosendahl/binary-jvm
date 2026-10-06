@@ -79,9 +79,11 @@ class MockIL:
         self.writes = {}     # entry -> size of the last write
         self.errors = []
         self.other_reads = set()  # non-stack registers read
+        self.targets = set()      # addresses the IL branches to
+        self.handler_entry = None # what the handler-entry prologue wrote to the stack registers
     def append(self, expr): pass
     def mark_label(self, label): pass
-    def get_label_for_address(self, arch, addr): return None
+    def get_label_for_address(self, arch, addr): self.targets.add(addr); return None
     def push(self, size, expr): self.delta += size; return ("push", size)
     def pop(self, size): self.delta -= size; return ("pop", size)
     def call_stack_adjust(self, dest, adjust): self.delta -= adjust; return ("call",)
@@ -258,8 +260,30 @@ def check_fused_semantics():
                 errors.append("%s+%s on (%r, %r): lifted %s, JVM %s" % (cmp, cond, a, b, got, want))
     return errors
 
+# the handler-entry prologue (type test, st0_lo = exc) runs before the instruction's own lift: record what
+# it did and start the instruction's stack-register bookkeeping afresh
+_lift_handler_entry = lifter.lift_handler_entry
+def _checked_handler_entry(il, ctx, off):
+    _lift_handler_entry(il, ctx, off)
+    il.handler_entry = (dict(il.writes), list(il.reads), il.delta)
+    il.writes, il.reads, il.delta = {}, [], 0
+    il.vals = {k: v for k, v in il.vals.items() if not isinstance(k, int)}
+lifter.lift_handler_entry = _checked_handler_entry
+
+def check_branches(name, value, addr, length, mi, il):
+    errors = []
+    branches = methodinfo.instruction_branches(name, value, addr, length, mi)
+    if len(branches) > 3:
+        errors.append("%d branches: %r" % (len(branches), branches))
+    allowed = {t for _, t in branches} | {addr + length}
+    if name in ("tableswitch", "lookupswitch"):  # IndirectBranch; the view sets the targets (analyze_tables)
+        allowed |= {value[0]} | {t for _, t in value[3 if name == "tableswitch" else 2]}
+    for t in il.targets - allowed:
+        errors.append("IL branches to 0x%x, not among the instruction's branches %r" % (t, branches))
+    return errors
+
 # ---- driver -------------------------------------------------------------------------------------
-KEYS = ("decode_fail", "lift_error", "unimplemented", "stack_mismatch", "stack_regs", "tiling")
+KEYS = ("decode_fail", "lift_error", "unimplemented", "stack_mismatch", "stack_regs", "branches", "tiling")
 NOSTATE = False
 
 def check_class(label, raw, stats):
@@ -294,6 +318,15 @@ def check_class(label, raw, stats):
                 off += length; continue
             stats["count"][name] += 1
             if il.unimplemented_used: stats["unimplemented"].append("%s %s" % (label, name))
+            for e in check_branches(name, value, addr, length, mi, il):
+                stats["branches"].append("%s: %s" % (where, e))
+            if mi is not None and off in mi.throw_sites:
+                stats["throw_sites"] += 1
+            if il.handler_entry is not None:
+                stats["handler_entries"] += 1
+                writes, reads, delta = il.handler_entry
+                if ctx.state is not None and (writes != {0: 4} or reads or delta):
+                    stats["stack_regs"].append("%s: handler entry writes %r, reads %r, moves %d" % (where, writes, reads, delta))
             if ctx.state is None:
                 stats["nostate"] += 1
                 exp = expected(reader, name, value) * 4
@@ -313,7 +346,7 @@ def check_class(label, raw, stats):
             stats["tiling"].append("%s m%d" % (label, m.index))
 
 def new_stats():
-    stats = {"count": collections.Counter(), "classes": 0, "nostate": 0, "deep": 0, "fused": 0}
+    stats = {"count": collections.Counter(), "classes": 0, "nostate": 0, "deep": 0, "fused": 0, "throw_sites": 0, "handler_entries": 0}
     for k in KEYS: stats[k] = []
     return stats
 
@@ -373,12 +406,13 @@ def main(args):
     with multiprocessing.Pool(initializer=_init_worker, initargs=(nostate,)) as pool:
         for stats in pool.imap_unordered(check_chunk, chunks(args)):
             total["count"].update(stats["count"])
-            for k in ("classes", "nostate", "deep", "fused"):
+            for k in ("classes", "nostate", "deep", "fused", "throw_sites", "handler_entries"):
                 total[k] += stats[k]
             for k in KEYS: total[k] += stats[k]
     print("classes: %d, instructions: %d, distinct opcodes: %d, %.1fs" % (total["classes"], sum(total["count"].values()), len(total["count"]), time.time()-t0))
     print("instructions without a stack shape (memory stack): %d; touching entries >= %d: %d; fused compare/if halves: %d"
           % (total["nostate"], NUM_STACK_REGS, total["deep"], total["fused"]))
+    print("exception checks after throw sites: %d; handler entries: %d" % (total["throw_sites"], total["handler_entries"]))
     errors = check_fused_semantics()
     print("fused compare semantics: %d errors" % len(errors))
     for line in errors[:10]: print("   ", line)

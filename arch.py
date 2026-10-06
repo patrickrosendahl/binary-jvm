@@ -1,10 +1,19 @@
 """The JVM Architecture: decoding, instruction text and the calling convention."""
+import threading
+
 from binaryninja import (Architecture, CallingConvention, RegisterInfo, IntrinsicInfo, InstructionInfo,
                          InstructionTextToken, InstructionTextTokenType, BranchType, Endianness)
 
 from .constants import *
 from .opcodes import *
 from .lifter import lift_instruction, INTRINSICS, LiftContext, reader_for_il
+from .classfile import reader_for_view
+from .methodinfo import method_info, instruction_branches
+
+# get_instruction_info gets no view, but the exception edges depend on the method's exception table:
+# analyze_basic_blocks (which calls get_instruction_info for the function, on the same thread) records
+# the class reader of the function being analysed here, keyed by thread
+_analysing = {}
 
 def int_token(text, value=None):
     if value is None:
@@ -65,6 +74,9 @@ def _build_regs():
     for n in range(NUM_STACK_REGS):
         regs["st%d" % n] = RegisterInfo("st%d" % n, 8)
         regs["st%d_lo" % n] = RegisterInfo("st%d_lo" % n, 4)
+    # pending exception (0 = none): set by throwing calls (caller-saved in jvm_call) and athrow, tested
+    # after throw sites inside try ranges, moved onto the operand stack at handler entry
+    regs["exc"] = RegisterInfo("exc", ADDR_SIZE)
     # operands of a compare fused with the following if (lcmp/dcmp*: cmpa/cmpb, fcmp*: the _lo registers)
     for name in ("cmpa", "cmpb"):
         regs[name] = RegisterInfo(name, 8)
@@ -83,6 +95,17 @@ class JVM(Architecture):
     endianness = Endianness.BigEndian
     intrinsics = {name: IntrinsicInfo([], []) for name in INTRINSICS}
 
+    def analyze_basic_blocks(self, func, context):
+        key = threading.get_ident()
+        try:
+            _analysing[key] = reader_for_view(func.view)
+        except Exception:
+            _analysing[key] = None
+        try:
+            super().analyze_basic_blocks(func, context)
+        finally:
+            _analysing.pop(key, None)
+
     def get_instruction_info(self, data, addr):
         instr, operand, length, value = decode_instruction(data, addr)
         if instr is None:
@@ -90,21 +113,10 @@ class JVM(Architecture):
 
         result = InstructionInfo()
         result.length = length
-        if instr in ("goto", "goto_w"):
-            result.add_branch(BranchType.UnconditionalBranch, value)
-        elif instr in ("jsr", "jsr_w"):
-            result.add_branch(BranchType.CallDestination, value)
-        elif instr in ("tableswitch", "lookupswitch"):
-            # targets come from the lifted compare chain (and analyze_tables)
-            result.add_branch(BranchType.IndirectBranch)
-        elif instr in RETURNS:
-            result.add_branch(BranchType.FunctionReturn)
-        elif instr == "athrow":
-            result.add_branch(BranchType.ExceptionBranch)
-        elif instr in CONDITIONAL_BRANCHES:
-            result.add_branch(BranchType.TrueBranch, value)
-            result.add_branch(BranchType.FalseBranch, addr + length)
-            
+        reader = _analysing.get(threading.get_ident())
+        mi = method_info(reader, addr) if reader is not None else None
+        for kind, target in instruction_branches(instr, value, addr, length, mi):
+            result.add_branch(BranchType[kind], target)
         return result
 
     def get_instruction_text(self, data, addr):
@@ -142,7 +154,7 @@ class JVMCallCallingConvention(CallingConvention):
     # call outputs in BN 6.1 on this 32-bit architecture)
     int_return_reg = "r"
     high_int_return_reg = "rh"
-    caller_saved_regs = ["r", "rh"]
+    caller_saved_regs = ["r", "rh", "exc"]  # exc: any call may throw
     eligible_for_heuristics = False
 
 
