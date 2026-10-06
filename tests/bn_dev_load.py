@@ -1,7 +1,9 @@
 # Run inside Binary Ninja via the script bridge:  bnrun tests/bn_dev_load.py
 # Copies the plugin package to /tmp/jvm_devN/, renames the architecture/view to "JVM-devN" / "JVM Class devN"
 # and imports it, so the lifter can be iterated without restarting Binary Ninja (BN can't unregister an
-# architecture or view type). Earlier dev view types are disabled. The Pseudo-Java language follows ARCH_NAME.
+# architecture or view type). Dev views are never offered for auto-detection (the GUI's view list only shows
+# the installed "JVM Class Format"); create them explicitly with BinaryViewType[VIEW_NAME].create(...). Their
+# long name is "JVM Class Format (devN)". The Pseudo-Java language follows ARCH_NAME.
 import importlib.util, os, shutil, sys
 import binaryninja as _bn
 
@@ -9,8 +11,6 @@ REPO = globals().get("JVM_REPO", "/Users/patrick/dev/binary-jvm")  # prepend JVM
 _dev = getattr(_bn, "_jvm_dev", None)
 if _dev is None:
     _dev = _bn._jvm_dev = {"n": 0, "views": []}
-for _v in _dev["views"]:
-    _v.is_valid_for_data = classmethod(lambda cls, data: False)
 _dev["n"] += 1
 _n = _dev["n"]
 _name = "jvm_dev%d" % _n
@@ -24,11 +24,16 @@ _c = os.path.join(_dst, "constants.py")
 _src = open(_c).read()
 _src = _src.replace('ARCH_NAME = "JVM"', 'ARCH_NAME = "JVM-dev%d"' % _n).replace('VIEW_NAME = "JVM Class"', 'VIEW_NAME = "JVM Class dev%d"' % _n)
 open(_c, "w").write(_src)
+_vp = os.path.join(_dst, "view.py")
+_vsrc = open(_vp).read()
+open(_vp, "w").write(_vsrc.replace('long_name = "JVM Class Format"', 'long_name = "JVM Class Format (dev%d)"' % _n))
 _spec = importlib.util.spec_from_file_location(_name, os.path.join(_dst, "__init__.py"), submodule_search_locations=[_dst])
 _mod = importlib.util.module_from_spec(_spec)
 sys.modules[_name] = _mod
 _spec.loader.exec_module(_mod)  # registers arch + calling convention + view
-_dev["views"].append(sys.modules[_name + ".view"].ClassView)
+_view = sys.modules[_name + ".view"].ClassView
+_view.is_valid_for_data = classmethod(lambda cls, data: False)  # explicit create only
+_dev["views"].append(_view)
 _dev["pkg"] = _mod
 _dev["ns"] = {"VIEW_NAME": sys.modules[_name + ".constants"].VIEW_NAME, "ARCH_NAME": sys.modules[_name + ".constants"].ARCH_NAME}
 # the Pseudo-Java language name derives from ARCH_NAME ("Pseudo-Java JVM-devN"), so it is fresh per load too
