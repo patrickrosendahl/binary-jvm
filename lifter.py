@@ -1,16 +1,22 @@
 """LLIL lifting for every JVM opcode.
 
-Model: each local slot n is register l<n> (8 bytes; l<n>_lo is its low 4 bytes), the operand stack is the
-real stack (4-byte slots, long/double take two), objects/fields/calls are intrinsics whose stack effects
-come from the constant-pool descriptors.
+Model: each local slot n is register l<n> (8 bytes; l<n>_lo is its low 4 bytes). Operand-stack entry k
+(counted in entries from the bottom; a long/double is one entry) is register st<k> (8 bytes) or
+st<k>_lo (4 bytes), using the stack shape methodinfo/stackmap computed for the instruction. Entries
+from NUM_STACK_REGS up, and the whole stack of instructions without a known shape (unreachable code,
+no class reader), use the real stack on `s` (4-byte slots, long/double take two). Objects/fields/calls
+are intrinsics or calls whose stack effects come from the constant-pool descriptors.
 """
 from binaryninja import LLIL_TEMP, LowLevelILLabel, Type
 
 from .constants import *
 from .opcodes import InstructionNames, slot_size, parse_method_descriptor
 from .classfile import (reader_for_view, JVMIntegerInfo, JVMFloatInfo, JVMLongInfo, JVMDoubleInfo)
+from .methodinfo import method_info
+from . import stackmap
 
 T0, T1, T2 = LLIL_TEMP(0), LLIL_TEMP(1), LLIL_TEMP(2)
+STACK_TEMP = 0x100  # temps for values popped off the memory stack / moved by stack shuffles
 
 def reader_for_il(il):
     try:
@@ -29,6 +35,10 @@ def local_reg(index, size):
     # l<n> is the 8-byte register of local slot n, l<n>_lo its low 4 bytes
     return ("l%d" if size == 8 else "l%d_lo") % index
 
+def stack_reg(index, size):
+    # operand-stack entry n: st<n> when it holds a long/double, st<n>_lo (a separate 4-byte register) otherwise
+    return ("st%d" if size == 8 else "st%d_lo") % index
+
 def local_expr(il, index, size):
     if index < NUM_LOCAL_REGS:
         return il.reg(size, local_reg(index, size))
@@ -42,12 +52,6 @@ def set_local(il, index, size, value):
 def pool_pointer(il, index):
     return il.const_pointer(ADDR_SIZE, pool_address(index))
 
-def push(il, size, expr):
-    il.append(il.push(size, expr))
-
-def pop_temp(il, temp, size):
-    il.append(il.set_reg(size, temp, il.pop(size)))
-
 def branch(il, target):
     label = il.get_label_for_address(il.arch, target)
     if label is not None:
@@ -55,24 +59,82 @@ def branch(il, target):
     else:
         il.append(il.jump(il.const_pointer(ADDR_SIZE, target)))
 
-def branch_if(il, cond, target):
-    # falls through to whatever is lifted next when cond is false
+def branch_if(il, cond, target, negate=False):
+    """goto target if cond (if not cond, when negate); falls through to whatever is lifted next otherwise"""
     t = il.get_label_for_address(il.arch, target)
     f = LowLevelILLabel()
-    if t is not None:
-        il.append(il.if_expr(cond, t, f))
-    else:
+    jump = t is None
+    if jump:
         t = LowLevelILLabel()
-        il.append(il.if_expr(cond, t, f))
+    il.append(il.if_expr(cond, f, t) if negate else il.if_expr(cond, t, f))
+    if jump:
         il.mark_label(t)
         il.append(il.jump(il.const_pointer(ADDR_SIZE, target)))
     il.mark_label(f)
+
+class Stack:
+    """The operand stack of one instruction. pop() returns a function building a fresh expression for
+    the value (call it as often as needed); values popped from registers are read lazily, so lifters
+    must use them before pushing over them (they all pop first and push last)."""
+    def __init__(self, il, state):
+        self.il = il
+        self.cats = None if state is None else list(state)
+        self.ntemp = 0
+
+    def temp(self):
+        self.ntemp += 1
+        return LLIL_TEMP(STACK_TEMP + self.ntemp)
+
+    def in_regs(self, entry):
+        return self.cats is not None and entry < NUM_STACK_REGS
+
+    def pop(self, size):
+        il = self.il
+        if self.cats is not None and self.cats:
+            k = len(self.cats) - 1
+            self.cats.pop()
+            if k < NUM_STACK_REGS:
+                name = stack_reg(k, size)
+                return lambda: il.reg(size, name)
+        t = self.temp()
+        il.append(il.set_reg(size, t, il.pop(size)))
+        return lambda: il.reg(size, t)
+
+    def push_target(self, size):
+        """register the next push writes (None: the memory stack); claims the entry"""
+        if self.cats is None:
+            return None
+        k = len(self.cats)
+        self.cats.append(2 if size == 8 else 1)
+        return stack_reg(k, size) if k < NUM_STACK_REGS else None
+
+    def push(self, size, expr):
+        il = self.il
+        name = self.push_target(size)
+        if name is None:
+            il.append(il.push(size, expr))
+        else:
+            il.append(il.set_reg(size, name, expr))
+
+    def push_intrinsic(self, size, intrinsic, params):
+        """push the single output of an intrinsic (straight into the stack register when there is one)"""
+        il = self.il
+        name = self.push_target(size)
+        if name is None:
+            t = self.temp()
+            il.append(il.intrinsic([t], intrinsic, params))
+            il.append(il.push(size, il.reg(size, t)))
+        else:
+            il.append(il.intrinsic([name], intrinsic, params))
 
 class LiftContext():
     def __init__(self, addr, length, reader):
         self.addr = addr
         self.length = length
         self.reader = reader
+        self.method = method_info(reader, addr)
+        self.state = self.method.state(addr) if self.method is not None else None
+        self.stack = None
 
     def pool(self, index):
         if self.reader is None:
@@ -84,6 +146,20 @@ class LiftContext():
             return None
         return self.reader.memberDescriptor(index)
 
+    def pop(self, size):
+        return self.stack.pop(size)
+
+    def push(self, size, expr):
+        self.stack.push(size, expr)
+
+    def push_intrinsic(self, size, intrinsic, params):
+        self.stack.push_intrinsic(size, intrinsic, params)
+
+def lift_instruction(il, name, value, ctx):
+    """lift one decoded instruction (the entry point for the architecture)"""
+    ctx.stack = Stack(il, ctx.state)
+    InstructionIL[name](il, value, ctx)
+
 # --- lifters: each takes (il, operand, ctx) and appends its own instructions ---
 
 def lift_const(size, value):
@@ -91,95 +167,151 @@ def lift_const(size, value):
         make = (lambda il: il.float_const_single(value)) if size == 4 else (lambda il: il.float_const_double(value))
     else:
         make = lambda il: il.const(size, value)
-    return lambda il, v, ctx: push(il, size, make(il))
+    return lambda il, v, ctx: ctx.push(size, make(il))
 
 def lift_ldc(size):
     def lift(il, index, ctx):
         entry = ctx.pool(index)
         if isinstance(entry, JVMIntegerInfo):
-            push(il, 4, il.const(4, signed(entry.value, 32)))
+            ctx.push(4, il.const(4, signed(entry.value, 32)))
         elif isinstance(entry, JVMFloatInfo):
-            push(il, 4, il.float_const_single(entry.value))
+            ctx.push(4, il.float_const_single(entry.value))
         elif isinstance(entry, JVMLongInfo):
-            push(il, 8, il.const(8, signed(entry.value, 64)))
+            ctx.push(8, il.const(8, signed(entry.value, 64)))
         elif isinstance(entry, JVMDoubleInfo):
-            push(il, 8, il.float_const_double(entry.value))
+            ctx.push(8, il.float_const_double(entry.value))
         elif size == 4:
             # String / Class / MethodType / MethodHandle / Dynamic: a reference to the pool entry
-            push(il, 4, pool_pointer(il, index))
+            ctx.push(4, pool_pointer(il, index))
         else:
-            push(il, 8, il.load(8, pool_pointer(il, index)))
+            ctx.push(8, il.load(8, pool_pointer(il, index)))
     return lift
 
 def signed(value, bits):
     return value - (1 << bits) if value >= (1 << (bits-1)) else value
 
 def lift_load_local(size, index=None):
-    return lambda il, v, ctx: push(il, size, local_expr(il, v if index is None else index, size))
+    return lambda il, v, ctx: ctx.push(size, local_expr(il, v if index is None else index, size))
 
 def lift_store_local(size, index=None):
-    return lambda il, v, ctx: il.append(set_local(il, v if index is None else index, size, il.pop(size)))
+    return lambda il, v, ctx: il.append(set_local(il, v if index is None else index, size, ctx.pop(size)()))
 
-def element_address(il, elem):
-    return il.add(ADDR_SIZE, il.reg(ADDR_SIZE, T0), il.mult(ADDR_SIZE, il.reg(4, T1), il.const(ADDR_SIZE, elem)))
+def element_address(il, arrayref, index, elem):
+    return il.add(ADDR_SIZE, arrayref(), il.mult(ADDR_SIZE, index(), il.const(ADDR_SIZE, elem)))
 
 def lift_array_load(elem, size, extend=None):
     def lift(il, v, ctx):
-        pop_temp(il, T1, 4)          # index
-        pop_temp(il, T0, ADDR_SIZE)  # arrayref
-        value = il.load(elem, element_address(il, elem))
+        index = ctx.pop(4)
+        arrayref = ctx.pop(ADDR_SIZE)
+        value = il.load(elem, element_address(il, arrayref, index, elem))
         if extend is not None:
             value = getattr(il, extend)(size, value)
-        push(il, size, value)
+        ctx.push(size, value)
     return lift
 
 def lift_array_store(elem, size):
     def lift(il, v, ctx):
-        pop_temp(il, T2, size)       # value
-        pop_temp(il, T1, 4)          # index
-        pop_temp(il, T0, ADDR_SIZE)  # arrayref
-        value = il.reg(size, T2)
+        value = ctx.pop(size)
+        index = ctx.pop(4)
+        arrayref = ctx.pop(ADDR_SIZE)
+        value = value()
         if elem < size:
             value = il.low_part(elem, value)
-        il.append(il.store(elem, element_address(il, elem), value))
+        il.append(il.store(elem, element_address(il, arrayref, index, elem), value))
     return lift
 
-def lift_stack_shuffle(pops, pushes):
-    # pops: sizes popped into T0, T1, ... (top of stack first); pushes: temp numbers pushed in order
+# stack shuffles without a known stack shape: sizes popped into temps (top first), temps pushed in order
+_SHUFFLE_FALLBACK = {
+    "pop": ([4], []), "pop2": ([8], []), "dup": ([4], [0, 0]), "dup_x1": ([4, 4], [0, 1, 0]),
+    "dup_x2": ([4, 8], [0, 1, 0]), "dup2": ([8], [0, 0]), "dup2_x1": ([8, 4], [0, 1, 0]),
+    "dup2_x2": ([8, 8], [0, 1, 0]), "swap": ([4, 4], [0, 1]),
+}
+
+def shuffle_layout(name, state):
+    """-> (first entry the instruction touches, source entry of each entry from there up afterwards)"""
+    if name in stackmap._POP:
+        rest, _ = stackmap._take_slots(state, stackmap._POP[name])
+        return len(rest), []
+    if name == "swap":
+        r = len(stackmap._pop(state, (1, 1)))
+        return r, [r + 1, r]
+    n, m = stackmap._DUP[name]
+    rest, top = stackmap._take_slots(state, n)
+    rest, below = stackmap._take_slots(rest, m)
+    r, b, t = len(rest), len(below), len(top)
+    tops = list(range(r + b, r + b + t))
+    return r, tops + list(range(r, r + b)) + tops
+
+def lift_stack_shuffle(name):
     def lift(il, v, ctx):
-        for i, size in enumerate(pops):
-            pop_temp(il, LLIL_TEMP(i), size)
-        for i in pushes:
-            push(il, pops[i], il.reg(pops[i], LLIL_TEMP(i)))
+        state = ctx.state
+        if state is None:
+            pops, pushes = _SHUFFLE_FALLBACK[name]
+            temps = [ctx.stack.temp() for _ in pops]
+            for i, size in enumerate(pops):
+                il.append(il.set_reg(size, temps[i], il.pop(size)))
+            for i in pushes:
+                il.append(il.push(pops[i], il.reg(pops[i], temps[i])))
+            if not pushes:
+                il.append(il.nop())
+            return
+        try:
+            first, srcs = shuffle_layout(name, state)
+        except stackmap.StackError:
+            il.append(il.unimplemented())
+            return
+        size = lambda entry: 4 * state[entry]
+        if len(state) <= NUM_STACK_REGS and first + len(srcs) <= NUM_STACK_REGS:
+            # register moves; sources that get overwritten are saved in temps first
+            writes = [(first + i, s) for i, s in enumerate(srcs) if first + i != s]
+            written = {p for p, _ in writes}
+            saved = {}
+            for _, s in writes:
+                if s in written and s not in saved:
+                    saved[s] = ctx.stack.temp()
+                    il.append(il.set_reg(size(s), saved[s], il.reg(size(s), stack_reg(s, size(s)))))
+            for p, s in writes:
+                src = saved[s] if s in saved else stack_reg(s, size(s))
+                il.append(il.set_reg(size(s), stack_reg(p, size(s)), il.reg(size(s), src)))
+            if not writes:
+                il.append(il.nop())
+            return
+        # deep stack: pop the touched entries into temps, push them back in the new order
+        temps = {}
+        for entry in reversed(range(first, len(state))):
+            value = ctx.pop(size(entry))
+            temps[entry] = ctx.stack.temp()
+            il.append(il.set_reg(size(entry), temps[entry], value()))
+        for s in srcs:
+            ctx.push(size(s), il.reg(size(s), temps[s]))
     return lift
 
 def lift_binop(op, size, rsize=None, mask=None):
     rsize = rsize or size
     def lift(il, v, ctx):
-        pop_temp(il, T1, rsize)  # value2
-        pop_temp(il, T0, size)   # value1
-        rhs = il.reg(rsize, T1)
+        b = ctx.pop(rsize)  # value2
+        a = ctx.pop(size)   # value1
+        rhs = b()
         if mask is not None:
             rhs = il.and_expr(rsize, rhs, il.const(rsize, mask))
-        push(il, size, getattr(il, op)(size, il.reg(size, T0), rhs))
+        ctx.push(size, getattr(il, op)(size, a(), rhs))
     return lift
 
 def lift_unop(op, size):
-    return lambda il, v, ctx: push(il, size, getattr(il, op)(size, il.pop(size)))
+    return lambda il, v, ctx: ctx.push(size, getattr(il, op)(size, ctx.pop(size)()))
 
 def lift_fmod(size):
     def lift(il, v, ctx):
-        pop_temp(il, T1, size)
-        pop_temp(il, T0, size)
-        il.append(il.intrinsic([T2], "fmod", [il.reg(size, T0), il.reg(size, T1)]))
-        push(il, size, il.reg(size, T2))
+        b = ctx.pop(size)
+        a = ctx.pop(size)
+        ctx.push_intrinsic(size, "fmod", [a(), b()])
     return lift
 
 def lift_convert(src, dst, op):
-    return lambda il, v, ctx: push(il, dst, getattr(il, op)(dst, il.pop(src)))
+    return lambda il, v, ctx: ctx.push(dst, getattr(il, op)(dst, ctx.pop(src)()))
 
 def lift_narrow(part, extend):
-    return lambda il, v, ctx: push(il, 4, getattr(il, extend)(4, il.low_part(part, il.pop(4))))
+    return lambda il, v, ctx: ctx.push(4, getattr(il, extend)(4, il.low_part(part, ctx.pop(4)())))
 
 def lift_iinc(il, v, ctx):
     index, const = v
@@ -187,17 +319,15 @@ def lift_iinc(il, v, ctx):
 
 def lift_lcmp(il, v, ctx):
     # (a > b) - (a < b)
-    pop_temp(il, T1, 8)
-    pop_temp(il, T0, 8)
-    a, b = (lambda: il.reg(8, T0)), (lambda: il.reg(8, T1))
-    push(il, 4, il.sub(4, il.bool_to_int(4, il.compare_signed_greater_than(8, a(), b())),
+    b = ctx.pop(8)
+    a = ctx.pop(8)
+    ctx.push(4, il.sub(4, il.bool_to_int(4, il.compare_signed_greater_than(8, a(), b())),
                           il.bool_to_int(4, il.compare_signed_less_than(8, a(), b()))))
 
 def lift_fcmp(size, nan_result):
     def lift(il, v, ctx):
-        pop_temp(il, T1, size)
-        pop_temp(il, T0, size)
-        a, b = (lambda: il.reg(size, T0)), (lambda: il.reg(size, T1))
+        b = ctx.pop(size)
+        a = ctx.pop(size)
         b2i = lambda cond: il.bool_to_int(4, cond)
         if nan_result < 0:
             # fcmpl: (a > b) + (a >= b) - 1   -> NaN gives -1
@@ -207,49 +337,55 @@ def lift_fcmp(size, nan_result):
             # fcmpg: 1 - (a <= b) - (a < b)   -> NaN gives 1
             result = il.sub(4, il.sub(4, il.const(4, 1), b2i(il.float_compare_less_equal(size, a(), b()))),
                                b2i(il.float_compare_less_than(size, a(), b())))
-        push(il, 4, result)
+        ctx.push(4, result)
     return lift
 
 def lift_if_zero(cmp):
-    # pop into a temp first: a pop inside the if condition is not tracked by BN's stack analysis
     def lift(il, v, ctx):
-        pop_temp(il, T0, 4)
-        branch_if(il, getattr(il, cmp)(4, il.reg(4, T0), il.const(4, 0)), v)
+        a = ctx.pop(4)
+        branch_if(il, getattr(il, cmp)(4, a(), il.const(4, 0)), v)
     return lift
 
 def lift_if_cmp(cmp, size=4):
     def lift(il, v, ctx):
-        pop_temp(il, T1, size)
-        pop_temp(il, T0, size)
-        branch_if(il, getattr(il, cmp)(size, il.reg(size, T0), il.reg(size, T1)), v)
+        b = ctx.pop(size)
+        a = ctx.pop(size)
+        branch_if(il, getattr(il, cmp)(size, a(), b()), v)
     return lift
 
 def lift_goto(il, v, ctx):
     branch(il, v)
 
 def lift_jsr(il, v, ctx):
-    # subroutine modelled as a call that pops the pushed return address itself
-    # a plain constant: as a const_pointer BN would start a bogus function at the return address
-    push(il, ADDR_SIZE, il.const(ADDR_SIZE, ctx.addr+ctx.length))
-    il.append(il.call_stack_adjust(il.const_pointer(ADDR_SIZE, v), ADDR_SIZE))
+    # subroutine modelled as a call; the return address it finds on the stack is a plain constant (as a
+    # const_pointer BN would start a bogus function at the return address)
+    ret = il.const(ADDR_SIZE, ctx.addr+ctx.length)
+    name = ctx.stack.push_target(ADDR_SIZE)
+    if name is not None:
+        il.append(il.set_reg(ADDR_SIZE, name, ret))
+        il.append(il.call(il.const_pointer(ADDR_SIZE, v)))
+    else:
+        # memory stack: the "call" pops the pushed return address itself
+        il.append(il.push(ADDR_SIZE, ret))
+        il.append(il.call_stack_adjust(il.const_pointer(ADDR_SIZE, v), ADDR_SIZE))
 
 def lift_ret(il, v, ctx):
     il.append(il.ret(local_expr(il, v, ADDR_SIZE)))
 
 def lift_switch(cases_index):
     def lift(il, v, ctx):
-        pop_temp(il, T0, 4)
-        for key, target in v[cases_index]:
-            branch_if(il, il.compare_equal(4, il.reg(4, T0), il.const(4, key)), target)
+        key = ctx.pop(4)
+        for k, target in v[cases_index]:
+            branch_if(il, il.compare_equal(4, key(), il.const(4, k)), target)
         branch(il, v[0])
     return lift
 
 def lift_return(size):
     def lift(il, v, ctx):
         if size == 4:
-            il.append(il.set_reg(4, "r", il.pop(4)))
+            il.append(il.set_reg(4, "r", ctx.pop(4)()))
         elif size == 8:
-            il.append(il.set_reg_split(4, "rh", "r", il.pop(8)))
+            il.append(il.set_reg_split(4, "rh", "r", ctx.pop(8)()))
         il.append(il.ret(il.reg(ADDR_SIZE, "lr")))
     return lift
 
@@ -267,23 +403,22 @@ def field_size(ctx, index):
 
 def lift_getstatic(il, v, ctx):
     size = field_size(ctx, v)
-    push(il, size, il.load(size, pool_pointer(il, v)))
+    ctx.push(size, il.load(size, pool_pointer(il, v)))
 
 def lift_putstatic(il, v, ctx):
     size = field_size(ctx, v)
-    il.append(il.store(size, pool_pointer(il, v), il.pop(size)))
+    il.append(il.store(size, pool_pointer(il, v), ctx.pop(size)()))
 
 def lift_getfield(il, v, ctx):
     size = field_size(ctx, v)
-    pop_temp(il, T0, ADDR_SIZE)
-    il.append(il.intrinsic([T1], "getfield", [il.reg(ADDR_SIZE, T0), pool_pointer(il, v)]))
-    push(il, size, il.reg(size, T1))
+    obj = ctx.pop(ADDR_SIZE)
+    ctx.push_intrinsic(size, "getfield", [obj(), pool_pointer(il, v)])
 
 def lift_putfield(il, v, ctx):
     size = field_size(ctx, v)
-    pop_temp(il, T1, size)
-    pop_temp(il, T0, ADDR_SIZE)
-    il.append(il.intrinsic([], "putfield", [il.reg(ADDR_SIZE, T0), pool_pointer(il, v), il.reg(size, T1)]))
+    value = ctx.pop(size)
+    obj = ctx.pop(ADDR_SIZE)
+    il.append(il.intrinsic([], "putfield", [obj(), pool_pointer(il, v), value()]))
 
 def lift_invoke(kind):
     def lift(il, v, ctx):
@@ -301,67 +436,55 @@ def lift_invoke(kind):
             # a real call through the pool entry, which the view types as a function pointer (like an
             # import table slot): arguments go to a<i> (receiver first), the result comes back in r / rh:r
             for i in reversed(range(len(sizes))):
-                il.append(il.set_reg(sizes[i], arg_reg(i, sizes[i]), il.pop(sizes[i])))
+                il.append(il.set_reg(sizes[i], arg_reg(i, sizes[i]), ctx.pop(sizes[i])()))
             il.append(il.call(il.load(ADDR_SIZE, pool_pointer(il, index))))
             if ret != 'V':
                 if slot_size(ret) == 8:
-                    # HLIL renders this as (retvar:4.d):(retvar.d); a temp or two 4-byte pushes don't help
-                    push(il, 8, il.reg_split(4, "rh", "r"))
+                    ctx.push(8, il.reg_split(4, "rh", "r"))
                 else:
-                    push(il, 4, il.reg(4, "r"))
+                    ctx.push(4, il.reg(4, "r"))
             return
         # too many arguments for the argument registers: fall back to an intrinsic
-        temps = [LLIL_TEMP(i) for i in range(len(sizes))]
-        for i in reversed(range(len(sizes))):
-            pop_temp(il, temps[i], sizes[i])
-        params = [pool_pointer(il, index)] + [il.reg(sizes[i], temps[i]) for i in range(len(sizes))]
+        values = [ctx.pop(sizes[i]) for i in reversed(range(len(sizes)))][::-1]
+        params = [pool_pointer(il, index)] + [value() for value in values]
         if ret == 'V':
             il.append(il.intrinsic([], kind, params))
         else:
-            out = LLIL_TEMP(len(sizes))
-            il.append(il.intrinsic([out], kind, params))
-            push(il, slot_size(ret), il.reg(slot_size(ret), out))
+            ctx.push_intrinsic(slot_size(ret), kind, params)
     return lift
 
 def lift_new(il, v, ctx):
-    il.append(il.intrinsic([T0], "new", [pool_pointer(il, v)]))
-    push(il, ADDR_SIZE, il.reg(ADDR_SIZE, T0))
+    ctx.push_intrinsic(ADDR_SIZE, "new", [pool_pointer(il, v)])
 
 def lift_newarray(il, v, ctx):
-    pop_temp(il, T0, 4)
-    il.append(il.intrinsic([T1], "newarray", [il.const_pointer(ADDR_SIZE, PSEUDOMEMORY_PRIMITIVES+v), il.reg(4, T0)]))
-    push(il, ADDR_SIZE, il.reg(ADDR_SIZE, T1))
+    count = ctx.pop(4)
+    ctx.push_intrinsic(ADDR_SIZE, "newarray", [il.const_pointer(ADDR_SIZE, PSEUDOMEMORY_PRIMITIVES+v), count()])
 
 def lift_anewarray(il, v, ctx):
-    pop_temp(il, T0, 4)
-    il.append(il.intrinsic([T1], "anewarray", [pool_pointer(il, v), il.reg(4, T0)]))
-    push(il, ADDR_SIZE, il.reg(ADDR_SIZE, T1))
+    count = ctx.pop(4)
+    ctx.push_intrinsic(ADDR_SIZE, "anewarray", [pool_pointer(il, v), count()])
 
 def lift_multianewarray(il, v, ctx):
     index, dims = v
-    for i in reversed(range(dims)):
-        pop_temp(il, LLIL_TEMP(i), 4)
-    out = LLIL_TEMP(dims)
-    il.append(il.intrinsic([out], "multianewarray", [pool_pointer(il, index)] + [il.reg(4, LLIL_TEMP(i)) for i in range(dims)]))
-    push(il, ADDR_SIZE, il.reg(ADDR_SIZE, out))
+    counts = [ctx.pop(4) for _ in range(dims)][::-1]
+    ctx.push_intrinsic(ADDR_SIZE, "multianewarray", [pool_pointer(il, index)] + [c() for c in counts])
 
 def lift_object_op(name, with_class, size):
     # pops an objectref, optionally passes the class operand, pushes a result of `size` (0 = none)
     def lift(il, v, ctx):
-        pop_temp(il, T0, ADDR_SIZE)
-        params = [il.reg(ADDR_SIZE, T0)]
+        obj = ctx.pop(ADDR_SIZE)
+        params = [obj()]
         if with_class:
             params.append(pool_pointer(il, v))
         if size == 0:
             il.append(il.intrinsic([], name, params))
         else:
-            il.append(il.intrinsic([T1], name, params))
-            push(il, size, il.reg(size, T1))
+            ctx.push_intrinsic(size, name, params)
     return lift
 
 def lift_athrow(il, v, ctx):
-    pop_temp(il, T0, ADDR_SIZE)
-    il.append(il.intrinsic([], "athrow", [il.reg(ADDR_SIZE, T0)]))
+    obj = ctx.pop(ADDR_SIZE)
+    il.append(il.intrinsic([], "athrow", [obj()]))
     il.append(il.no_ret())
 
 def lift_wide(il, v, ctx):
@@ -377,7 +500,7 @@ INTRINSICS = ["invokevirtual", "invokespecial", "invokestatic", "invokeinterface
 
 InstructionIL = {
     "nop":         lambda il, v, ctx: il.append(il.nop()),
-    "aconst_null": lambda il, v, ctx: push(il, ADDR_SIZE, il.const(ADDR_SIZE, 0)),
+    "aconst_null": lambda il, v, ctx: ctx.push(ADDR_SIZE, il.const(ADDR_SIZE, 0)),
     "iconst_m1":   lift_const(4, -1),
     "iconst_0":    lift_const(4, 0),
     "iconst_1":    lift_const(4, 1),
@@ -392,8 +515,8 @@ InstructionIL = {
     "fconst_2":    lift_const(4, 2.0),
     "dconst_0":    lift_const(8, 0.0),
     "dconst_1":    lift_const(8, 1.0),
-    "bipush":      lambda il, v, ctx: push(il, 4, il.const(4, v)),
-    "sipush":      lambda il, v, ctx: push(il, 4, il.const(4, v)),
+    "bipush":      lambda il, v, ctx: ctx.push(4, il.const(4, v)),
+    "sipush":      lambda il, v, ctx: ctx.push(4, il.const(4, v)),
     "ldc":         lift_ldc(4),
     "ldc_w":       lift_ldc(4),
     "ldc2_w":      lift_ldc(8),
@@ -416,16 +539,16 @@ InstructionIL = {
     "castore":     lift_array_store(2, 4),
     "sastore":     lift_array_store(2, 4),
 
-    # operand stack: every slot is 4 bytes, category-2 values (long/double) take two slots
-    "pop":         lift_stack_shuffle([4], []),
-    "pop2":        lift_stack_shuffle([8], []),
-    "dup":         lift_stack_shuffle([4], [0, 0]),
-    "dup_x1":      lift_stack_shuffle([4, 4], [0, 1, 0]),
-    "dup_x2":      lift_stack_shuffle([4, 8], [0, 1, 0]),
-    "dup2":        lift_stack_shuffle([8], [0, 0]),
-    "dup2_x1":     lift_stack_shuffle([8, 4], [0, 1, 0]),
-    "dup2_x2":     lift_stack_shuffle([8, 8], [0, 1, 0]),
-    "swap":        lift_stack_shuffle([4, 4], [0, 1]),
+    # operand stack: register moves using the known categories
+    "pop":         lift_stack_shuffle("pop"),
+    "pop2":        lift_stack_shuffle("pop2"),
+    "dup":         lift_stack_shuffle("dup"),
+    "dup_x1":      lift_stack_shuffle("dup_x1"),
+    "dup_x2":      lift_stack_shuffle("dup_x2"),
+    "dup2":        lift_stack_shuffle("dup2"),
+    "dup2_x1":     lift_stack_shuffle("dup2_x1"),
+    "dup2_x2":     lift_stack_shuffle("dup2_x2"),
+    "swap":        lift_stack_shuffle("swap"),
 
     "iadd":        lift_binop("add", 4),
     "ladd":        lift_binop("add", 8),

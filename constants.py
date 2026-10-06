@@ -6,6 +6,7 @@ VIEW_NAME = "JVM Class"
 ADDR_SIZE = 4
 NUM_LOCAL_REGS = 64  # locals 0..63 are registers (covers >99.9% of methods); higher wide-indexed locals live in pseudo memory
 LOCALS_ADDR = 0x8000
+NUM_STACK_REGS = 64  # operand-stack entries 0..63 are registers st<n> (javac stacks stay far below); deeper ones live on the memory stack `s`
 NUM_ARG_REGS = 32  # outgoing call arguments a0..a31 (receiver included; covers >99.99% of sample descriptors)
 # invoke* as real calls through typed pool slots (readable `StringBuilder.append(sb, s)`); costs ~2-3x
 # analysis time on call-heavy classes. False = the older invokevirtual(...) intrinsics.

@@ -4,7 +4,7 @@ from binaryninja import (Architecture, CallingConvention, RegisterInfo, Intrinsi
 
 from .constants import *
 from .opcodes import *
-from .lifter import InstructionIL, INTRINSICS, LiftContext, reader_for_il
+from .lifter import lift_instruction, INTRINSICS, LiftContext, reader_for_il
 
 def int_token(text, value=None):
     if value is None:
@@ -59,6 +59,12 @@ def _build_regs():
     for n in range(NUM_ARG_REGS):
         regs["a%d" % n] = RegisterInfo("a%d" % n, 8)
         regs["a%d_lo" % n] = RegisterInfo("a%d" % n, 4, 0)
+    # operand-stack entry n: st<n>_lo holds a category-1 value (int/float/reference), st<n> a long/double.
+    # Independent registers, not sub-registers: an entry holds 4- and 8-byte values at different points of
+    # a method, and a partial write of a shared register would make BN merge them (.d/.q accessors)
+    for n in range(NUM_STACK_REGS):
+        regs["st%d" % n] = RegisterInfo("st%d" % n, 8)
+        regs["st%d_lo" % n] = RegisterInfo("st%d_lo" % n, 4)
     return regs
 
 class JVM(Architecture):
@@ -110,7 +116,7 @@ class JVM(Architecture):
         instr, operand, length, value = decode_instruction(data, addr)
         if instr is None:
             return None
-        InstructionIL[instr](il, value, LiftContext(addr, length, reader_for_il(il)))
+        lift_instruction(il, instr, value, LiftContext(addr, length, reader_for_il(il)))
         return length
 
 
