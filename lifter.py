@@ -158,6 +158,15 @@ class LiftContext():
 def lift_instruction(il, name, value, ctx):
     """lift one decoded instruction (the entry point for the architecture)"""
     ctx.stack = Stack(il, ctx.state)
+    mi = ctx.method
+    if mi is not None:
+        off = ctx.addr - mi.base
+        if off in mi.fused_cmp:
+            lift_cmp_fused(il, name, ctx)
+            return
+        if off in mi.fused_if:
+            lift_if_fused(il, mi.fused_if[off], name, value, ctx)
+            return
     InstructionIL[name](il, value, ctx)
 
 # --- lifters: each takes (il, operand, ctx) and appends its own instructions ---
@@ -339,6 +348,43 @@ def lift_fcmp(size, nan_result):
                                b2i(il.float_compare_less_than(size, a(), b())))
         ctx.push(4, result)
     return lift
+
+# compare fusion (jvm-32): `lcmp; ifge L` lifts as `cmpa = a; cmpb = b` + `if (cmpa >= cmpb) goto L`.
+# (compare, if) -> (LLIL comparison of a and b, negate): the branch is taken iff the comparison holds
+# (fails, when negated). Float comparisons are ordered (false on NaN); fcmpl/dcmpl make NaN -1 and
+# fcmpg/dcmpg make it 1, so the conditions NaN satisfies are the negation of an ordered compare.
+_IF_OPS = {"ifeq": "eq", "ifne": "ne", "iflt": "lt", "ifge": "ge", "ifgt": "gt", "ifle": "le"}
+_LCMP = {"eq": ("compare_equal", False), "ne": ("compare_not_equal", False),
+         "lt": ("compare_signed_less_than", False), "ge": ("compare_signed_greater_equal", False),
+         "gt": ("compare_signed_greater_than", False), "le": ("compare_signed_less_equal", False)}
+_FCMPL = {"eq": ("float_compare_equal", False), "ne": ("float_compare_equal", True),
+          "lt": ("float_compare_greater_equal", True), "ge": ("float_compare_greater_equal", False),
+          "gt": ("float_compare_greater_than", False), "le": ("float_compare_greater_than", True)}
+_FCMPG = {"eq": ("float_compare_equal", False), "ne": ("float_compare_equal", True),
+          "lt": ("float_compare_less_than", False), "ge": ("float_compare_less_than", True),
+          "gt": ("float_compare_less_equal", True), "le": ("float_compare_less_equal", False)}
+FUSED_COMPARE = {}
+for _cmp, _table in (("lcmp", _LCMP), ("fcmpl", _FCMPL), ("dcmpl", _FCMPL), ("fcmpg", _FCMPG), ("dcmpg", _FCMPG)):
+    for _if, _op in _IF_OPS.items():
+        FUSED_COMPARE[(_cmp, _if)] = _table[_op]
+COMPARE_SIZE = {"lcmp": 8, "fcmpl": 4, "fcmpg": 4, "dcmpl": 8, "dcmpg": 8}
+
+def compare_regs(size):
+    return ("cmpa", "cmpb") if size == 8 else ("cmpa_lo", "cmpb_lo")
+
+def lift_cmp_fused(il, name, ctx):
+    size = COMPARE_SIZE[name]
+    ra, rb = compare_regs(size)
+    b = ctx.pop(size)
+    a = ctx.pop(size)
+    il.append(il.set_reg(size, ra, a()))
+    il.append(il.set_reg(size, rb, b()))
+
+def lift_if_fused(il, cmp, name, target, ctx):
+    size = COMPARE_SIZE[cmp]
+    ra, rb = compare_regs(size)
+    op, negate = FUSED_COMPARE[(cmp, name)]
+    branch_if(il, getattr(il, op)(size, il.reg(size, ra), il.reg(size, rb)), target, negate)
 
 def lift_if_zero(cmp):
     def lift(il, v, ctx):

@@ -15,6 +15,8 @@ ACCESSOR = re.compile(r"[\w\]\)](:\d+)?(?<!sx)(?<!zx)\.[dq]\b(?!\()")  # var.d /
 vt = b.BinaryViewType[globals().get("VIEW", b._jvm_dev["ns"]["VIEW_NAME"])]  # VIEW = "JVM Class devN": pin your own dev load (other sessions load too)
 paths = sorted(os.path.join(d, f) for d, _, fs in os.walk(CLASS_DIR) for f in fs if f.endswith(".class"))
 paths = paths[START:START + LIMIT]
+if globals().get("FILES"):  # FILES = ["com/x/Y.class", ...] relative to CLASS_DIR instead of a slice
+    paths = [os.path.join(CLASS_DIR, f) for f in FILES]
 tot = {"classes": 0, "functions": 0, "accessor_lines": 0, "accessor_classes": 0, "catch_funcs": 0, "time": 0.0, "hlil_fail": 0}
 for p in paths:
     t = time.time()
@@ -38,7 +40,7 @@ for p in paths:
         lines += len(hits)
         for l in hits[:SHOW]:
             print("   %s: %s" % (f.name, l.strip()))
-        if "%s.%s" % (cname, f.name) in DUMP:
+        if "%s.%s" % (cname, f.name) in DUMP or "%s.*" % cname in DUMP:
             print("==== %s.%s" % (cname, f.name))
             print("\n".join(text))
     tot["classes"] += 1

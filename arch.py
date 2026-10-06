@@ -65,6 +65,10 @@ def _build_regs():
     for n in range(NUM_STACK_REGS):
         regs["st%d" % n] = RegisterInfo("st%d" % n, 8)
         regs["st%d_lo" % n] = RegisterInfo("st%d_lo" % n, 4)
+    # operands of a compare fused with the following if (lcmp/dcmp*: cmpa/cmpb, fcmp*: the _lo registers)
+    for name in ("cmpa", "cmpb"):
+        regs[name] = RegisterInfo(name, 8)
+        regs[name + "_lo"] = RegisterInfo(name + "_lo", 4)
     return regs
 
 class JVM(Architecture):

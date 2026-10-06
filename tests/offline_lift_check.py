@@ -78,6 +78,7 @@ class MockIL:
         self.reads = []      # (entry, size) of stack registers read before being written
         self.writes = {}     # entry -> size of the last write
         self.errors = []
+        self.other_reads = set()  # non-stack registers read
     def append(self, expr): pass
     def mark_label(self, label): pass
     def get_label_for_address(self, arch, addr): return None
@@ -94,6 +95,7 @@ class MockIL:
                 return self.vals.get(k)
             self.reads.append((k, size))
             return ("in", k, size)
+        self.other_reads.add(name)
         return self.vals.get(name, ("reg", name))
     def _write(self, size, name, value):
         m = ST.match(name) if isinstance(name, str) else None
@@ -174,9 +176,18 @@ def popped_entries(reader, name, value, state):
     args, _ = opcodes.parse_method_descriptor(reader.memberDescriptor(index))
     return len(args) + (0 if name in ("invokestatic", "invokedynamic") else 1)
 
-def check_stack_regs(reader, name, value, state, il, where, stats):
-    """the stack-register checks for an instruction with a known stack shape; returns error strings"""
+def check_stack_regs(reader, name, value, state, il, where, stats, fused=None):
+    """the stack-register checks for an instruction with a known stack shape; returns error strings.
+    fused: "cmp" / "if" for the two halves of a fused compare (the result entry is never materialised:
+    the compare leaves its operands in cmpa/cmpb, the if reads them instead of popping)"""
     errors = list(il.errors)
+    if fused == "cmp":
+        regs = ("cmpa", "cmpb") if name in ("lcmp", "dcmpl", "dcmpg") else ("cmpa_lo", "cmpb_lo")
+        if any(r not in il.vals for r in regs):
+            errors.append("fused compare does not set %s/%s" % regs)
+    elif fused == "if":
+        if not ({"cmpa", "cmpb"} <= il.other_reads or {"cmpa_lo", "cmpb_lo"} <= il.other_reads):
+            errors.append("fused if does not compare cmpa/cmpb")
     jsr = name in ("jsr", "jsr_w")
     out = stackmap._effect(name, value, state, reader.memberDescriptor)
     if jsr:
@@ -208,7 +219,7 @@ def check_stack_regs(reader, name, value, state, il, where, stats):
                 errors.append("entry %d holds %r, expected entry %d" % (p, got, s))
     else:
         for k in range(first, min(len(out), NUM_STACK_REGS)):
-            if k not in il.writes:
+            if k not in il.writes and fused != "cmp":
                 errors.append("does not write pushed entry st%d" % k)
     if jsr:
         if len(state) < NUM_STACK_REGS and il.writes.get(len(state)) != 4:
@@ -220,6 +231,31 @@ def check_stack_regs(reader, name, value, state, il, where, stats):
         errors.append("memory stack moves %d bytes, expected %d" % (il.delta, mem))
     if len(state) > NUM_STACK_REGS or len(out) > NUM_STACK_REGS:
         stats["deep"] += 1
+    return errors
+
+def check_fused_semantics():
+    """every (compare, if) pair of the fusion table branches exactly when the JVM would, incl. NaN"""
+    nan = float("nan")
+    ordered = {"compare_equal": lambda a, b: a == b, "compare_not_equal": lambda a, b: a != b,
+               "compare_signed_less_than": lambda a, b: a < b, "compare_signed_less_equal": lambda a, b: a <= b,
+               "compare_signed_greater_than": lambda a, b: a > b, "compare_signed_greater_equal": lambda a, b: a >= b,
+               "float_compare_equal": lambda a, b: a == b, "float_compare_less_than": lambda a, b: a < b,
+               "float_compare_less_equal": lambda a, b: a <= b, "float_compare_greater_than": lambda a, b: a > b,
+               "float_compare_greater_equal": lambda a, b: a >= b}  # Python float compares are ordered
+    conds = {"ifeq": lambda r: r == 0, "ifne": lambda r: r != 0, "iflt": lambda r: r < 0,
+             "ifge": lambda r: r >= 0, "ifgt": lambda r: r > 0, "ifle": lambda r: r <= 0}
+    def jvm_cmp(cmp, a, b):
+        if a != a or b != b:
+            return -1 if cmp.endswith("l") else 1
+        return (a > b) - (a < b)
+    errors = []
+    for (cmp, cond), (op, negate) in lifter.FUSED_COMPARE.items():
+        pairs = [(1, 2), (2, 2), (3, 2)] + ([] if cmp == "lcmp" else [(nan, 1.0), (1.0, nan), (nan, nan)])
+        for a, b in pairs:
+            want = conds[cond](jvm_cmp(cmp, a, b))
+            got = ordered[op](a, b) != negate
+            if want != got:
+                errors.append("%s+%s on (%r, %r): lifted %s, JVM %s" % (cmp, cond, a, b, got, want))
     return errors
 
 # ---- driver -------------------------------------------------------------------------------------
@@ -246,7 +282,11 @@ def check_class(label, raw, stats):
             il = MockIL()
             ctx = lifter.LiftContext(addr, length, reader)
             if NOSTATE:
-                ctx.state = None
+                ctx.state = ctx.method = None
+            mi = ctx.method
+            fused = None if mi is None else "cmp" if off in mi.fused_cmp else "if" if off in mi.fused_if else None
+            if fused:
+                stats["fused"] += 1
             try:
                 lifter.lift_instruction(il, name, value, ctx)
             except Exception as e:
@@ -263,7 +303,7 @@ def check_class(label, raw, stats):
                     stats["stack_regs"].append("%s: uses stack registers without a stack shape" % where)
             else:
                 try:
-                    errors = check_stack_regs(reader, name, value, ctx.state, il, where, stats)
+                    errors = check_stack_regs(reader, name, value, ctx.state, il, where, stats, fused)
                 except Exception as e:
                     errors = ["check failed: %r" % e]
                 for e in errors:
@@ -273,7 +313,7 @@ def check_class(label, raw, stats):
             stats["tiling"].append("%s m%d" % (label, m.index))
 
 def new_stats():
-    stats = {"count": collections.Counter(), "classes": 0, "nostate": 0, "deep": 0}
+    stats = {"count": collections.Counter(), "classes": 0, "nostate": 0, "deep": 0, "fused": 0}
     for k in KEYS: stats[k] = []
     return stats
 
@@ -333,17 +373,21 @@ def main(args):
     with multiprocessing.Pool(initializer=_init_worker, initargs=(nostate,)) as pool:
         for stats in pool.imap_unordered(check_chunk, chunks(args)):
             total["count"].update(stats["count"])
-            for k in ("classes", "nostate", "deep"):
+            for k in ("classes", "nostate", "deep", "fused"):
                 total[k] += stats[k]
             for k in KEYS: total[k] += stats[k]
     print("classes: %d, instructions: %d, distinct opcodes: %d, %.1fs" % (total["classes"], sum(total["count"].values()), len(total["count"]), time.time()-t0))
-    print("instructions without a stack shape (memory stack): %d; touching entries >= %d: %d" % (total["nostate"], NUM_STACK_REGS, total["deep"]))
+    print("instructions without a stack shape (memory stack): %d; touching entries >= %d: %d; fused compare/if halves: %d"
+          % (total["nostate"], NUM_STACK_REGS, total["deep"], total["fused"]))
+    errors = check_fused_semantics()
+    print("fused compare semantics: %d errors" % len(errors))
+    for line in errors[:10]: print("   ", line)
     for key in KEYS:
         print("%s: %d" % (key, len(total[key])))
         for line in total[key][:10]: print("   ", line)
     unseen = [n for n in opcodes.InstructionNames if n and n not in total["count"]]
     print("opcodes not exercised by the input:", " ".join(unseen))
-    return 0 if not any(total[k] for k in KEYS) else 1
+    return 0 if not any(total[k] for k in KEYS) and not errors else 1
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))

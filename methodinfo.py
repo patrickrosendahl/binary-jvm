@@ -7,9 +7,12 @@ method here and cached on the class reader:
     mi = method_info(reader, addr)     # None outside a method with code
     mi.state(addr)                     # operand-stack categories (bottom..top) on entry, None if unreachable
 """
-from .constants import METHOD_BASE, METHOD_STRIDE, method_address
+from .constants import METHOD_BASE, METHOD_STRIDE, NUM_STACK_REGS, method_address
 from .opcodes import decode_instruction, CONDITIONAL_BRANCHES
 from . import stackmap
+
+COMPARES = {"lcmp", "fcmpl", "fcmpg", "dcmpl", "dcmpg"}
+IF_ZERO = {"ifeq", "ifne", "iflt", "ifge", "ifgt", "ifle"}
 
 class MethodInfo:
     def __init__(self, reader, method):
@@ -44,6 +47,17 @@ class MethodInfo:
 
         self.states, self.max_depth, self.errors = stackmap.compute_stack_states(
             self.code, self.base, self.exception_table, reader.memberDescriptor)
+
+        # compare fusion (jvm-32): lcmp/fcmp*/dcmp* directly followed by if<cond> that nothing else jumps to
+        # lifts as one comparison. fused_cmp: compare offsets; fused_if: if offset -> compare name
+        self.fused_cmp, self.fused_if = set(), {}
+        for off, (name, _, length, _) in self.decoded.items():
+            nxt = off + length
+            if (name in COMPARES and nxt in self.decoded and self.decoded[nxt][0] in IF_ZERO
+                    and nxt not in self.targets and off in self.states and nxt in self.states
+                    and len(self.states[off]) <= NUM_STACK_REGS):
+                self.fused_cmp.add(off)
+                self.fused_if[nxt] = name
 
     def state(self, addr):
         return self.states.get(addr - self.base)
