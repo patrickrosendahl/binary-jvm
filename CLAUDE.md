@@ -4,12 +4,10 @@ Guidance for Claude Code working in this repo. **The task list / roadmap lives i
 [`README.md`](README.md)** ("Roadmap / TODO") — this file is the environment + how-to-work
 reference. Read both before starting.
 
-**⏸ Paused (2026-10-06).** Work stopped by decision: Binary Ninja will never generate really
-usable Java-level code (classes, exception handling, source-level structure), so further
-investment isn't worth it. The plugin is **unregistered** from Binary Ninja (plugin symlink
-removed, `files.container.excludedTransforms` reset). Details, what works and the known gaps:
-wiki `jvm/index.md`, ticket jvm-28; open tickets are labelled `paused`.
-To pick it up again, see "Installing for real" below and re-set the Universal exclusion.
+**▶ Resumed (2026-10-06).** The pause (jvm-28) was lifted to build Java-level output: operand
+stack as registers (jvm-33), typed signatures + names (jvm-35), compare fusion (jvm-32), exception
+edges inside methods (jvm-42), a Pseudo-Java language representation (jvm-43/44) and a class view
+(jvm-41). The plugin is **installed** again (symlink + `files.container.excludedTransforms = ["Universal"]`).
 
 **Project tracking:** tickets live in minitick project **`jvm`** (`jvm-N`; CLI
 `/Users/patrick/dev/minitick/.venv/bin/minitick … -p jvm`), documentation in miniwiki project
@@ -74,12 +72,14 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
 2. **Live in BN without restart**: `bnrun tests/bn_dev_load.py` copies the package to
    `/tmp/jvm_devN/`, renames arch/view to `JVM-devN` / `JVM Class devN` and registers them
    (BN cannot unregister types, so every reload needs fresh names; older dev views are disabled).
-   Then `bnrun tests/bn_batch_check.py` (20 classes from `lib/mdg/` by default, per-class
-   timing). Views created this way are in-process but **not UI tabs**.
-3. bnrun scripts run one at a time. Always pass **`--timeout N`**; a running script can be stopped
+   Then `bnrun --parallel tests/bn_batch_check.py` (20 classes from `lib/mdg/` by default, per-class
+   timing); `bnrun --parallel tests/bn_golden.py` dumps reference HLIL + readability metrics. Views created this way are in-process but **not UI tabs**.
+3. bnrun has two lanes: serialized (default; UI work and global registration like `bn_dev_load.py`)
+   and `--parallel` (scripts on their own views, up to 4 at once, no lock). Always pass **`--timeout N`**; a running script can be stopped
    with `bnrun --cancel` (or Ctrl-C on the client), `bnrun --status` shows what is running.
    Cancellation lands between Python bytecodes — a long native call (`update_analysis_and_wait()`)
-   finishes first — so keep batches small and take the usage lock.
+   finishes first — so keep batches small. The usage lock is only needed for UI tabs
+   (`bv`/`bvs`/`--view`/`--main-thread` are refused without it).
 
 ### Installing for real
 ```bash
@@ -87,8 +87,7 @@ ln -s /Users/patrick/dev/binary-jvm "$HOME/Library/Application Support/Binary Ni
 ```
 Then restart Binary Ninja (architecture/view registration happens once at startup) — with the
 user's OK via `/Users/patrick/dev/bn-script-bridge/bnrestart` (saves modified views, reopens files,
-waits for the bridge). **Currently not installed** (symlink removed 2026-10-06 when the project
-was paused); re-installing also needs `files.container.excludedTransforms = ["Universal"]` (jvm-39).
+waits for the bridge). **Installed** (re-linked 2026-10-06 when the project resumed); a fresh install also needs `files.container.excludedTransforms = ["Universal"]` (jvm-39).
 
 ## Samples
 

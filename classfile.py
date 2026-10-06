@@ -4,6 +4,8 @@ import struct
 
 from binaryninja import Type, TypeBuilder
 
+from .constants import method_address
+
 _type_cache = {}
 
 def _cached_type(key, make):
@@ -425,11 +427,33 @@ class JVMModuleReference(JVMClassReference):
 class JVMPackageReference(JVMClassReference):
     pass
         
-class JVMFieldInfo(JVMStructure):
+def find_attribute(attributes, kind):
+    """the parsed body of the first attribute of this type (e.g. "Signature"), or None"""
+    for a in attributes:
+        if a is not None and a.attributeType == kind:
+            return a.attribute
+    return None
+
+def pool_text(reader, index):
+    """the UTF-8 / class name text of a pool entry, None for index 0 or another entry kind"""
+    if not index:
+        return None
+    entry = reader.constantPool.get(index)
+    return None if entry is None else str(entry)
+
+class JVMMemberMixin:
+    """name/descriptor/signature of a field_info or method_info"""
+    def generic_signature(self):
+        attr = find_attribute(self.attributes, "Signature")
+        return pool_text(self.classReader, attr.signature_index) if attr else None
+
+class JVMFieldInfo(JVMStructure, JVMMemberMixin):
         
     def __init__(self, r):
         JVMStructure.__init__(self, r)
         self.read()
+        self.name = str(self.classReader.constantPool.get(self.name_index))
+        self.descriptor = str(self.classReader.constantPool.get(self.descriptor_index))
         
     def read(self):
         self.access_flags = self.readShort("access_flags")
@@ -440,7 +464,7 @@ class JVMFieldInfo(JVMStructure):
         for i in range(self.attributes_count):
             self.attributes[i] = self.readStruct(JVMAttributeInfo(self.classReader), "attribute["+str(i)+"]")
             
-class JVMMethodInfo(JVMStructure):
+class JVMMethodInfo(JVMStructure, JVMMemberMixin):
 
     def __init__(self, r, ind):
         JVMStructure.__init__(self, r)
@@ -461,6 +485,25 @@ class JVMMethodInfo(JVMStructure):
              
         self.name = str(self.classReader.constantPool.get(self.name_index))
         self.descriptor = str(self.classReader.constantPool.get(self.descriptor_index))
+
+    def local_variables(self):
+        """LocalVariableTable entries [(start_pc, length, name, descriptor, slot)] (empty without debug info)"""
+        if self.code_attribute is None:
+            return []
+        result = []
+        for a in self.code_attribute.attribute.attributes:
+            if a.attributeType == "LocalVariableTable":
+                for start, length, name_index, desc_index, slot in a.attribute.local_variable_table:
+                    result.append((start, length, pool_text(self.classReader, name_index),
+                                   pool_text(self.classReader, desc_index), slot))
+        return result
+
+    def parameter_names(self):
+        """names from the MethodParameters attribute (declared parameters, no `this`), or None"""
+        attr = find_attribute(self.attributes, "MethodParameters")
+        if attr is None:
+            return None
+        return [pool_text(self.classReader, name_index) for name_index, _ in attr.parameters]
 
 class JVMAttributeInfo(JVMStructure):
     
@@ -495,11 +538,27 @@ class JVMAttributeInfo(JVMStructure):
             self.attribute = self.readStruct(JVMLineNumberTableAttribute(self.classReader),"attribute")
         elif self.attributeType == "LocalVariableTable":
             self.attribute = self.readStruct(JVMLocalVariableTableAttribute(self.classReader),"attribute")
+        elif self.attributeType == "LocalVariableTypeTable":
+            self.attribute = self.readStruct(JVMLocalVariableTypeTableAttribute(self.classReader),"attribute")
+        elif self.attributeType == "MethodParameters":
+            self.attribute = self.readStruct(JVMMethodParametersAttribute(self.classReader),"attribute")
         elif self.attributeType == "Deprecated":
             self.attribute = self.readStruct(JVMDeprecatedAttribute(self.classReader),"attribute")
         else:
             self.readArray(self.attribute_length, "attribute")
  
+class JVMMethodParametersAttribute(JVMStructure):
+
+    def __init__(self, r):
+        JVMStructure.__init__(self, r)
+        self.read()
+
+    def read(self):
+        self.parameters_count = self.readByte("parameters_count")
+        self.parameters = []
+        for i in range(self.parameters_count):
+            self.parameters.append((self.readShort("name_index["+str(i)+"]"), self.readShort("access_flags["+str(i)+"]")))
+
 class JVMDeprecatedAttribute(JVMStructure):
 
     def __init__(self, r):
@@ -694,6 +753,32 @@ class JVMClassStructure(JVMStructure):
             self.attributes.append(attr)
             if attr.attributeType == "BootstrapMethods":
                 self.classReader.setBootstrap(attr)
+        r = self.classReader
+        self.name = pool_text(r, self.this_class)                       # binary names, e.g. java/lang/String
+        self.super_name = pool_text(r, self.super_class)                # None for java/lang/Object
+        self.interface_names = [pool_text(r, i) for i in self.interfaces]
+
+    def generic_signature(self):
+        attr = find_attribute(self.attributes, "Signature")
+        return pool_text(self.classReader, attr.signature_index) if attr else None
+
+    def source_file(self):
+        attr = find_attribute(self.attributes, "SourceFile")
+        return pool_text(self.classReader, attr.sourcefile_index) if attr else None
+
+    def inner_classes(self):
+        """InnerClasses entries as dicts (binary names; None where the entry has index 0)"""
+        attr = find_attribute(self.attributes, "InnerClasses")
+        if attr is None:
+            return []
+        r = self.classReader
+        return [{"inner": pool_text(r, inner), "outer": pool_text(r, outer), "name": pool_text(r, name),
+                 "access_flags": flags} for inner, outer, name, flags in attr.classes]
+
+    def referenced_class_names(self):
+        """binary names of every CONSTANT_Class in the pool (arrays like [Ljava/lang/String; included)"""
+        return [str(c) for c in self.classReader.constantPool.poolContent if isinstance(c, JVMClassReference)
+                and not isinstance(c, (JVMModuleReference, JVMPackageReference))]
         
         
 class JVMClassReader():
@@ -706,6 +791,8 @@ class JVMClassReader():
         self.bootstrap_attribute = None
         self.structTypes = {}
         self.structTypeCount = {}
+        self.jtypes = None                 # view.JavaTypes, set by the view
+        self.pending_components = False    # view: create components after analysis (reopened .bndb)
     def reset(self):
         self.idx = 0
     def unpack(self, fmt, size):
@@ -759,6 +846,32 @@ class JVMClassReader():
     def getBootstrap(self,index):
         if self.bootstrap_attribute == None: return None
         return self.bootstrap_attribute.attribute.bootstrap_methods[index]
+
+
+# jvm-41: class metadata stored in the view under this key (bv.query_metadata(CLASS_METADATA_KEY)).
+# Contract with the Pseudo-Java printer -- keep the keys. Missing strings are "" (Metadata has no None);
+# class names are dotted (java.lang.String); descriptors and member names are raw (<init>, (I)V).
+CLASS_METADATA_KEY = "jvm.class"
+
+def class_metadata(cls):
+    """{name, super, interfaces, access_flags, signature, source_file, inner_classes, fields, methods}"""
+    def d(name):
+        return name.replace("/", ".") if name else ""
+    return {
+        "name": d(cls.name),
+        "super": d(cls.super_name),
+        "interfaces": [d(i) for i in cls.interface_names],
+        "access_flags": cls.access_flags,
+        "signature": cls.generic_signature() or "",
+        "source_file": cls.source_file() or "",
+        "inner_classes": [{"inner": d(e["inner"]), "outer": d(e["outer"]), "name": e["name"] or "",
+                           "access_flags": e["access_flags"]} for e in cls.inner_classes()],
+        "fields": [{"name": f.name, "descriptor": f.descriptor, "access_flags": f.access_flags,
+                    "signature": f.generic_signature() or ""} for f in cls.fields],
+        "methods": [{"name": m.name, "descriptor": m.descriptor, "access_flags": m.access_flags,
+                     "address": method_address(m.index) if m.code_attribute is not None else 0,
+                     "signature": m.generic_signature() or ""} for m in cls.methods],
+    }
 
 
 # Registry of parsed classes, keyed by the core BinaryView handle, so the lifter can resolve
