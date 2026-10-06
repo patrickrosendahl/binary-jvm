@@ -1,6 +1,6 @@
 """`JVM\\Show class` (jvm-41): the viewed class as one unit -- a Java-like skeleton with header, fields
 and methods in source order, built from the "jvm.class" metadata the view stores. Method bodies come
-from `pseudo_java.render_method(func)` when that module exists, else from the function's HLIL text."""
+from `pseudo_java.render_body(func)` when that module exists, else from the function's HLIL text."""
 import traceback
 
 from binaryninja import (PluginCommand, LinearViewObject, LinearViewCursor, LinearDisassemblyLineType,
@@ -12,9 +12,9 @@ from .javatypes import (ACC_STATIC, ACC_ENUM, ACC_SYNTHETIC, class_keyword, java
 from .constants import ARCH_NAME
 
 try:
-    from .pseudo_java import render_method
+    from .pseudo_java import render_body  # body only: the skeleton prints the header and braces itself
 except ImportError:
-    render_method = None
+    render_body = None
 
 INDENT = "    "
 
@@ -53,11 +53,11 @@ def hlil_lines(func):
     return [l[indent:] for l in lines]
 
 def method_body(func):
-    if render_method is not None:
+    if render_body is not None:
         try:
-            return list(render_method(func))
+            return list(render_body(func))
         except Exception:
-            return ["// pseudo_java.render_method failed:"] + ["// " + l for l in traceback.format_exc().splitlines()]
+            return ["// pseudo_java.render_body failed:"] + ["// " + l for l in traceback.format_exc().splitlines()]
     return hlil_lines(func)
 
 def parameter_names(func, count, static):
