@@ -12,3 +12,4 @@ __pycache__/
 
 # agent worktrees (Claude Code)
 .claude/worktrees/
+tests/golden/
