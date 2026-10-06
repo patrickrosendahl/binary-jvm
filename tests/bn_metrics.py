@@ -35,6 +35,8 @@ for p in paths:
             text = None
         if text is None:
             tot["hlil_fail"] += 1
+            if SHOW:
+                print("   %s: no HLIL (analysis skipped: %r)" % (f.name, getattr(f, "analysis_skip_reason", None)))
             continue
         hits = [l for l in text if ACCESSOR.search(FIELDREF.sub("", l))]
         lines += len(hits)
