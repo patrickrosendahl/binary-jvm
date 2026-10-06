@@ -97,9 +97,12 @@ class JavaTypes:
 
     def return_value(self, desc, arch):
         t = self.value_type(desc)
-        # jvm/jvm_call have no float registers: float results come back in r, double in rh:r
+        # jvm/jvm_call have no float registers: float results come back in r; long/double in the 8-byte
+        # register r64, which must be given explicitly (the conventions' default is the pair rh:r)
         if desc[0] == 'F':
             return ReturnValue(t, CoreVariable.reg(arch.get_reg_index("r")))
+        if desc[0] in 'JD':
+            return ReturnValue(t, CoreVariable.reg(arch.get_reg_index("r64")))
         return t
 
 def method_short_name(reader, content):

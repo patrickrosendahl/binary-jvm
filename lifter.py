@@ -487,7 +487,7 @@ def lift_return(size):
         if size == 4:
             il.append(il.set_reg(4, "r", ctx.pop(4)()))
         elif size == 8:
-            il.append(il.set_reg_split(4, "rh", "r", ctx.pop(8)()))
+            il.append(il.set_reg(8, "r64", ctx.pop(8)()))
         il.append(il.ret(il.reg(ADDR_SIZE, "lr")))
     return lift
 
@@ -536,13 +536,13 @@ def lift_invoke(kind):
             sizes = [ADDR_SIZE] + sizes  # objectref
         if INVOKES_AS_CALLS and len(sizes) <= NUM_ARG_REGS:
             # a real call through the pool entry, which the view types as a function pointer (like an
-            # import table slot): arguments go to a<i> (receiver first), the result comes back in r / rh:r
+            # import table slot): arguments go to a<i> (receiver first), the result comes back in r / r64
             for i in reversed(range(len(sizes))):
                 il.append(il.set_reg(sizes[i], arg_reg(i, sizes[i]), ctx.pop(sizes[i])()))
             il.append(il.call(il.load(ADDR_SIZE, pool_pointer(il, index))))
             if ret != 'V':
                 if slot_size(ret) == 8:
-                    ctx.push(8, il.reg_split(4, "rh", "r"))
+                    ctx.push(8, il.reg(8, "r64"))
                 else:
                     ctx.push(4, il.reg(4, "r"))
             return
