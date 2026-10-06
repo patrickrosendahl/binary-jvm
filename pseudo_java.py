@@ -64,6 +64,7 @@ LANGUAGE_NAME = language_name_for(ARCH_NAME)
 # ---------------------------------------------------------------------------------------------------
 PRIMITIVES = {'B': 'byte', 'C': 'char', 'D': 'double', 'F': 'float', 'I': 'int', 'J': 'long', 'S': 'short',
               'Z': 'boolean', 'V': 'void'}
+TYPE_CODES = {v: k for k, v in PRIMITIVES.items()}  # 'int' -> 'I'
 NEWARRAY_TYPES = {4: 'boolean', 5: 'char', 6: 'float', 7: 'double', 8: 'byte', 9: 'short', 10: 'int', 11: 'long'}
 BOXES = {"java/lang/Integer": ("intValue", "I"), "java/lang/Long": ("longValue", "J"),
          "java/lang/Short": ("shortValue", "S"), "java/lang/Byte": ("byteValue", "B"),
@@ -250,7 +251,8 @@ def group_try_entries(table):
 def try_runs(stmt_pcs, groups, active=()):
     """Place try ranges on one block's statements.
 
-    stmt_pcs: per statement the list of pcs it covers (its own pc first), or None if unknown.
+    stmt_pcs: per statement the list of pcs it covers (its own pc first), or None if unknown/neutral
+    (labels, exception checks): those join a run between two inside statements but never start or end one.
     groups: from group_try_entries. Returns [(first, last, group)] for maximal runs of consecutive
     statements whose pcs all lie in the group's range and none of which is a handler of that group,
     largest ranges first, non-overlapping; groups in `active` (already open in an enclosing block) are skipped.
@@ -262,17 +264,21 @@ def try_runs(stmt_pcs, groups, active=()):
         if (start, end) in active:
             continue
         handler_pcs = {h for h, _ in handlers}
-        inside = []
+        inside = []  # True / False / None (neutral)
         for pcs in stmt_pcs:
-            inside.append(bool(pcs) and all(start <= pc < end for pc in pcs) and pcs[0] not in handler_pcs)
+            inside.append(None if not pcs else
+                          all(start <= pc < end for pc in pcs) and pcs[0] not in handler_pcs)
         i = 0
         while i < len(inside):
-            if not inside[i]:
+            if inside[i] is not True:
                 i += 1
                 continue
             j = i
-            while j + 1 < len(inside) and inside[j+1]:
-                j += 1
+            k = i + 1
+            while k < len(inside) and inside[k] is not False:
+                if inside[k]:
+                    j = k
+                k += 1
             if not any(k in taken for k in range(i, j+1)):
                 runs.append((i, j, g))
                 taken.update(range(i, j+1))
@@ -343,6 +349,9 @@ if _HAVE_BN:
         if t is None:
             return "var"
         try:
+            text = str(t).replace("const ", "").strip()
+            if text in JNI_TYPEDEFS:  # the view's 4-byte boolean/byte/char/short typedefs
+                return JNI_TYPEDEFS[text]
             if isinstance(t, VoidType):
                 return "void"
             if isinstance(t, BoolType):
@@ -368,13 +377,15 @@ if _HAVE_BN:
             pass
         return str(t)
 
+    JNI_TYPEDEFS = {"jboolean": "boolean", "jbyte": "byte", "jchar": "char", "jshort": "short",
+                    "jint": "int", "jlong": "long", "jfloat": "float", "jdouble": "double"}
+
     def _dotted_to_java(name, simple=None):
+        """the view's class struct names are dotted binary names ('java.lang.String', 'a.Outer$5')"""
         name = name.replace("struct ", "").strip()
-        if simple is None:
-            simple = SIMPLE_CLASS_NAMES
-        if simple and not name.endswith("]"):
-            name = name.rsplit(".", 1)[-1]
-        return name.replace("$", ".")
+        if name in JNI_TYPEDEFS:
+            return JNI_TYPEDEFS[name]
+        return java_class_name(name.replace(".", "/"), simple)
 
     class _ClassInfo:
         """Per-view lookups: pool entries, method infos, class name (cached per view handle)."""
@@ -755,33 +766,46 @@ if _HAVE_BN:
                 return
             operands = []
             idesc = init_shape[3] or ""
-            if init_shape[5] and idesc.startswith("(Ljava/lang/String;") or idesc.startswith("(Ljava/lang/CharSequence;"):
+            if init_shape[5] and (idesc.startswith("(Ljava/lang/String;") or
+                                  idesc.startswith("(Ljava/lang/CharSequence;")):
                 operands.append((init_shape[5][0], True))
+            sb = var
             used = 1  # the <init> call
             appends = []
             final = None
+            cur = var  # the builder as currently named: javac code may park a partial chain in a temp
             for k in range(j + 1, len(body)):
-                n = self.refs(body[k], var)
+                n = self.refs(body[k], cur)
                 if not n:
                     continue
-                chain = self.append_chain(body[k], var)
+                s = body[k]
+                chain = self.append_chain(s, cur)
                 if chain is not None and chain[1] is None:
                     appends.append(k)
                     operands.extend(chain[0])
-                    used += n
+                    used += n if cur == sb else 0
                     continue
+                if s.operation == Op.HLIL_VAR_INIT and n == 1:
+                    # tmp = sb.append(a)...append(b); continued through tmp (used exactly once later)
+                    chain = self.append_chain(s.src, cur)
+                    if chain is not None and self.var_count(s.dest) == 1 and chain[0]:
+                        appends.append(k)
+                        operands.extend(chain[0])
+                        used += n if cur == sb else 0
+                        cur = s.dest
+                        continue
                 # the statement holding toString()
-                for e in _walk(body[k]):
+                for e in _walk(s):
                     shape = self.call_shape(e)
                     if shape and shape[2] == "toString" and shape[1] in STRING_BUILDERS and shape[4] is not None:
-                        chain = self.append_chain(shape[4], var, top=True)
+                        chain = self.append_chain(shape[4], cur, top=True)
                         if chain is not None:
                             final = (k, e, chain[0])
                             break
                 if final is not None:
-                    used += n
+                    used += n if cur == sb else 0
                 break
-            if final is None or used != self.var_count(var):
+            if final is None or used != self.var_count(sb):
                 return
             k, e, tail = final
             operands.extend(tail)
@@ -1010,6 +1034,15 @@ if _HAVE_BN:
                 if newline:
                     tokens.new_line()
 
+        def catch_hint(self, instr):
+            """' T' for an exception check: the handlers covering its pc"""
+            pc = instr.address - self.function.start
+            found = []
+            for start, end, handlers in self.try_groups:
+                if start <= pc < end:
+                    found += [java_class_name(t) if t else "finally" for _, t in handlers]
+            return " " + " / ".join(found) if found else ""
+
         def handler_hint(self, hpc):
             sym = self.function.view.get_symbol_at(self.function.start + hpc)
             return " (%s)" % sym.name if sym is not None else ""
@@ -1042,9 +1075,18 @@ if _HAVE_BN:
                 self.emit_block(instr, tokens, settings)
             elif o == Op.HLIL_IF:
                 if self.mentions_exc(instr.condition):
-                    # exception check outside a placed try region
+                    # exception check (or handler type dispatch) outside a placed try region: no `exc` in
+                    # the output, the exceptional path becomes a commented block
                     self.note(tokens, "// may throw -> catch%s" % self.catch_hint(instr))
-                    if instr.as_ast and instr.false is not None and instr.false.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
+                    if not instr.as_ast:
+                        return
+                    if instr.true.operation not in (Op.HLIL_GOTO, Op.HLIL_NOP, Op.HLIL_NORET, Op.HLIL_UNREACHABLE) \
+                            and not self.is_exc_plumbing(instr.true):
+                        tokens.new_line()
+                        self.note(tokens, "// on exception:")
+                        self._scoped(instr, instr.true, tokens, settings)
+                        tokens.finalize_scope()
+                    if instr.false is not None and instr.false.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
                         tokens.new_line()
                         self.perform_get_expr_text(instr.false, tokens, settings, P.TopLevelOperatorPrecedence, True)
                     return
@@ -1167,9 +1209,10 @@ if _HAVE_BN:
                 self.op(tokens, " = ")
                 self.perform_get_expr_text(instr.src, tokens, settings, P.AssignmentOperatorPrecedence)
             elif o == Op.HLIL_VAR_INIT:
-                self.emit_var_decl(instr.dest, instr, tokens, instr.src)
+                type_name = self.emit_var_decl(instr.dest, instr, tokens, instr.src)
                 self.op(tokens, " = ")
-                self.perform_get_expr_text(instr.src, tokens, settings, P.AssignmentOperatorPrecedence)
+                self.emit_typed(instr.src, TYPE_CODES.get(type_name, 'L'), tokens, settings,
+                                P.AssignmentOperatorPrecedence)
             elif o == Op.HLIL_VAR_DECLARE:
                 self.emit_var_decl(instr.var, instr, tokens)
             elif o == Op.HLIL_FLOAT_CONST:
@@ -1314,14 +1357,18 @@ if _HAVE_BN:
                                context=InstructionTextTokenContext.LocalVariableTokenContext))
 
         def emit_var_decl(self, var, instr, tokens, src=None):
-            type_name = java_type_of(var.type)
-            if src is not None and type_name in ("Object", "int", "long", "var"):
-                type_name = self.expr_java_type(src) or type_name
+            # the initializer's type (descriptors, casts, `new`) beats the variable's propagated BN type: the
+            # stack registers are shared by unrelated values, so BN's type for them is often a neighbour's
+            type_name = self.expr_java_type(src) if src is not None else None
+            if type_name is None:
+                code = self.var_code(var)  # e.g. `i = 0` ... `i++`: an int whatever BN propagated
+                type_name = PRIMITIVES.get(code) if code and code in "BCDFIJSZ" else java_type_of(var.type)
             self.type_tok(tokens, type_name)
             self.txt(tokens, " ")
             tokens.append(_tok(TT.LocalVariableToken, java_var_name(var.name), address=instr.expr_index,
                                size=instr.size, value=var.identifier,
                                context=InstructionTextTokenContext.LocalVariableTokenContext))
+            return type_name
 
         def expr_java_type(self, e):
             """Java type of an initializer, from descriptors / pool entries (None if unknown)"""
@@ -1527,7 +1574,9 @@ if _HAVE_BN:
             if addr == 0:
                 self.kw(tokens, "null")
                 return
-            if self.function.view.get_symbol_at(addr) is None:
+            view = self.function.view
+            if view.get_symbol_at(addr) is None and not view.get_functions_containing(addr) and \
+                    view.get_data_var_at(addr) is None:
                 # no symbol: an int BN guessed to be a pointer
                 tokens.append(_tok(TT.IntegerToken, java_int_literal(addr, instr.size or 4), value=addr))
                 return
@@ -1708,9 +1757,11 @@ if _HAVE_BN:
             if o == Op.HLIL_VAR:
                 if e.var in self.param_codes:
                     return self.param_codes[e.var]
-                if isinstance(e.var.type, BoolType):
-                    return 'Z'
-                return self.var_code(e.var)
+                code = self.var_code(e.var)  # what it is set from beats BN's (shared-register) type
+                if code is not None:
+                    return code
+                declared = java_type_of(e.var.type)
+                return {"boolean": 'Z', "char": 'C'}.get(declared)
             if o == Op.HLIL_DEREF:
                 idx = _pool_index(_const_target(e.src))
                 m = self.info.member(idx) if idx is not None else None
@@ -1726,6 +1777,9 @@ if _HAVE_BN:
                     return m[2][0] if m and m[2] else None
                 if e.intrinsic.name in ("instanceof", "__instanceof"):
                     return 'Z'
+            if o in (Op.HLIL_ADD, Op.HLIL_SUB, Op.HLIL_MUL, Op.HLIL_DIVS, Op.HLIL_MODS, Op.HLIL_LSL, Op.HLIL_ASR,
+                     Op.HLIL_LSR, Op.HLIL_NEG) and e.size in (4, 8):
+                return 'I' if e.size == 4 else 'J'
             if isinstance(e.expr_type, BoolType):
                 return 'Z'
             return None
@@ -2030,6 +2084,16 @@ if _HAVE_BN:
             pass
         return PseudoJavaFunction(register(), func.arch, func, func.hlil)
 
+    def render_body(func):
+        """the method body only: no header, no outer braces, dedented"""
+        lines = render_method(func)
+        if lines and lines[0] == header_text(func):
+            lines = lines[1:]
+        if lines and lines[0].strip() == "{" and lines[-1].strip() == "}":
+            lines = lines[1:-1]
+        indent = min((len(l) - len(l.lstrip()) for l in lines if l.strip()), default=0)
+        return [l[indent:] for l in lines]
+
     def render_method(func):
         """Java header + body of func as plain text lines (for the class view / reports)."""
         lines = []
@@ -2049,4 +2113,7 @@ else:
         return None
 
     def render_method(func):
+        raise RuntimeError("Pseudo-Java needs Binary Ninja")
+
+    def render_body(func):
         raise RuntimeError("Pseudo-Java needs Binary Ninja")

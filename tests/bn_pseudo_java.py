@@ -30,6 +30,8 @@ for rel in CLASSES:
         if FUNCS and f.name not in FUNCS:
             continue
         print("=" * 20, f.name)
+        if f.language_representation(pj.LANGUAGE_NAME) is None:
+            print("   (BN has no %s representation for this function; render_method falls back)" % pj.LANGUAGE_NAME)
         if HLIL:
             for line in f.hlil.root.lines:
                 print("   HLIL |", line)
