@@ -1757,7 +1757,11 @@ if _HAVE_BN:
                     if need_separator is not None:
                         tokens.scope_separator()
                     try:
-                        self.emit_sync(body, idx, end, lock, value, plan, tokens, settings, block)
+                        if idx in plan.get("sync_split", {}):
+                            self.emit_sync_split(body, idx, plan["sync_split"][idx], lock, value, plan, tokens,
+                                                 settings, block)
+                        else:
+                            self.emit_sync(body, idx, end, lock, value, plan, tokens, settings, block)
                     except Exception as ex:
                         self.emit_error(body[idx], ex, tokens)
                     idx = end + 1
@@ -2026,7 +2030,7 @@ if _HAVE_BN:
                 if end is None:
                     real = [x for x in range(k + 1, hi + 1) if not self.fold_transparent(body, x, plan)]
                     if not real or not self.never_falls(body[real[-1]]):
-                        k += 1
+                        k = self.plan_sync_split(body, k, hi, lock, run_at, plan, out)
                         continue
                 inner = body[k + 1:(end if end is not None else hi) + 1]
                 total = self.monitor_exits([self.hlil.root], lock)
@@ -2034,7 +2038,7 @@ if _HAVE_BN:
                         self.monitor_exits(inner, lock) != total or \
                         any(self.monitor_var(i, "monitorenter") == lock for x in inner
                             for i in _walk(x.instr if isinstance(x, _ExcBranch) else x)):
-                    k += 1
+                    k = self.plan_sync_split(body, k, hi, lock, run_at, plan, out)
                     continue
                 stop = end if end is not None else hi
                 crossing = [f for f, (a, b, _) in run_at.items() if a <= stop and b >= k and not (k < a and b <= last)
@@ -2048,6 +2052,99 @@ if _HAVE_BN:
                 out[k] = (stop, lock, self.lock_value(body, k, lock, plan))
                 k = stop + 1
             return out
+
+        def plan_sync_split(self, body, k, hi, lock, run_at, plan, out):
+            """a synchronized block left in the middle of an if (Vineflower prints these as a block too):
+            ('branch'): `enter; S; if (c) { X; exit; return; } else { exit; R }` -> synchronized { S; if (c) { X; return; } } R
+            ('goto'): `enter; S; if (c) { A; L: exit; T } else { B; goto L; }` -> synchronized { S; if (c) { A } else { B } } T
+            Returns the next index to look at."""
+            try:
+                shape = self.sync_split_shape(body, k, hi, lock, run_at, plan)
+            except Exception:
+                shape = None
+            if shape is None:
+                return k + 1
+            out[k] = (shape[1], lock, self.lock_value(body, k, lock, plan))
+            plan.setdefault("sync_split", {})[k] = shape
+            return shape[1] + 1
+
+        def sync_split_shape(self, body, k, hi, lock, run_at, plan):
+            j = next((m for m in range(k + 1, hi + 1) if self.monitor_exits([body[m]], lock)), None)
+            if j is None:
+                return None
+            s = body[j]
+            if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_IF or \
+                    self.monitor_exits([self.hlil.root], lock) != self.monitor_exits([s], lock) or \
+                    any(a <= j and b >= k for a, b, _ in run_at.values()) or \
+                    any(self.monitor_var(i, "monitorenter") == lock for x in body[k + 1:j + 1]
+                        for i in _walk(x.instr if isinstance(x, _ExcBranch) else x)):
+                return None
+            if s.false is not None and s.false.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
+                for leave, rest, leave_true in ((s.true, s.false, True), (s.false, s.true, False)):
+                    li, ri = self.flatten(self.stmts_of(leave)), self.flatten(self.stmts_of(rest))
+                    rr = [x for x in ri if not self.hidden_item(x)]
+                    if not rr or isinstance(rr[0], _ExcBranch) or self.monitor_var(rr[0], "monitorexit") != lock or \
+                            self.in_monitor_code(rr[0]) or self.monitor_exits(ri, lock) != 1:
+                        continue
+                    m = [q for q, x in enumerate(li) if not isinstance(x, _ExcBranch) and
+                         self.monitor_var(x, "monitorexit") == lock]
+                    if len(m) != 1 or self.monitor_exits(li, lock) != 1 or not self.exit_leaves(li[m[0] + 1:]):
+                        continue
+                    return ('branch', j, leave_true, li, ri, rr[0], rest)
+            shape = self.if_goto_shape(body, j, plan)
+            if shape is not None and shape[0] == 'split':
+                tail = shape[3]
+                tr = [x for x in tail if not self.hidden_item(x)]
+                if tr and not isinstance(tr[0], _ExcBranch) and self.monitor_var(tr[0], "monitorexit") == lock and \
+                        not self.in_monitor_code(tr[0]) and self.monitor_exits(tail, lock) == 1:
+                    return ('goto', j, shape, tail, tr[0])
+            return None
+
+        def emit_sync_split(self, body, k, shape, lock, value, plan, tokens, settings, block):
+            j = shape[1]
+            s = body[j]
+            self.kw(tokens, "synchronized ")
+            tokens.append_open_paren()
+            if value is not None:
+                self.expr(value, tokens, settings)
+            else:
+                self.emit_var(lock, body[k], tokens)
+            tokens.append_close_paren()
+            tokens.begin_scope(ScopeType.BlockScopeType)
+            self.active_syncs.append(lock)
+            try:
+                if [m for m in range(k + 1, j) if not self.hidden_item(body[m]) and
+                        m not in plan.get("folded", ()) and m not in plan.get("done", ())]:
+                    self.emit_range(body, k + 1, j - 1, plan, tokens, settings, block)
+                    tokens.scope_separator()
+                if shape[0] == 'branch':
+                    _, _, leave_true, li, ri, release, rest_blk = shape
+                    self.kw(tokens, "if ")
+                    tokens.append_open_paren()
+                    if leave_true:
+                        self.expr(s.condition, tokens, settings)
+                    else:
+                        self.emit_negated(s.condition, tokens, settings)
+                    tokens.append_close_paren()
+                    tokens.begin_scope(ScopeType.BlockScopeType)
+                    self.emit_list(li, tokens, settings, s.true if leave_true else s.false)
+                    tokens.end_scope(ScopeType.BlockScopeType)
+                    tokens.finalize_scope()
+                    tokens.new_line()
+                    after, after_blk = ri, rest_blk
+                else:
+                    _, _, ig, after, release = shape
+                    self.emit_if_goto(s, ig, body, plan, tokens, settings, block, with_tail=False)
+                    after_blk = s.true
+            finally:
+                self.active_syncs.pop()
+                tokens.end_scope(ScopeType.BlockScopeType)
+            tokens.finalize_scope()
+            tokens.new_line()
+            self.consumed.add(release.expr_index)  # the release is the block's end
+            if [x for x in after if not self.hidden_item(x)]:
+                tokens.scope_separator()
+                self.emit_list(after, tokens, settings, after_blk)
 
         def hidden_item(self, s):
             """a flattened item that prints nothing"""
@@ -2493,7 +2590,7 @@ if _HAVE_BN:
                 return ('split', head if x_true else other, other if x_true else head, tail)
             return None
 
-        def emit_if_goto(self, s, shape, body, plan, tokens, settings, block):
+        def emit_if_goto(self, s, shape, body, plan, tokens, settings, block, with_tail=True):
             if shape[0] == 'skip':
                 q, i0 = shape[1], shape[2]
                 self.kw(tokens, "if ")
@@ -2527,7 +2624,7 @@ if _HAVE_BN:
                 tokens.end_scope(ScopeType.BlockScopeType)
             tokens.finalize_scope()
             tokens.new_line()
-            if [x for x in tail if not self.hidden_item(x)]:
+            if with_tail and [x for x in tail if not self.hidden_item(x)]:
                 tokens.scope_separator()
                 self.emit_list(tail, tokens, settings, s.true)
 
@@ -3357,8 +3454,9 @@ if _HAVE_BN:
                     if v is None or v in seen:
                         continue
                     seen.add(v)
-                    if AUTO_VAR_NAME.match(v.name) and not self.is_exc_var(v) and v != self.this_var and \
-                            v not in self.param_codes:
+                    if self.is_exc_var(v):
+                        continue  # prints as exc / the catch variable
+                    if AUTO_VAR_NAME.match(v.name) and v != self.this_var and v not in self.param_codes:
                         auto.append(v)
                     else:
                         taken.add(java_var_name(v.name))

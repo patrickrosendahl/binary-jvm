@@ -77,7 +77,7 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
    **Pseudo Java gates** (after any `pseudo_java.py` change; wiki `vineflower-comparison.md`):
    `python3 tests/vineflower_compare.py --decompile` (once: Vineflower, the decompiler Recaf uses, local fork),
    `bnrun --parallel --timeout 600 tests/bn_pseudo_java_dump.py` (prepend `DEV_PKG = "jvm_devN"` for a dev load), then
-   `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=5 offset_stores=0 while_true=2 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0`
+   `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=2 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0`
    (exit 1 on a regression); and `tests/bn_pseudo_java_compare_all.sh [jvm_devN]` (~25 min, run it in the
    background): every mdg method with an exception table against HLIL -- must stay 251/251.
 3. bnrun has two lanes: serialized (default; UI work and global registration like `bn_dev_load.py`)
