@@ -127,6 +127,25 @@ check("constant literals", [pj.constant_literal("int", 0xffffffff, "I"), pj.cons
                             pj.constant_literal("string", 'a"b', "Ljava/lang/String;")],
       ["-1", "true", "'A'", "-2L", "1.5f", "Double.POSITIVE_INFINITY", '"a\\"b"'])
 
+# names for auto-named variables (jvm-55)
+check("auto names", [bool(pj.AUTO_VAR_NAME.match(n)) for n in
+                     ["st0_lo", "st1_lo_3", "st0_1", "r", "r_12", "r64", "r64_3", "l3_lo", "l2_lo_1", "arg2", "result",
+                      "i", "e", "XidProducer_LOGGER_1", "rawValue"]],
+      [True] * 9 + [False] * 6)
+check("name from method", [pj.name_from_method(m) for m in
+                           ["getRawValue", "getXidObject", "toLowerCase", "nextElement", "elementAt", "isOpen", "size",
+                            "LOGGER", "jE", "toString", "<init>", "getClass", "hasMoreElements", "get", "a"]],
+      ["rawValue", "xidObject", "lowerCase", "element", "element", "open", "size", "logger", "jE", None, None,
+       None, "moreElements", "get", None])
+check("name from type", [pj.name_from_type(t) for t in
+                         ["Vector", "StatsItem", "String", "int", "long[]", "Map.Entry", "byte[]", "Property",
+                          "java.util.Hashtable", "Outer$Inner", None, "Object[]"]],
+      ["vector", "statsItem", "str", "n", "longs", "entry", "bytes", "property", "hashtable", "inner", None,
+       "objects"])
+taken = {"str", "arg2"}
+check("unique names", [pj.unique_name("str", taken), pj.unique_name("str", taken), pj.unique_name("vector", taken)],
+      ["str2", "str3", "vector"])
+
 if failures:
     print("\n".join(failures))
     print("%d failure(s)" % len(failures))

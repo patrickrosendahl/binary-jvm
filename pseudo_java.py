@@ -47,6 +47,8 @@ What it does on top of plain HLIL (all at render time, nothing is rewritten in t
 
 `render_method(func) -> list[str]` returns the Java header plus body lines (used by the class view).
 """
+import re
+
 from .constants import (ARCH_NAME, VIEW_NAME, PSEUDOMEMORY_TABLE, PSEUDOMEMORY_PRIMITIVES, POOL_STRIDE,
                         METHOD_BASE, METHOD_STRIDE)
 
@@ -58,6 +60,7 @@ FOLD_TEMPORARIES = True      # print a single-use operand-stack temporary inside
 SYNC_BLOCKS = True           # monitorenter ... monitorexit -> synchronized (x) { ... } (jvm-47)
 ARRAY_LITERALS = True        # new T[n] + n element stores -> new T[]{...} (jvm-49)
 LOOP_CONDITIONS = True       # while (true) { if (c) { tail; break; } ... } -> while (!c) { ... } tail (jvm-50)
+RENAME_TEMPORARIES = True    # st0_lo_8 / r_12 / l3_lo -> names from their value: rawValue, vector, str (jvm-55)
 SPLIT_CONDITIONS = True      # T x; if (a) { x = e; } if (!a || p(x)) -> if (!a || p(e)) (jvm-54)
 # intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
 PURE_INTRINSICS = {"getfield", "arraylength", "checkcast", "instanceof", "new", "newarray", "anewarray",
@@ -187,6 +190,64 @@ def java_var_name(name):
         name = name.rsplit("/", 1)[-1]
     out = "".join(ch if ch.isalnum() or ch in "_$" else "_" for ch in name)
     return out if out and not out[0].isdigit() else "_" + out
+
+
+# names BN gives the lifter's stack registers and unnamed locals; anything else (LocalVariableTable names, user
+# renames, BN's own `i` / `result`) is printed as it is
+AUTO_VAR_NAME = re.compile(r"^(st\d+(_lo)?|r|r64|rh|l\d+(_lo)?)(_\d+)?$")
+JAVA_KEYWORDS = {
+    "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class", "const", "continue",
+    "default", "do", "double", "else", "enum", "extends", "final", "finally", "float", "for", "goto", "if",
+    "implements", "import", "instanceof", "int", "interface", "long", "native", "new", "package", "private",
+    "protected", "public", "return", "short", "static", "strictfp", "super", "switch", "synchronized", "this",
+    "throw", "throws", "transient", "try", "void", "volatile", "while", "true", "false", "null", "var"}
+TYPE_VAR_NAMES = {"String": "str", "Object": "obj", "int": "n", "long": "n", "short": "n", "byte": "b",
+                  "char": "c", "boolean": "flag", "float": "f", "double": "d", "Class": "cls",
+                  "StringBuffer": "sb", "StringBuilder": "sb", "Integer": "n", "Long": "n", "Boolean": "flag"}
+
+
+def name_from_method(method):
+    """a local's name from the method that produced it: getValue -> value, isOpen -> open, toLowerCase ->
+    lowerCase, nextElement -> element, elementAt -> element; None when nothing sensible is left"""
+    if not method or method.startswith("<") or len(method) < 2:
+        return None
+    m = re.match(r"^(get|is|has|to|create|new|read|next|find|load|fetch|build|make|parse|as)([A-Z0-9_$].*)$", method)
+    name = m.group(2) if m else method
+    if name.endswith("At") and len(name) > 2:
+        name = name[:-2]
+    if not name or not (name[0].isalpha() or name[0] in "_$"):
+        return None
+    if name.isupper():
+        name = name.lower()
+    name = name[0].lower() + name[1:]
+    return name if name not in JAVA_KEYWORDS and name not in ("string",) else None
+
+
+def name_from_type(java_type):
+    """a local's name from its Java type: Vector -> vector, StatsItem -> statsItem, String -> str, int -> n,
+    long[] -> longs, Map.Entry -> entry"""
+    if not java_type:
+        return None
+    arrays = java_type.count("[]")
+    base = java_type.replace("[]", "").split("<")[0].strip().rsplit(".", 1)[-1].rsplit("$", 1)[-1]
+    if not base or not (base[0].isalpha() or base[0] in "_$"):
+        return None
+    name = TYPE_VAR_NAMES.get(base) if not arrays else None
+    if name is None:
+        name = base.lower() if base.isupper() else base[0].lower() + base[1:]
+        if arrays:
+            name = name[:-1] + "ies" if name.endswith("y") else name + "s"
+    return name if name not in JAVA_KEYWORDS else name + "Value"
+
+
+def unique_name(base, taken):
+    """base, base2, base3, ... not in taken (which is updated)"""
+    name, n = base, 2
+    while name in taken:
+        name = "%s%d" % (base, n)
+        n += 1
+    taken.add(name)
+    return name
 
 
 def java_int_literal(value, size):
@@ -803,6 +864,7 @@ if _HAVE_BN:
             self._finally_subs = None
             self._concat = {}       # expr_index of toString / indy call -> [(expr|str, is_string)]
             self._var_counts = None
+            self._names = None        # auto-named variable -> printed name (jvm-55)
             self.count_discount = {}  # var -> reads that no longer print (merged split conditions, jvm-54)
             self.break_subst = {}     # expr_index of a loop break -> (items, block) printed in its place (jvm-54)
             self.break_used = set()
@@ -2842,7 +2904,7 @@ if _HAVE_BN:
             tokens.append_open_paren()
             self.type_tok(tokens, java_class_name(ctype))
             self.txt(tokens, " ")
-            name = java_var_name(var.name) if var is not None else "e"
+            name = self.display_name(var) if var is not None else "e"
             if var is not None:
                 tokens.append(_tok(TT.LocalVariableToken, name, value=var.identifier,
                                    context=InstructionTextTokenContext.LocalVariableTokenContext))
@@ -2893,7 +2955,7 @@ if _HAVE_BN:
                 if rethrow:
                     self.kw(tokens, "finally")
                     tokens.begin_scope(ScopeType.BlockScopeType)
-                    self.emit_handler_body(items[:real[-1]], java_var_name(var.name) if var else "t", blk,
+                    self.emit_handler_body(items[:real[-1]], self.display_name(var) if var else "t", blk,
                                            tokens, settings)
                 else:
                     name = self.catch_header("catch", "java/lang/Throwable", var, tokens)
@@ -3272,6 +3334,82 @@ if _HAVE_BN:
             tokens.append(_tok(TT.GotoLabelToken, instr.target.name, value=instr.target.label_id))
             self.txt(tokens, ":")
 
+        # --- names for the lifter's auto-named variables (jvm-55) ---------------------------------------
+        def display_name(self, var):
+            if RENAME_TEMPORARIES:
+                name = self.display_names().get(var)
+                if name is not None:
+                    return name
+            return java_var_name(var.name)
+
+        def display_names(self):
+            """auto-named variables (stack registers, locals without a LocalVariableTable name) -> a name from the
+            value they hold, unique in the method and never one of its other names; render-time only"""
+            if self._names is not None:
+                return self._names
+            names = {}
+            try:
+                seen, auto, taken = set(), [], {"this"}
+                for i in _walk(self.hlil.root):
+                    o = i.operation
+                    v = i.dest if o == Op.HLIL_VAR_INIT else i.var if o in (Op.HLIL_VAR_DECLARE, Op.HLIL_VAR,
+                                                                            Op.HLIL_VAR_SSA) else None
+                    if v is None or v in seen:
+                        continue
+                    seen.add(v)
+                    if AUTO_VAR_NAME.match(v.name) and not self.is_exc_var(v) and v != self.this_var and \
+                            v not in self.param_codes:
+                        auto.append(v)
+                    else:
+                        taken.add(java_var_name(v.name))
+                for v in self.function.parameter_vars:
+                    taken.add(java_var_name(v.name))
+                for v in auto:
+                    hint = self.name_hint(v)
+                    if hint:
+                        names[v] = unique_name(hint, taken)
+            except Exception:
+                names = {}
+            self._names = names
+            return names
+
+        def name_hint(self, var):
+            if var in self.exc_copies():
+                return "e"
+            try:
+                defs = [d for d in self.hlil.get_var_definitions(var) if d.operation in (Op.HLIL_VAR_INIT, Op.HLIL_ASSIGN)]
+            except Exception:
+                defs = []
+            # a counter: set to a constant, then stepped (`i = 0` ... `i = i + 1`)
+            if len(defs) >= 2 and any(d.src.operation == Op.HLIL_CONST for d in defs) and \
+                    any(d.src.operation in (Op.HLIL_ADD, Op.HLIL_SUB) and self.refs(d.src, var) for d in defs):
+                return "i"
+            for d in defs:
+                hint = self.expr_name_hint(d.src)
+                if hint:
+                    return hint
+            return name_from_type(self.defs_java_type(var) or java_type_of(var.type))
+
+        def expr_name_hint(self, e):
+            o = e.operation
+            if o == Op.HLIL_INTRINSIC:
+                n = e.intrinsic.name
+                if n in ("checkcast", "new", "newarray", "anewarray", "multianewarray"):
+                    return name_from_type(self.expr_java_type(e))
+                if n == "getfield" and len(e.params) > 1:
+                    m = re.search(r"[./]([A-Za-z_$][\w$]*)\W*$", str(e.params[1]))
+                    return name_from_method(m.group(1)) if m else None
+            if o == Op.HLIL_CALL or (o == Op.HLIL_INTRINSIC and e.intrinsic.name.startswith("invoke")):
+                if e.expr_index in self._concat:
+                    return "str"
+                shape = self.call_shape(e)
+                if shape is not None:
+                    return name_from_method(shape[2]) or name_from_type(self.expr_java_type(e))
+            if o in (Op.HLIL_DEREF, Op.HLIL_CONST_PTR, Op.HLIL_IMPORT):
+                m = re.search(r"[./]([A-Za-z_$][\w$]*)\W*$", str(e))
+                return name_from_method(m.group(1)) if m else None
+            return None
+
         def emit_var(self, var, instr, tokens):
             if self.this_var is not None and var == self.this_var:
                 tokens.append(_tok(TT.KeywordToken, "this"))
@@ -3282,7 +3420,7 @@ if _HAVE_BN:
                 tokens.append(_tok(TT.LocalVariableToken, self.exc_names[-1] if self.exc_names else "exc", context=InstructionTextTokenContext.LocalVariableTokenContext,
                                    address=instr.expr_index, value=var.identifier, size=instr.size))
                 return
-            tokens.append(_tok(TT.LocalVariableToken, java_var_name(var.name), address=instr.expr_index,
+            tokens.append(_tok(TT.LocalVariableToken, self.display_name(var), address=instr.expr_index,
                                size=instr.size, value=var.identifier,
                                context=InstructionTextTokenContext.LocalVariableTokenContext))
 
@@ -3297,7 +3435,7 @@ if _HAVE_BN:
                 type_name = PRIMITIVES.get(code) if code and code in "BCDFIJSZ" else java_type_of(var.type)
             self.type_tok(tokens, type_name)
             self.txt(tokens, " ")
-            tokens.append(_tok(TT.LocalVariableToken, java_var_name(var.name), address=instr.expr_index,
+            tokens.append(_tok(TT.LocalVariableToken, self.display_name(var), address=instr.expr_index,
                                size=instr.size, value=var.identifier,
                                context=InstructionTextTokenContext.LocalVariableTokenContext))
             return type_name
