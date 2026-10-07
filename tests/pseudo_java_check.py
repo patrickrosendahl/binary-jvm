@@ -146,6 +146,24 @@ taken = {"str", "arg2"}
 check("unique names", [pj.unique_name("str", taken), pj.unique_name("str", taken), pj.unique_name("vector", taken)],
       ["str2", "str3", "vector"])
 
+# varargs calls (jvm-57)
+SCHED = os.path.join(ROOT, "sample/ActiveTraderDE_app/Contents/WorkingDir/current/lib/mdg/com/is_teledata/util/Scheduler.class")
+if os.path.exists(SCHED):
+    flags = pj.class_method_flags(open(SCHED, "rb").read())
+    check("method flags", flags.get(("addJob", "(Lcom/is_teledata/util/Producer;J)Ljava/lang/Long;")), 0x11)
+    check("method flags count", len(flags), 7)
+check("method flags junk", pj.class_method_flags(b"nope"), None)
+GC = "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"
+check("varargs spread", [pj.varargs_call_args(GC, 1, ["value"], None),
+                         pj.varargs_call_args(GC, 1, ["value", "value"], None),
+                         pj.varargs_call_args(GC, 1, [], None),
+                         pj.varargs_call_args(GC, 1, ["null"], None),
+                         pj.varargs_call_args(GC, 1, ["array"], None),
+                         pj.varargs_call_args("(I[Ljava/lang/Object;)V", 2, ["value"], ["(II)V"]),
+                         pj.varargs_call_args("(I[Ljava/lang/Object;)V", 2, ["value", "null"], ["(II)V"]),
+                         pj.varargs_call_args("(Ljava/lang/Object;)V", 1, ["value"], None)],
+      [True, True, True, False, False, False, True, False])
+
 if failures:
     print("\n".join(failures))
     print("%d failure(s)" % len(failures))

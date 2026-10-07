@@ -24,11 +24,12 @@ try/catch handlers). Offline, the decoder + lifter pass over the whole sample (�
 effects matching an independent table. All 341 `mdg.jar` classes analyse live in the installed
 plugin; invokes decompile as `Class.method(args)` calls (jvm-40).
 
-**Pseudo Java vs Vineflower** (jvm-45…53, 2026-10-07): per-method comparison with Recaf's decompiler on 20
-mdg classes -- stack temporaries 491 → 199, gotos 6 → 0, `synchronized` blocks instead of comments
-(14 → 5 left), array literals, loop conditions, jsr/ret finally inline, no exception plumbing outside catch
-blocks, field initialisers in the class view; gates in `CLAUDE.md` (testing workflow), details in the wiki
-page `vineflower-comparison.md`.
+**Pseudo Java vs Vineflower** (jvm-45…57, 2026-10-07): per-method comparison with Recaf's decompiler on 20
+mdg classes -- unnamed stack temporaries 491 → 0 (folded, the rest named from their value), gotos 6 → 0,
+`synchronized` blocks instead of comments (14 → 0), `while (true)` loops 9 → 2 (search loops, split
+short-circuit conditions, do-while exits), array literals and varargs calls, jsr/ret finally inline, no
+exception plumbing outside catch blocks, field initialisers in the class view; lines 2790 → 2360 (Vineflower
+1974). Gates in `CLAUDE.md` (testing workflow), details in the wiki page `vineflower-comparison.md`.
 
 See the roadmap below. **This README is the source of truth for the TODO list.**
 

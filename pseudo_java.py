@@ -61,6 +61,7 @@ SYNC_BLOCKS = True           # monitorenter ... monitorexit -> synchronized (x) 
 ARRAY_LITERALS = True        # new T[n] + n element stores -> new T[]{...} (jvm-49)
 LOOP_CONDITIONS = True       # while (true) { if (c) { tail; break; } ... } -> while (!c) { ... } tail (jvm-50)
 RENAME_TEMPORARIES = True    # st0_lo_8 / r_12 / l3_lo -> names from their value: rawValue, vector, str (jvm-55)
+VARARGS_CALLS = True         # m(new T[]{a, b}) -> m(a, b) when m is varargs (jvm-57)
 SPLIT_CONDITIONS = True      # T x; if (a) { x = e; } if (!a || p(x)) -> if (!a || p(e)) (jvm-54)
 # intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
 PURE_INTRINSICS = {"getfield", "arraylength", "checkcast", "instanceof", "new", "newarray", "anewarray",
@@ -154,6 +155,71 @@ def descriptor_arg_codes(desc):
         i = desc.index(';', i) + 1 if desc[i] == 'L' else i + 1
         codes.append(desc[start])
     return codes
+
+
+ACC_VARARGS = 0x0080
+# JDK varargs methods (no class file at hand for them): (owner, name) -- each name has no overload a varargs
+# call could be confused with
+JDK_VARARGS = {
+    ("java/lang/Class", "getMethod"), ("java/lang/Class", "getConstructor"),
+    ("java/lang/Class", "getDeclaredMethod"), ("java/lang/Class", "getDeclaredConstructor"),
+    ("java/lang/reflect/Constructor", "newInstance"), ("java/lang/reflect/Method", "invoke"),
+    ("java/lang/String", "format"), ("java/io/PrintStream", "printf"), ("java/io/PrintStream", "format"),
+    ("java/io/PrintWriter", "printf"), ("java/io/PrintWriter", "format"), ("java/util/Arrays", "asList"),
+    ("java/text/MessageFormat", "format"), ("java/util/Objects", "hash"), ("java/util/EnumSet", "of"),
+    ("java/util/List", "of"), ("java/util/Set", "of"), ("java/util/stream/Stream", "of"),
+    ("java/nio/file/Paths", "get"), ("java/nio/file/Path", "of"),
+}
+_CP_SIZES = {3: 4, 4: 4, 5: 8, 6: 8, 7: 2, 8: 2, 9: 4, 10: 4, 11: 4, 12: 4, 15: 3, 16: 2, 17: 4, 18: 4, 19: 2, 20: 2}
+
+
+def class_method_flags(data):
+    """{(name, descriptor): access flags} of a class file's methods (pure; None if it does not parse)"""
+    import struct
+    try:
+        if data[:4] != b"\xca\xfe\xba\xbe":
+            return None
+        count = struct.unpack_from(">H", data, 8)[0]
+        utf8, i, idx = {}, 10, 1
+        while idx < count:
+            tag = data[i]
+            if tag == 1:
+                n = struct.unpack_from(">H", data, i + 1)[0]
+                utf8[idx] = data[i + 3:i + 3 + n].decode("utf-8", "replace")
+                i += 3 + n
+            else:
+                i += 1 + _CP_SIZES[tag]
+            idx += 2 if tag in (5, 6) else 1
+        i += 6
+        i += 2 + 2 * struct.unpack_from(">H", data, i)[0]
+        out = {}
+        for kind in ("fields", "methods"):
+            n = struct.unpack_from(">H", data, i)[0]
+            i += 2
+            for _ in range(n):
+                flags, name, desc, attrs = struct.unpack_from(">HHHH", data, i)
+                i += 8
+                for _ in range(attrs):
+                    i += 6 + struct.unpack_from(">I", data, i + 2)[0]
+                if kind == "methods":
+                    out[(utf8.get(name), utf8.get(desc))] = flags
+        return out
+    except Exception:
+        return None
+
+
+def varargs_call_args(desc, n_args, elems, overloads):
+    """whether a call's trailing array literal may print as plain arguments: the callee is varargs (checked
+    by the caller), its last parameter is that array, the literal is not a lone null / array (which Java
+    would pass as the array itself), and no other overload of the name could take the spread arguments.
+    overloads: descriptors of the other methods of that name (None: unknown, assumed none)"""
+    codes = descriptor_arg_codes(desc)
+    if not codes or codes[-1] != "[" or len(codes) != n_args:
+        return False
+    if len(elems) == 1 and elems[0] in ("null", "array"):
+        return False
+    spread = n_args - 1 + len(elems)
+    return not any(len(descriptor_arg_codes(d)) == spread for d in (overloads or ()))
 
 
 def method_modifiers(flags):
@@ -689,6 +755,35 @@ if _HAVE_BN:
             except Exception:
                 pass
             self.class_name = self._class_name()
+            self._flags = {}
+
+        def class_flags(self, owner):
+            """method flags of another class of the same unpacked jar / directory (None if not found)"""
+            if owner in self._flags:
+                return self._flags[owner]
+            flags = None
+            try:
+                import os
+                path = self.view.file.original_filename
+                own = self.class_name
+                if path and own and path.endswith(own + ".class"):
+                    other = os.path.join(path[:-len(own + ".class")], owner + ".class")
+                    if os.path.isfile(other):
+                        with open(other, "rb") as fh:
+                            flags = class_method_flags(fh.read())
+            except Exception:
+                flags = None
+            self._flags[owner] = flags
+            return flags
+
+        def varargs(self, owner, name, desc):
+            """(callee is varargs, descriptors of its other overloads or None)"""
+            if (owner, name) in JDK_VARARGS:
+                return True, None
+            flags = self.class_flags(owner)
+            if not flags or not flags.get((name, desc), 0) & ACC_VARARGS:
+                return False, None
+            return True, [d for (n, d) in flags if n == name and d != desc]
 
         def _class_name(self):
             if isinstance(self.meta, dict) and self.meta.get("name"):
@@ -3883,16 +3978,44 @@ if _HAVE_BN:
                 tokens.append(_tok(TT.TypeNameToken, java_class_name(owner)))
                 self.op(tokens, ".")
             tokens.append(_tok(TT.CodeSymbolToken, name, value=slot))
-            self.typed_args(tokens, settings, args, desc)
+            self.typed_args(tokens, settings, args, desc, (owner, name))
 
-        def typed_args(self, tokens, settings, args, desc):
+        def typed_args(self, tokens, settings, args, desc, callee=None):
             codes = descriptor_arg_codes(desc) if desc else []
+            spread = self.varargs_spread(args, desc, callee) if callee and VARARGS_CALLS else None
             tokens.append_open_paren()
-            for i, a in enumerate(args):
+            for i, a in enumerate(args[:-1] if spread is not None else args):
                 if i:
                     self.txt(tokens, ", ")
                 self.emit_typed(a, codes[i] if i < len(codes) else None, tokens, settings)
+            if spread is not None:  # varargs: the array literal's elements are the trailing arguments (jvm-57)
+                for i, e in enumerate(spread):
+                    if i or len(args) > 1:
+                        self.txt(tokens, ", ")
+                    self.emit_typed(e, None, tokens, settings)
             tokens.append_close_paren()
+
+        def varargs_spread(self, args, desc, callee):
+            """the elements of a trailing array literal passed to a varargs method, else None"""
+            if not args or not desc:
+                return None
+            last = args[-1]
+            if last.operation not in (Op.HLIL_VAR, Op.HLIL_VAR_SSA):
+                return None
+            value = self.inline.get(last.var)
+            if not (isinstance(value, tuple) and value[0] == 'arr'):
+                return None
+            elems = list(value[2])
+            is_va, overloads = self.info.varargs(callee[0], callee[1], desc)
+            if not is_va:
+                return None
+            kinds = []
+            for e in elems:
+                t = self.expr_java_type(e)
+                kinds.append("null" if e.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR) and e.constant == 0 and
+                             (t is None or t not in PRIMITIVES.values()) else
+                             "array" if t and t.endswith("[]") else "value")
+            return elems if varargs_call_args(desc, len(args), kinds, overloads) else None
 
         def emit_typed(self, e, code, tokens, settings, precedence=None):
             """a value in a context of known descriptor type: 1 -> true for Z, 'x' for C, 0 -> null for L/["""
