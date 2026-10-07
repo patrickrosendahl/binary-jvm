@@ -64,9 +64,12 @@ def _build_regs():
         # of every long/double function type (view.JavaTypes.return_value)
         "r64": RegisterInfo("r64", 8),
     }
+    # local slot n: l<n>_lo holds a category-1 value, l<n> a long/double. Independent registers like st<n>
+    # (the verifier guarantees a slot is read with the width it was last written with); as a sub-register
+    # a slot holding a reference here and a long there merges into one variable (`l1.d = exc`)
     for n in range(NUM_LOCAL_REGS):
         regs["l%d" % n] = RegisterInfo("l%d" % n, 8)
-        regs["l%d_lo" % n] = RegisterInfo("l%d" % n, 4, 0)
+        regs["l%d_lo" % n] = RegisterInfo("l%d_lo" % n, 4)
     # outgoing invoke arguments, one register per argument (receiver first)
     for n in range(NUM_ARG_REGS):
         regs["a%d" % n] = RegisterInfo("a%d" % n, 8)

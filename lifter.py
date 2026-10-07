@@ -1,6 +1,6 @@
 """LLIL lifting for every JVM opcode.
 
-Model: each local slot n is register l<n> (8 bytes; l<n>_lo is its low 4 bytes). Operand-stack entry k
+Model: local slot n is register l<n> (long/double) or l<n>_lo (a separate 4-byte register). Operand-stack entry k
 (counted in entries from the bottom; a long/double is one entry) is register st<k> (8 bytes) or
 st<k>_lo (4 bytes), using the stack shape methodinfo/stackmap computed for the instruction. Entries
 from NUM_STACK_REGS up, and the whole stack of instructions without a known shape (unreachable code,
@@ -32,7 +32,7 @@ def arg_reg(index, size):
     return ("a%d" if size == 8 else "a%d_lo") % index
 
 def local_reg(index, size):
-    # l<n> is the 8-byte register of local slot n, l<n>_lo its low 4 bytes
+    # local slot n: l<n> when it holds a long/double, l<n>_lo (a separate 4-byte register) otherwise
     return ("l%d" if size == 8 else "l%d_lo") % index
 
 def stack_reg(index, size):
