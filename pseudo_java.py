@@ -4361,6 +4361,12 @@ if _HAVE_BN:
                     self.kw(tokens, "this" if owner == self.info.class_name else "super")
                     self.typed_args(tokens, settings, args, desc)
                     return
+                if recv.operation == Op.HLIL_INTRINSIC and recv.intrinsic.name == "new":
+                    # BN folds a `new` whose object is never used again into its constructor call
+                    self.kw(tokens, "new ")
+                    self.type_tok(tokens, java_class_name(owner))
+                    self.typed_args(tokens, settings, args, desc)
+                    return
                 self.emit_receiver(recv, tokens, settings)
                 self.op(tokens, ".")
                 tokens.append(_tok(TT.CodeSymbolToken, "<init>", value=slot))

@@ -59,7 +59,8 @@ COUNTERS = {
     "sync_comments": re.compile(r"//\s*\}?\s*synchronized"),
     "offset_stores": re.compile(r"__offset"),
     "while_true": re.compile(r"\bwhile \(true\)|\bdo \{"),
-    "plumbing": re.compile(r"\b(exc(_\d+)?|__exception|__propagate)\b|\binstanceof\(|could not render|render raised"),
+    "plumbing": re.compile(r"\b(exc(_\d+)?|__exception|__propagate)\b|\binstanceof\(|could not render|render raised"
+                           r"|\.<init>\("),
 }
 
 
