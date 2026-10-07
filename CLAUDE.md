@@ -112,6 +112,26 @@ yet, jvm-13): unpack next to the JAR into a dir named like it — `mdg.jar` → 
 (`unzip -o -q mdg.jar -d mdg`) — and open the `.class` files from there. `sample/extracted/` is a
 legacy copy of mdg.jar.
 
+## Code structure: parts shared with sister projects
+
+`../binary-cpp` (readable C++: try/catch from exception tables, HLIL readability passes; a later
+binary-dotnet would follow) re-uses this project's language-neutral parts by **copy-paste or with little
+translation** -- no shared package for now. Its README ("Code structure: reusable parts between the projects")
+has the full plan; the same rules apply here:
+- Language-neutral code belongs in `shared/` (to be split out, jvm-68): HLIL walking (`_walk`, `_children`,
+  statement lists), token helpers + `emit_error`, evaluation-order-safe folding (`eval_nodes`, `plan_folds`
+  core), the readability passes (ternary, boolean return, `x++` as a value, loop conditions, split
+  conditions), try-region layout (`group_try_entries`, `try_runs`), and the comparison tooling (statement
+  counting, counters, EXCESS causes, `--max` gates in `tests/vineflower_compare.py`).
+- `shared/` never imports the JVM modules; JVM specifics reach it through hook methods the language class
+  provides (`side_effect`, `reads_memory`, `is_plumbing`, `call_shape`, …), the shared passes being mixins
+  (`PseudoJavaFunction` is one class today, so a mixin is the smallest change).
+- Each shared file carries a provenance header (`# shared with binary-cpp/<path> (synced at <commit>)`) and an
+  entry in `SHARED.md`; a change on one side is ported in the same session or noted there. Shared passes come
+  with a small synthetic test case so the copy can be checked on the other side.
+- Until jvm-68 is done: when you add or change such a part in `pseudo_java.py`, keep the JVM specifics behind a
+  method of their own instead of inlining them into the general logic.
+
 ## Conventions
 
 - **Downloaded external documentation goes in `docs/`** (e.g. `docs/java_opcodes.md`,
