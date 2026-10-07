@@ -184,6 +184,75 @@ def leaked_catch_var(lines):
     return n
 
 
+PRIMITIVE_TYPES = {"int", "long", "short", "byte", "char", "boolean", "float", "double"}
+JTYPE = r"[A-Za-z_$][\w$.]*(?:<[^;=()]*?>)?(?:\[\])*"
+DECL = re.compile(r"(?:^|[(,;]\s*|\bfor \()\s*(?:final\s+)?(%s)\s+([A-Za-z_$][\w$]*)\s*(?=[=;,)])" % JTYPE)
+NOT_TYPES = {"return", "throw", "new", "else", "case", "goto", "break", "continue", "instanceof", "this", "super"}
+# assignments from a value of a known type that Java would reject without a cast
+STRING_SUPERS = {"String", "Object", "CharSequence", "Comparable", "Serializable"}
+BOXED = {"Integer": "int", "Long": "long", "Short": "short", "Byte": "byte", "Character": "char", "Boolean": "boolean",
+         "Float": "float", "Double": "double"}
+
+
+def declared_types(lines):
+    """name -> declared Java type for parameters (header line), locals and catch variables of one method"""
+    out = {}
+    for l in lines:
+        code = strip_strings(re.sub(r"//.*", "", l))
+        for m in DECL.finditer(code):
+            if m.group(1) not in NOT_TYPES:
+                out.setdefault(m.group(2), m.group(1))
+    return out
+
+
+def value_type(expr, types):
+    """static type of a simple expression from the declarations: a variable, an array element `a[i]`, a cast,
+    a string literal; None if unknown"""
+    expr = expr.strip()
+    if re.fullmatch(r'"(\\.|[^"\\])*"', expr):
+        return "String"
+    m = re.fullmatch(r"\((%s)\)\s*[\w$.\[\]]+" % JTYPE, expr)
+    if m and m.group(1) not in PRIMITIVE_TYPES | {"this"}:
+        return m.group(1)
+    m = re.fullmatch(r"([A-Za-z_$][\w$]*)((?:\[[^\[\]]+\])*)", expr)
+    if m and m.group(1) in types:
+        t, dims = types[m.group(1)], m.group(2).count("[")
+        if t.count("[]") < dims:
+            return None
+        return t[:len(t) - 2 * dims] if dims else t
+    return None
+
+
+def type_problems(lines):
+    """(reference compared with 0, double casts, declared-type mismatches) of one method's Pseudo Java"""
+    types = declared_types(lines)
+    ref_zero = casts = mismatch = 0
+    for l in lines:
+        code = strip_strings(re.sub(r"//.*", "", l))
+        for m in re.finditer(r"([A-Za-z_$][\w$]*(?:\[[^\[\]]+\])*)\s*[!=]=\s*0(?![\w.])", code):
+            t = value_type(m.group(1), types)
+            if t is not None and t not in PRIMITIVE_TYPES:
+                ref_zero += 1
+        casts += len(re.findall(r"(?<![\w$)\]])\((%s)\)\s*\(\1\)" % JTYPE, code))
+        for m in re.finditer(r"(?:^|[{;])\s*(?:(%s)\s+)?([A-Za-z_$][\w$]*)\s*=\s*([^=;][^;]*);" % JTYPE, code):
+            decl, name, rhs = m.group(1), m.group(2), m.group(3)
+            if decl in NOT_TYPES:
+                continue
+            target = decl or types.get(name)
+            src = value_type(rhs, types)
+            if target is None or src is None or target == src:
+                continue
+            if src == "String" and target not in STRING_SUPERS:
+                mismatch += 1
+            elif src not in PRIMITIVE_TYPES and target not in PRIMITIVE_TYPES and src == "Object" and \
+                    target != "Object":
+                mismatch += 1  # a downcast without a cast
+            elif (src in PRIMITIVE_TYPES) != (target in PRIMITIVE_TYPES) and src != "Object" and target != "Object" \
+                    and BOXED.get(src, src) != BOXED.get(target, target):
+                mismatch += 1  # (boxing is hidden: `int n = integer` is fine)
+    return ref_zero, casts, mismatch
+
+
 def compare_method(pj_body, vf_body):
     pj_text = "\n".join(pj_body)
     r = {k: len(p.findall(pj_text)) if k != "labels" else sum(1 for l in pj_body if p.match(l))
@@ -191,6 +260,7 @@ def compare_method(pj_body, vf_body):
     r["temps"] = len(set(m.group(0) for m in COUNTERS["temps"].finditer(strip_strings(pj_text))))
     r["dead_code"] = dead_after_return(pj_body)
     r["leaked_catch_var"] = leaked_catch_var(pj_body)
+    r["ref_zero"], r["double_casts"], r["type_mismatch"] = type_problems(pj_body)
     r["lines"] = sum(1 for l in pj_body if l.strip() and l.strip() not in "{}")
     if vf_body is not None:
         vf_text = "\n".join(vf_body)
@@ -251,7 +321,7 @@ def main():
                 print("-" * 30, "Vineflower")
                 print("\n".join(vbody or ["(no match)"]))
     keys = ["lines", "vf_lines", "temps", "gotos", "labels", "sync_comments", "offset_stores", "while_true", "plumbing",
-            "dead_code", "leaked_catch_var"]
+            "dead_code", "leaked_catch_var", "ref_zero", "double_casts", "type_mismatch"]
     for k in keys:
         totals[k] = sum(r.get(k, 0) for r in rows)
     totals["lost_calls"] = sum(len(r.get("lost_calls", [])) for r in rows)
@@ -261,6 +331,7 @@ def main():
     print("TOTAL", json.dumps(totals))
     bad = lambda r: (r["temps"] + 5 * (r["gotos"] + r["sync_comments"] + r["offset_stores"]) +
                      20 * (r["plumbing"] + r["dead_code"] + r["leaked_catch_var"]) +
+                     10 * (r["ref_zero"] + r["double_casts"] + r["type_mismatch"]) +
                      10 * (len(r.get("lost_calls", [])) + len(r.get("lost_strings", []))))
     for r in sorted(rows, key=bad, reverse=True)[:a.worst]:
         if bad(r) == 0:

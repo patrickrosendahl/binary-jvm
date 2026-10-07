@@ -173,23 +173,111 @@ JDK_VARARGS = {
 _CP_SIZES = {3: 4, 4: 4, 5: 8, 6: 8, 7: 2, 8: 2, 9: 4, 10: 4, 11: 4, 12: 4, 15: 3, 16: 2, 17: 4, 18: 4, 19: 2, 20: 2}
 
 
+def _class_pool(data):
+    """(utf8 text by pool index, name index of each Class entry by pool index, offset after the pool)"""
+    import struct
+    count = struct.unpack_from(">H", data, 8)[0]
+    utf8, classes, i, idx = {}, {}, 10, 1
+    while idx < count:
+        tag = data[i]
+        if tag == 1:
+            n = struct.unpack_from(">H", data, i + 1)[0]
+            utf8[idx] = data[i + 3:i + 3 + n].decode("utf-8", "replace")
+            i += 3 + n
+        else:
+            if tag == 7:
+                classes[idx] = struct.unpack_from(">H", data, i + 1)[0]
+            i += 1 + _CP_SIZES[tag]
+        idx += 2 if tag in (5, 6) else 1
+    return utf8, classes, i
+
+
+def class_supertypes(data):
+    """(superclass or None, [interfaces]) internal names of a class file (pure; None if it does not parse)"""
+    import struct
+    try:
+        if data[:4] != b"\xca\xfe\xba\xbe":
+            return None
+        utf8, classes, i = _class_pool(data)
+        sup, n = struct.unpack_from(">HH", data, i + 4)
+        ifaces = [utf8.get(classes.get(struct.unpack_from(">H", data, i + 8 + 2 * k)[0])) for k in range(n)]
+        return (utf8.get(classes.get(sup)) if sup else None), [x for x in ifaces if x]
+    except Exception:
+        return None
+
+
+# direct supertypes (superclass first) of common JDK classes, by printed (simple) name
+JDK_SUPERTYPES = {
+    "String": ["Object", "CharSequence", "Comparable"], "StringBuffer": ["Object", "CharSequence"],
+    "StringBuilder": ["Object", "CharSequence"], "Number": ["Object"],
+    "Integer": ["Number", "Comparable"], "Long": ["Number", "Comparable"], "Short": ["Number", "Comparable"],
+    "Byte": ["Number", "Comparable"], "Float": ["Number", "Comparable"], "Double": ["Number", "Comparable"],
+    "Boolean": ["Object", "Comparable"], "Character": ["Object", "Comparable"],
+    "Vector": ["AbstractList", "List"], "Stack": ["Vector"], "ArrayList": ["AbstractList", "List"],
+    "LinkedList": ["AbstractList", "List"], "AbstractList": ["AbstractCollection", "List"],
+    "AbstractCollection": ["Object", "Collection"], "List": ["Collection"], "Set": ["Collection"],
+    "HashSet": ["AbstractCollection", "Set"], "TreeSet": ["AbstractCollection", "Set"],
+    "Hashtable": ["Dictionary", "Map"], "Properties": ["Hashtable"], "HashMap": ["AbstractMap", "Map"],
+    "TreeMap": ["AbstractMap", "Map"], "AbstractMap": ["Object", "Map"],
+    "Throwable": ["Object"], "Exception": ["Throwable"], "Error": ["Throwable"],
+    "RuntimeException": ["Exception"], "IOException": ["Exception"], "InterruptedException": ["Exception"],
+    "FileNotFoundException": ["IOException"], "IllegalArgumentException": ["RuntimeException"],
+    "NumberFormatException": ["IllegalArgumentException"], "IllegalStateException": ["RuntimeException"],
+    "NullPointerException": ["RuntimeException"], "ClassCastException": ["RuntimeException"],
+    "IndexOutOfBoundsException": ["RuntimeException"], "ArrayIndexOutOfBoundsException": ["IndexOutOfBoundsException"],
+    "Date": ["Object", "Comparable"], "Calendar": ["Object", "Comparable"],
+    "GregorianCalendar": ["Calendar"],
+}
+NUMERIC_ORDER = ["byte", "short", "char", "int", "long", "float", "double"]
+
+
+def _ancestors(t, supertypes):
+    """t and its supertypes, nearest first (superclasses before interfaces), Object last"""
+    out, queue = [], [t]
+    while queue:
+        x = queue.pop(0)
+        if x in out or x == "Object":
+            continue
+        out.append(x)
+        queue.extend((supertypes(x) if supertypes else None) or JDK_SUPERTYPES.get(x) or [])
+    return out + ["Object"]
+
+
+def common_supertype(types, supertypes=None):
+    """the most specific Java type all values of `types` fit: the type itself when they agree, the wider
+    number type for primitives (byte/short/char/int -> int, int/long -> long), for classes the nearest common
+    supertype (supertypes(name) -> direct supertypes, else JDK_SUPERTYPES; Object when unknown), None when
+    there is none (a primitive and a reference, boolean and int)"""
+    types = [t for t in types if t]
+    if not types:
+        return None
+    out = types[0]
+    for t in types[1:]:
+        if out == t:
+            continue
+        prim = (out in PRIMITIVES.values(), t in PRIMITIVES.values())
+        if any(prim):
+            if not all(prim) or "boolean" in (out, t) or "void" in (out, t):
+                return None
+            out = NUMERIC_ORDER[max(NUMERIC_ORDER.index(out), NUMERIC_ORDER.index(t), NUMERIC_ORDER.index("int"))]
+        elif out.endswith("[]") and t.endswith("[]"):
+            inner = common_supertype([out[:-2], t[:-2]], supertypes)
+            out = inner + "[]" if inner and inner not in PRIMITIVES.values() else "Object"
+        elif out.endswith("[]") or t.endswith("[]"):
+            out = "Object"
+        else:
+            theirs = set(_ancestors(t, supertypes))
+            out = next(a for a in _ancestors(out, supertypes) if a in theirs)
+    return out
+
+
 def class_method_flags(data):
     """{(name, descriptor): access flags} of a class file's methods (pure; None if it does not parse)"""
     import struct
     try:
         if data[:4] != b"\xca\xfe\xba\xbe":
             return None
-        count = struct.unpack_from(">H", data, 8)[0]
-        utf8, i, idx = {}, 10, 1
-        while idx < count:
-            tag = data[i]
-            if tag == 1:
-                n = struct.unpack_from(">H", data, i + 1)[0]
-                utf8[idx] = data[i + 3:i + 3 + n].decode("utf-8", "replace")
-                i += 3 + n
-            else:
-                i += 1 + _CP_SIZES[tag]
-            idx += 2 if tag in (5, 6) else 1
+        utf8, _, i = _class_pool(data)
         i += 6
         i += 2 + 2 * struct.unpack_from(">H", data, i)[0]
         out = {}
@@ -756,12 +844,11 @@ if _HAVE_BN:
                 pass
             self.class_name = self._class_name()
             self._flags = {}
+            self._supers = {}
+            self._internal = None
 
-        def class_flags(self, owner):
-            """method flags of another class of the same unpacked jar / directory (None if not found)"""
-            if owner in self._flags:
-                return self._flags[owner]
-            flags = None
+        def sibling_class(self, owner):
+            """bytes of another class file of the same unpacked jar / directory (None if not found)"""
             try:
                 import os
                 path = self.view.file.original_filename
@@ -770,11 +857,51 @@ if _HAVE_BN:
                     other = os.path.join(path[:-len(own + ".class")], owner + ".class")
                     if os.path.isfile(other):
                         with open(other, "rb") as fh:
-                            flags = class_method_flags(fh.read())
+                            return fh.read()
             except Exception:
-                flags = None
-            self._flags[owner] = flags
-            return flags
+                pass
+            return None
+
+        def class_flags(self, owner):
+            """method flags of another class of the same unpacked jar / directory (None if not found)"""
+            if owner not in self._flags:
+                data = self.sibling_class(owner)
+                self._flags[owner] = class_method_flags(data) if data else None
+            return self._flags[owner]
+
+        def internal_names(self):
+            """printed class name -> internal name, for every class this class file mentions (ambiguous: None)"""
+            if self._internal is None:
+                names = {}
+                try:
+                    found = {self.class_name} if self.class_name else set()
+                    for e in self.reader.constantPool.poolContent:
+                        kind = type(e).__name__
+                        if kind == "JVMClassReference":
+                            found.add(str(e))
+                        elif kind == "JVMUTF8Info":
+                            found.update(re.findall(r"L([\w/$]+);", str(e)))
+                    for n in found:
+                        if n and not n.startswith("["):
+                            key = java_class_name(n)
+                            names[key] = n if names.get(key, n) == n else None
+                except Exception:
+                    pass
+                self._internal = names
+            return self._internal
+
+        def supertypes(self, simple):
+            """direct supertypes (printed names, superclass first) of a class known by its printed name: from its
+            class file in the same jar dir, else JDK_SUPERTYPES (None if unknown)"""
+            if simple not in self._supers:
+                out = None
+                internal = self.internal_names().get(simple)
+                data = self.sibling_class(internal) if internal else None
+                st = class_supertypes(data) if data else None
+                if st is not None:
+                    out = [java_class_name(n) for n in ([st[0]] if st[0] else []) + st[1]]
+                self._supers[simple] = out if out is not None else JDK_SUPERTYPES.get(simple)
+            return self._supers[simple]
 
         def varargs(self, owner, name, desc):
             """(callee is varargs, descriptors of its other overloads or None)"""
@@ -913,15 +1040,18 @@ if _HAVE_BN:
             self.return_code = self.method[1][self.method[1].index(")") + 1] if self.method else None
             # parameters by local slot (BN drops unused parameters from the function type, so positions lie)
             self.param_codes = {}
+            self.param_types = {}
             self.this_var = None
             if self.method is not None:
                 slots = arg_slots(self.method[1], self.is_static)
+                arg_types = descriptor_types(self.method[1])[0]
                 for var in param_vars_by_slot(func).items():
                     slot, v = var
                     if slot == 0 and not self.is_static:
                         self.this_var = v
                     elif slot in slots:
                         self.param_codes[v] = slots[slot][1]
+                        self.param_types[v] = arg_types[slots[slot][0]]
             self.table = self.info.exception_table(func)
             # javac's synchronized-block cleanup handlers (catch-any doing monitorexit) are not try/finally
             self.try_groups = [g for g in group_try_entries(self.table)
@@ -3618,11 +3748,12 @@ if _HAVE_BN:
                                context=InstructionTextTokenContext.LocalVariableTokenContext))
 
         def emit_var_decl(self, var, instr, tokens, src=None):
-            # the initializer's type (descriptors, casts, `new`) beats the variable's propagated BN type: the
-            # stack registers are shared by unrelated values, so BN's type for them is often a neighbour's
-            type_name = self.expr_java_type(src) if src is not None else None
-            if type_name is None and src is None:
-                type_name = self.defs_java_type(var)
+            # what the variable is set from (descriptors, casts, `new`; the common supertype of all its values)
+            # beats its propagated BN type: the stack registers are shared by unrelated values, so BN's type
+            # for them is often a neighbour's
+            type_name = self.var_java_type(var)
+            if type_name is None and src is not None:
+                type_name = self.expr_java_type(src)
             if type_name is None:
                 code = self.var_code(var)  # e.g. `i = 0` ... `i++`: an int whatever BN propagated
                 type_name = PRIMITIVES.get(code) if code and code in "BCDFIJSZ" else java_type_of(var.type)
@@ -3633,22 +3764,52 @@ if _HAVE_BN:
                                context=InstructionTextTokenContext.LocalVariableTokenContext))
             return type_name
 
+        def var_java_type(self, var):
+            """Java type of a variable: `this`, a parameter's descriptor type, else the common supertype of the
+            values it is set from (None if unknown)"""
+            if var == self.this_var and self.info.class_name:
+                return java_class_name(self.info.class_name)
+            if var in self.param_types:
+                return self.param_types[var]
+            cache = self.__dict__.setdefault("_var_type_cache", {})
+            if var not in cache:
+                cache[var] = None  # recursion guard
+                cache[var] = self.defs_java_type(var)
+            return cache[var]
+
         def defs_java_type(self, var):
-            """Java type of a declared-only variable when all its assignments agree (the lock of a synchronized
-            block is a stack register BN types as int32_t)"""
-            types = set()
+            """common supertype of the values a variable is set from; constants (null, numbers) fit any type and
+            values of unknown type are left out (the lock of a synchronized block is a stack register BN types
+            as int32_t)"""
+            types = []
             try:
                 for d in self.hlil.get_var_definitions(var):
                     if d.operation not in (Op.HLIL_VAR_INIT, Op.HLIL_ASSIGN):
                         return None
-                    types.add(self.expr_java_type(d.src))
+                    types.append(self.expr_java_type(d.src))
             except Exception:
                 return None
-            return types.pop() if len(types) == 1 else None
+            return common_supertype(types, self.info.supertypes)
+
+        @staticmethod
+        def type_code(java_type):
+            """'int' -> 'I', 'String' -> 'L', 'int[]' -> '['"""
+            if not java_type:
+                return None
+            if java_type.endswith("[]"):
+                return '['
+            return TYPE_CODES.get(java_type, 'L')
+
+        def array_elem_type(self, base):
+            t = self.expr_java_type(base)
+            return t[:-2] if t and t.endswith("[]") else None
 
         def expr_java_type(self, e):
-            """Java type of an initializer, from descriptors / pool entries (None if unknown)"""
+            """Java type of an expression, from descriptors / pool entries / what variables are set from (None if
+            unknown)"""
             o = e.operation
+            if o in (Op.HLIL_VAR, Op.HLIL_VAR_SSA):
+                return self.var_java_type(e.var)
             if o in (Op.HLIL_CALL, Op.HLIL_INTRINSIC) and e.expr_index in self._concat:
                 return "String"
             if o == Op.HLIL_CALL or (o == Op.HLIL_INTRINSIC and e.intrinsic.name.startswith("invoke")):
@@ -3681,8 +3842,13 @@ if _HAVE_BN:
                 return None
             if o == Op.HLIL_DEREF:
                 idx = _pool_index(_const_target(e.src))
-                m = self.info.member(idx) if idx is not None else None
+                if idx is None:
+                    arr = self.array_access(e.src, e.size)
+                    return self.array_elem_type(arr[0]) if arr is not None else None
+                m = self.info.member(idx)
                 return field_type_name(m[2]) if m and m[2] else None
+            if o in (Op.HLIL_STRUCT_FIELD, Op.HLIL_DEREF_FIELD) and e.size and e.offset % e.size == 0:
+                return self.array_elem_type(e.src)  # a constant-index array element (see _expr_text)
             if o in (Op.HLIL_ADD, Op.HLIL_SUB, Op.HLIL_MUL, Op.HLIL_DIVS, Op.HLIL_MODS, Op.HLIL_AND, Op.HLIL_OR,
                      Op.HLIL_XOR, Op.HLIL_LSL, Op.HLIL_ASR, Op.HLIL_LSR, Op.HLIL_NEG, Op.HLIL_NOT) and e.size in (4, 8):
                 return "int" if e.size == 4 else "long"
@@ -3693,6 +3859,8 @@ if _HAVE_BN:
                 idx = _pool_index(e.constant)
                 if idx is not None and self.info.string(idx) is not None:
                     return "String"
+                if idx is not None and self.info.kind(idx) == "JVMClassReference":
+                    return "Class"
             return None
 
         def emit_assign(self, instr, tokens, settings):
@@ -4062,13 +4230,17 @@ if _HAVE_BN:
                 if e.var in self.param_codes:
                     return self.param_codes[e.var]
                 code = self.var_code(e.var)  # what it is set from beats BN's (shared-register) type
+                if code is None:
+                    code = self.type_code(self.var_java_type(e.var))
                 if code is not None:
                     return code
                 declared = java_type_of(e.var.type)
                 return {"boolean": 'Z', "char": 'C'}.get(declared)
             if o == Op.HLIL_DEREF:
                 idx = _pool_index(_const_target(e.src))
-                m = self.info.member(idx) if idx is not None else None
+                if idx is None:
+                    return self.type_code(self.expr_java_type(e))  # an array element
+                m = self.info.member(idx)
                 return m[2][0] if m and m[2] else None
             if o == Op.HLIL_CALL or (o == Op.HLIL_INTRINSIC and e.intrinsic.name.startswith("invoke")):
                 shape = self.call_shape(e)
@@ -4081,9 +4253,15 @@ if _HAVE_BN:
                     return m[2][0] if m and m[2] else None
                 if e.intrinsic.name in ("instanceof", "__instanceof"):
                     return 'Z'
+                if e.intrinsic.name in ("checkcast", "new", "newarray", "anewarray", "multianewarray"):
+                    return self.type_code(self.expr_java_type(e))
             if o in (Op.HLIL_ADD, Op.HLIL_SUB, Op.HLIL_MUL, Op.HLIL_DIVS, Op.HLIL_MODS, Op.HLIL_LSL, Op.HLIL_ASR,
                      Op.HLIL_LSR, Op.HLIL_NEG) and e.size in (4, 8):
                 return 'I' if e.size == 4 else 'J'
+            if o in (Op.HLIL_STRUCT_FIELD, Op.HLIL_DEREF_FIELD):
+                code = self.type_code(self.expr_java_type(e))
+                if code is not None:
+                    return code
             if isinstance(e.expr_type, BoolType):
                 return 'Z'
             return None
@@ -4192,7 +4370,11 @@ if _HAVE_BN:
                 self.expr(p[0], tokens, settings)
                 return
             if name == "checkcast" and len(p) == 2:
-                self.emit_cast(self.class_operand(p[1]) or "?", p[0], tokens, settings, precedence)
+                cls, src = self.class_operand(p[1]) or "?", p[0]
+                while src.operation == Op.HLIL_INTRINSIC and src.intrinsic.name == "checkcast" and \
+                        len(src.params) == 2 and self.class_operand(src.params[1]) == cls:
+                    src = src.params[0]  # the same checkcast twice in a row: one cast
+                self.emit_cast(cls, src, tokens, settings, precedence)
                 return
             if name in ("instanceof", "__instanceof") and len(p) == 2:
                 parens = precedence > P.CompareOperatorPrecedence

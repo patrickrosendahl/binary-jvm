@@ -164,6 +164,19 @@ check("varargs spread", [pj.varargs_call_args(GC, 1, ["value"], None),
                          pj.varargs_call_args("(Ljava/lang/Object;)V", 1, ["value"], None)],
       [True, True, True, False, False, False, True, False])
 
+# common supertypes for declared types (jvm-58)
+sup = {"A": ["Base", "Iface"], "B": ["Base"], "Base": ["Object"], "C": ["Object", "Iface"]}.get
+check("common supertype", [pj.common_supertype(t, sup) for t in
+                           [["String", "String"], ["String", "SubscriptionFilter"], ["A", "B"], ["A", "C"],
+                            ["int", "short"], ["int", "long"], ["int", "String"], ["boolean", "int"],
+                            [None, "String"], [], ["String[]", "Object[]"], ["int[]", "long[]"], ["int[]", "String"],
+                            ["IOException", "RuntimeException"], ["Vector", "ArrayList"], ["Integer", "Long"]]],
+      ["String", "Object", "Base", "Iface", "int", "long", None, None, "String", None, "Object[]", "Object", "Object",
+       "Exception", "AbstractList", "Number"])
+if os.path.exists(SCHED):
+    check("class supertypes", pj.class_supertypes(open(SCHED, "rb").read()), ("java/lang/Thread", []))
+check("class supertypes junk", pj.class_supertypes(b"nope"), None)
+
 if failures:
     print("\n".join(failures))
     print("%d failure(s)" % len(failures))
