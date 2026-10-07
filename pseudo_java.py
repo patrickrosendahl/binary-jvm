@@ -55,6 +55,7 @@ from .constants import (ARCH_NAME, VIEW_NAME, PSEUDOMEMORY_TABLE, PSEUDOMEMORY_P
 # ---------------------------------------------------------------------------------------------------
 HIDE_BOXING = True          # Integer.valueOf(x) / x.intValue() -> x
 FOLD_TEMPORARIES = True      # print a single-use operand-stack temporary inside its use (jvm-46)
+SYNC_BLOCKS = True           # monitorenter ... monitorexit -> synchronized (x) { ... } (jvm-47)
 # intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
 PURE_INTRINSICS = {"getfield", "arraylength", "checkcast", "instanceof", "new", "newarray", "anewarray",
                    "multianewarray", "__exception"}
@@ -684,6 +685,8 @@ if _HAVE_BN:
                 self.monitor_windows.append((h, (max(ends) if ends else h + 4) + 3))
             self._in_finally = False
             self.inline = {}        # folded single-use temporary -> its value (expr, or ('new', entry)) (jvm-46)
+            self.active_syncs = []  # lock variables of the synchronized blocks being printed (jvm-47)
+            self.hidden_vars = set()  # lock variables whose definition moved into a synchronized header
             self._def_counts = None
             self.deferred = set()           # expr_index of handler code met in a try body, printed by its catch
             self.printed_handlers = set()   # handler pcs whose catch/finally clause was printed
@@ -1413,6 +1416,8 @@ if _HAVE_BN:
                 self.hidden_gotos = {}
                 self._follow = []
                 self.inline = {}
+                self.active_syncs = []
+                self.hidden_vars = set()
                 self.deferred = set()
                 self.printed_handlers = set()
             self.emit_list(self.flatten(list(instr.body)), tokens, settings, instr, is_root)
@@ -1443,7 +1448,14 @@ if _HAVE_BN:
                 # a try range is printed once per function, where it first fits
                 runs = try_runs(pcs, self.try_groups, {(g[0], g[1]) for g in self.active_tries} | self.placed)
             run_at = {r[0] + lo: (r[0] + lo, r[1] + lo, r[2]) for r in runs}
-            for r in runs:
+            sync_at = {}
+            if SYNC_BLOCKS and block.as_ast:
+                try:
+                    sync_at = self.plan_syncs(body, lo, hi, run_at, plan)
+                except Exception:
+                    sync_at = {}
+            runs = list(run_at.values())
+            for r in run_at.values():
                 self.placed.add((r[2][0], r[2][1]))
                 self.placed_handlers.update(h for h, _ in r[2][2])
             if FOLD_TEMPORARIES and block.as_ast:
@@ -1454,6 +1466,17 @@ if _HAVE_BN:
             need_separator = None  # None: nothing emitted yet in this range
             idx = lo
             while idx <= hi:
+                if idx in sync_at:
+                    end, lock, value = sync_at[idx]
+                    if need_separator is not None:
+                        tokens.scope_separator()
+                    try:
+                        self.emit_sync(body, idx, end, lock, value, plan, tokens, settings, block)
+                    except Exception as ex:
+                        self.emit_error(body[idx], ex, tokens)
+                    idx = end + 1
+                    need_separator = True
+                    continue
                 if idx in run_at:
                     first, last, group = run_at[idx]
                     if need_separator is not None:
@@ -1660,6 +1683,193 @@ if _HAVE_BN:
                 return
             self.perform_get_expr_text(value, tokens, settings, precedence)
 
+        # --- synchronized blocks (jvm-47) ------------------------------------------------------------
+        def monitor_var(self, s, name):
+            """the lock variable of a `monitorenter(v)` / `monitorexit(v)` statement, else None"""
+            if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_INTRINSIC or s.intrinsic.name != name or \
+                    len(s.params) != 1 or s.params[0].operation not in (Op.HLIL_VAR, Op.HLIL_VAR_SSA):
+                return None
+            return s.params[0].var
+
+        def monitor_exits(self, roots, lock):
+            """monitorexit(lock) statements below roots that are not javac's cleanup-handler code"""
+            n = 0
+            for r in roots:
+                for i in _walk(r.instr if isinstance(r, _ExcBranch) else r):
+                    if self.monitor_var(i, "monitorexit") == lock and not self.in_monitor_code(i):
+                        n += 1
+            return n
+
+        def never_falls(self, s):
+            """control never continues after statement s (every path returns, throws, breaks, ...)"""
+            if isinstance(s, _ExcBranch):
+                return False
+            if s.operation == Op.HLIL_IF:
+                if s.false is None or s.false.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
+                    return False
+                return all(self.ends_flow(self.flatten(self.stmts_of(b))) or
+                           (self.flatten(self.stmts_of(b)) and self.never_falls(self.flatten(self.stmts_of(b))[-1]))
+                           for b in (s.true, s.false))
+            return self.ends_flow([s])
+
+        def plan_syncs(self, body, lo, hi, run_at, plan):
+            """{index of monitorenter: (last index of the block, lock var, value printed for the lock)} for the
+            synchronized blocks of body[lo..hi]; try runs inside a block move into it, a run crossing one
+            cancels it"""
+            out = {}
+            k = lo
+            while k <= hi:
+                lock = self.monitor_var(body[k], "monitorenter")
+                if lock is None or self.in_monitor_code(body[k]):
+                    k += 1
+                    continue
+                end = None
+                for b in range(hi, k, -1):
+                    if self.monitor_var(body[b], "monitorexit") == lock:
+                        end = b
+                        break
+                last = end - 1 if end is not None else hi
+                if end is None:
+                    real = [x for x in range(k + 1, hi + 1) if not self.fold_transparent(body, x, plan)]
+                    if not real or not self.never_falls(body[real[-1]]):
+                        k += 1
+                        continue
+                inner = body[k + 1:(end if end is not None else hi) + 1]
+                total = self.monitor_exits([self.hlil.root], lock)
+                if not self.exits_leave(body, k, end if end is not None else hi + 1, lock) or \
+                        self.monitor_exits(inner, lock) != total or \
+                        any(self.monitor_var(i, "monitorenter") == lock for x in inner
+                            for i in _walk(x.instr if isinstance(x, _ExcBranch) else x)):
+                    k += 1
+                    continue
+                stop = end if end is not None else hi
+                crossing = [f for f, (a, b, _) in run_at.items() if a <= stop and b >= k and not (k < a and b <= last)
+                            and not (a <= k and stop <= b)]
+                containing = [f for f, (a, b, _) in run_at.items() if a <= k and stop <= b]
+                if crossing or containing:
+                    k += 1
+                    continue
+                for f in [f for f, (a, b, _) in run_at.items() if k < a and b <= last]:
+                    del run_at[f]  # placed inside the block
+                out[k] = (stop, lock, self.lock_value(body, k, lock, plan))
+                k = stop + 1
+            return out
+
+        def hidden_item(self, s):
+            """a flattened item that prints nothing"""
+            if isinstance(s, _ExcBranch):
+                if s.branch.expr_index in self.consumed:
+                    return True
+                cls = self.branch_class(s.branch, s.address - self.function.start)
+                return cls[0] in ('hide', 'rethrow') or (cls[0] == 'handler' and cls[1] in self.placed_handlers)
+            return self.is_exc_plumbing(s) or s.operation == Op.HLIL_NOP or \
+                (s.expr_index in self.consumed) or self.in_monitor_code(s)
+
+        def exit_leaves(self, after):
+            """the statements after a monitorexit leave the block at once (return / throw)"""
+            for y in after:
+                if self.hidden_item(y):
+                    continue
+                return not isinstance(y, _ExcBranch) and y.operation not in (Op.HLIL_BREAK, Op.HLIL_CONTINUE,
+                                                                             Op.HLIL_GOTO) and self.ends_flow([y])
+            return False
+
+        def exits_leave(self, body, k, end, lock):
+            """every monitorexit(lock) inside body[k+1..end) is directly followed by a return or throw (the block's
+            other exits); a release in the middle of the code would put the rest outside the lock"""
+            for m in range(k + 1, end):
+                x = body[m]
+                if isinstance(x, _ExcBranch):
+                    continue
+                if self.monitor_var(x, "monitorexit") == lock:
+                    if not self.in_monitor_code(x) and not self.exit_leaves(body[m + 1:end]):
+                        return False
+                    continue
+                for blk, i, st in _stmts_preorder(x):
+                    if blk.operation != Op.HLIL_BLOCK or self.monitor_var(st, "monitorexit") != lock or \
+                            self.in_monitor_code(st):
+                        continue
+                    if not self.exit_leaves(self.flatten(list(blk.body)[i + 1:])):
+                        return False
+            return True
+
+        def lock_only_vars(self):
+            """variables read only as the operand of monitorenter / monitorexit, set by one assignment"""
+            if getattr(self, "_lock_only", None) is None:
+                self._lock_only = set()
+                try:
+                    reads, mon, assigns = {}, {}, {}
+                    for i in _walk(self.hlil.root):
+                        if i.operation == Op.HLIL_VAR:
+                            reads[i.var] = reads.get(i.var, 0) + 1
+                        if self.monitor_var(i, "monitorenter") is not None or self.monitor_var(i, "monitorexit") is not None:
+                            v = i.params[0].var
+                            mon[v] = mon.get(v, 0) + 1
+                        if i.operation == Op.HLIL_ASSIGN and i.dest.operation == Op.HLIL_VAR:
+                            assigns[i.dest.var] = assigns.get(i.dest.var, 0) + 1
+                    self._lock_only = {v for v, n in mon.items() if assigns.get(v) == 1 and reads.get(v, 0) == n + 1
+                                       and self.def_count(v) == 2}  # declared apart (VAR_DECLARE), assigned once
+                except Exception:
+                    pass
+            return self._lock_only
+
+        def lock_value(self, body, k, lock, plan):
+            """the expression the lock variable is set from right before the monitorenter, when the variable
+            is used for nothing else (its definition is then not printed)"""
+            try:
+                defs = list(self.hlil.get_var_definitions(lock))
+            except Exception:
+                return None
+            if len(defs) != 1:
+                return None
+            reads = sum(1 for i in _walk(self.hlil.root) if i.operation == Op.HLIL_VAR and i.var == lock)
+            monitor = sum(1 for i in _walk(self.hlil.root)
+                          if self.monitor_var(i, "monitorenter") == lock or self.monitor_var(i, "monitorexit") == lock)
+            d = defs[0]
+            is_assign = d.operation == Op.HLIL_ASSIGN
+            if reads != monitor + (1 if is_assign else 0):
+                return None
+            j = k - 1
+            while j >= 0 and body[j].expr_index != d.expr_index and self.fold_transparent(body, j, plan):
+                j -= 1
+            if j < 0 or body[j].expr_index != d.expr_index:
+                return None
+            plan.setdefault("folded", set()).add(j)
+            if is_assign:
+                self.hidden_vars.add(lock)
+            return d.src
+
+        def emit_sync(self, body, k, end, lock, value, plan, tokens, settings, block):
+            # variables declared in the block but used after it are declared before it (as for try)
+            for j in range(k + 1, end + 1):
+                s = body[j]
+                if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_VAR_INIT or s.dest in self.hoisted or \
+                        s.dest in self.inline or self.is_exc_var(s.dest) or j in plan["skip"]:
+                    continue
+                inside = sum(self.refs(body[x], s.dest) for x in range(k + 1, end + 1) if not isinstance(body[x], _ExcBranch))
+                if self.var_count(s.dest) > inside:
+                    self.hoisted.add(s.dest)
+                    self.emit_var_decl(s.dest, s, tokens, s.src)
+                    tokens.append_semicolon()
+                    tokens.new_line()
+            self.kw(tokens, "synchronized ")
+            tokens.append_open_paren()
+            if value is not None:
+                self.expr(value, tokens, settings)
+            else:
+                self.emit_var(lock, body[k], tokens)
+            tokens.append_close_paren()
+            tokens.begin_scope(ScopeType.BlockScopeType)
+            self.active_syncs.append(lock)
+            last = end - 1 if self.monitor_var(body[end], "monitorexit") == lock else end
+            try:
+                self.emit_range(body, k + 1, last, plan, tokens, settings, block)
+            finally:
+                self.active_syncs.pop()
+                tokens.end_scope(ScopeType.BlockScopeType)
+            tokens.finalize_scope()
+            tokens.new_line()
+
         def emit_error(self, s, ex, tokens):
             """never lose a statement: if rendering fails, print its HLIL as a comment"""
             try:
@@ -1737,6 +1947,22 @@ if _HAVE_BN:
                 return need_separator
             if self.is_implicit_super(s) or s.operation == Op.HLIL_NORET:
                 return need_separator
+            lock = self.monitor_var(s, "monitorexit")
+            if lock is not None and lock in self.active_syncs:
+                return need_separator  # leaving the synchronized block
+            if s.operation == Op.HLIL_VAR_DECLARE and (s.var in self.hidden_vars or s.var in self.lock_only_vars()):
+                return need_separator
+            if s.operation == Op.HLIL_ASSIGN and s.dest.operation == Op.HLIL_VAR and \
+                    s.dest.var in self.lock_only_vars():
+                # a lock variable whose synchronized block could not be printed: declared where it is set
+                if need_separator:
+                    tokens.scope_separator()
+                self.emit_var_decl(s.dest.var, s, tokens, s.src)
+                self.op(tokens, " = ")
+                self.expr(s.src, tokens, settings, P.AssignmentOperatorPrecedence)
+                tokens.append_semicolon()
+                tokens.new_line()
+                return False
             if not self.exc_names and self.is_rethrow(s) and s.params[0].operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) \
                     and self.is_exc_var(s.params[0].var):
                 return need_separator  # an uncaught exception propagates: no Java statement
