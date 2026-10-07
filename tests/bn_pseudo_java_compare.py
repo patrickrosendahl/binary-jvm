@@ -8,8 +8,12 @@
 #   * no exception plumbing: no `exc`, `__exception`, `__propagate`, `instanceof(`, no render errors
 #   * not truncated: balanced braces, last line `}`
 #   * a method with an exception table has `try` (except javac's synchronized-only cleanup handlers)
+#   * no catch variable used outside its catch block, no jump right after a jump (`return; break;`) (jvm-45)
 import os, re, sys, time
 import binaryninja as b
+sys.path.insert(0, "/Users/patrick/dev/binary-jvm/tests")
+import importlib, vineflower_compare as _vc
+_vc = importlib.reload(_vc)  # the app's interpreter keeps modules between bnrun calls
 
 CLASS_DIR = globals().get("CLASS_DIR", "/Users/patrick/dev/binary-jvm/sample/ActiveTraderDE_app/Contents/WorkingDir/current/lib/mdg")
 CLASSES = globals().get("CLASSES", ["com/is_teledata/cache/HashCache.class"])
@@ -59,9 +63,9 @@ for rel in CLASSES:
             if i.operation == Op.HLIL_CALL or (i.operation == Op.HLIL_INTRINSIC and i.intrinsic.name.startswith("invoke")):
                 shape = lr.call_shape(i)
                 if shape is None and i.operation == Op.HLIL_CALL:
-                    m = re.match(r"(sub_[0-9a-f]+)\(", str(i))
-                    if m:
-                        names.add(m.group(1))
+                    m = re.match(r"sub_([0-9a-f]+)\(", str(i))
+                    if m and int(m.group(1), 16) not in lr.finally_subs():  # jsr finally bodies print inline
+                        names.add("sub_" + m.group(1))
             if shape and shape[2] not in SKIP_NAMES:
                 names.add(shape[2])
             if i.operation in (Op.HLIL_CONST_PTR, Op.HLIL_CONST):
@@ -86,6 +90,10 @@ for rel in CLASSES:
             problems.append("unbalanced braces %d/%d" % (code.count("{"), code.count("}")))
         if not lines or lines[-1].strip() != "}":
             problems.append("truncated? last line %r" % (lines[-1] if lines else None))
+        if _vc.leaked_catch_var(lines):
+            problems.append("catch variable used outside its catch")
+        if _vc.dead_after_return(lines):
+            problems.append("dead code after a jump")
         real = [e for e in table if e[3] or not lr.is_monitor_cleanup(e[2])]
         if real and not re.search(r"\btry\b", text):
             problems.append("no try for %s" % real)

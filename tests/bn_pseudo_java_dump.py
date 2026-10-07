@@ -12,7 +12,8 @@ OUT_DIR = globals().get("OUT_DIR", REPO + "/.scratch/vfcmp/pj")
 CLASSES = globals().get("CLASSES", None)
 if CLASSES is None:
     sys.path.insert(0, os.path.join(REPO, "tests"))
-    import vineflower_compare
+    import importlib, vineflower_compare
+    vineflower_compare = importlib.reload(vineflower_compare)
     CLASSES = vineflower_compare.DEFAULT_CLASSES
 PKG = globals().get("DEV_PKG") or (b._jvm_dev["pkg"].__name__ if hasattr(b, "_jvm_dev") else "binary-jvm")
 pj = sys.modules[PKG + ".pseudo_java"]

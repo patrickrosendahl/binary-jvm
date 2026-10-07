@@ -413,6 +413,20 @@ if _HAVE_BN:
             self.address = instr.address
             self.expr_index = instr.expr_index
 
+    class _StmtList:
+        """statements following an exception test that only run on an exception, as a pseudo block"""
+        operation = Op.HLIL_BLOCK
+        as_ast = True
+
+        def __init__(self, stmts):
+            self.body = list(stmts)
+            self.address = stmts[0].address
+            self.expr_index = -1 - stmts[0].expr_index  # never a real block
+
+        @property
+        def operands(self):
+            return [self.body]
+
     def _const_target(instr):
         """address a pool reference expression points at (CONST_PTR / IMPORT / CONST), else None"""
         if instr.operation in (Op.HLIL_CONST_PTR, Op.HLIL_IMPORT, Op.HLIL_EXTERN_PTR):
@@ -664,6 +678,11 @@ if _HAVE_BN:
             for h in self.monitor_handlers:
                 ends = [e for s, e, hh, _ in self.table if hh == h and s >= h]
                 self.monitor_windows.append((h, (max(ends) if ends else h + 4) + 3))
+            self._in_finally = False
+            self.deferred = set()           # expr_index of handler code met in a try body, printed by its catch
+            self.printed_handlers = set()   # handler pcs whose catch/finally clause was printed
+            self.var_subst = {}     # subroutine parameter -> caller expression (jsr finally bodies, jvm-51)
+            self._finally_subs = None
             self._concat = {}       # expr_index of toString / indy call -> [(expr|str, is_string)]
             self._var_counts = None
             self._exc_storage = None
@@ -748,7 +767,8 @@ if _HAVE_BN:
 
         def mentions_exc(self, instr):
             for i in _walk(instr):
-                if i.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and self.is_exc_var(i.var):
+                if i.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and (self.is_exc_var(i.var) or
+                                                                       i.var in self.type_temps()):
                     return True
                 if i.operation in (Op.HLIL_VAR_INIT, Op.HLIL_VAR_DECLARE):
                     if self.is_exc_var(i.dest if i.operation == Op.HLIL_VAR_INIT else i.var):
@@ -760,7 +780,11 @@ if _HAVE_BN:
             `exc = __exception()`, `exc = 0`, `exc = exc_2`, declarations of exc"""
             o = s.operation
             if o == Op.HLIL_VAR_DECLARE:
-                return self.is_exc_var(s.var)
+                return self.is_exc_var(s.var) or s.var in self.type_temps()
+            if o == Op.HLIL_VAR_INIT and s.dest in self.type_temps():
+                return True
+            if o == Op.HLIL_ASSIGN and s.dest.operation == Op.HLIL_VAR and s.dest.var in self.type_temps():
+                return True
             if o == Op.HLIL_ASSIGN and s.dest.operation == Op.HLIL_VAR and self.is_exc_var(s.dest.var):
                 return self.throw_value(s) is None
             if o == Op.HLIL_VAR_INIT and self.is_exc_var(s.dest):
@@ -768,6 +792,26 @@ if _HAVE_BN:
             if o == Op.HLIL_INTRINSIC and s.intrinsic.name == "__exception":
                 return True
             return False
+
+        def is_type_test(self, e):
+            return e.operation == Op.HLIL_INTRINSIC and e.intrinsic.name in ("instanceof", "__instanceof") and \
+                e.params and self.is_exc_value(e.params[0]) and self.mentions_exc(e.params[0])
+
+        def type_temps(self):
+            """variables BN parks a handler's type test in: `temp0 = instanceof(exc, T)`"""
+            if getattr(self, "_type_temps", None) is None:
+                self._type_temps = set()
+                cands = {}
+                try:
+                    for i in _walk(self.hlil.root):
+                        if i.operation == Op.HLIL_VAR_INIT:
+                            cands.setdefault(i.dest, []).append(i.src)
+                        elif i.operation == Op.HLIL_ASSIGN and i.dest.operation == Op.HLIL_VAR:
+                            cands.setdefault(i.dest.var, []).append(i.src)
+                    self._type_temps = {v for v, srcs in cands.items() if all(self.is_type_test(x) for x in srcs)}
+                except Exception:
+                    pass
+            return self._type_temps
 
         def throw_value(self, s):
             """`exc = v` (athrow inside a try range) -> v; None for the lifter's own exc updates"""
@@ -823,9 +867,34 @@ if _HAVE_BN:
                 return None
             test = self.exc_test(s.condition)
             if test is None:
-                return None
+                # a condition mixing the exception register into an ordinary test (`r != 0 && exc != 0`,
+                # `exc != 0 && instanceof(exc, T) == 0`, `r == 0 || exc == 0`): on the normal path (exc == 0)
+                # it has a fixed value, so the other branch is only taken on an exception
+                normal = self.normal_value(s.condition) if self.mentions_exc(s.condition) else None
+                if normal is None:
+                    return None
+                test = ('exc', not normal)
             kind, exc_true = test
             return (kind, s.true, s.false) if exc_true else (kind, s.false, s.true)
+
+        def normal_value(self, c):
+            """value of a condition on the normal path (no exception pending: exc == 0), None if it depends on
+            other values"""
+            if c.operation == Op.HLIL_NOT:
+                v = self.normal_value(c.src)
+                return None if v is None else not v
+            if c.operation in (Op.HLIL_AND, Op.HLIL_OR) and c.size == 0:
+                vals = [self.normal_value(c.left), self.normal_value(c.right)]
+                stop = c.operation == Op.HLIL_OR  # a true operand decides ||, a false one &&
+                if stop in vals:
+                    return stop
+                return (not stop) if all(v is not None for v in vals) else None
+            test = self.exc_test(c)
+            if test is not None and test[0] == 'exc':
+                return not test[1]
+            if test is not None and test[0] == 'type':
+                return test[1]  # instanceof(null, T) is false: holds for `other types` tests
+            return None
 
         def exc_test(self, c):
             """condition testing the exception register -> (kind, True if it holds on the exceptional
@@ -851,6 +920,8 @@ if _HAVE_BN:
                     return None
             elif c.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and self.is_exc_var(c.var):
                 kind, exc_true = 'exc', True
+            elif c.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and c.var in self.type_temps():
+                kind, exc_true = 'type', False
             elif c.operation == Op.HLIL_INTRINSIC and c.intrinsic.name in ("instanceof", "__instanceof") and \
                     c.params and self.is_exc_value(c.params[0]) and self.mentions_exc(c.params[0]):
                 kind, exc_true = 'type', False
@@ -873,20 +944,44 @@ if _HAVE_BN:
             path of `if (exc == 0) { ... }` / `if (exc != 0) { handler } else { ... }` continues in line,
             the exceptional branch becomes an _ExcBranch item (hidden or commented when printed)"""
             out = []
-            for s in stmts:
+            for k, s in enumerate(stmts):
                 if s.operation == Op.HLIL_BLOCK:
                     out.extend(self.flatten(s.body))
                     continue
                 parts = self.exc_if_parts(s) if s.operation == Op.HLIL_IF and s.as_ast else None
                 if parts is not None:
                     kind, xb, nb = parts
-                    if xb is not None and xb.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
+                    xb_empty = xb is None or xb.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE)
+                    if not xb_empty:
                         out.append(_ExcBranch(s, xb, kind))
+                    normal = []
                     if nb is not None and nb.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
-                        out.extend(self.flatten(self.stmts_of(nb)))
+                        normal = self.flatten(self.stmts_of(nb))
+                        out.extend(normal)
+                    rest = stmts[k + 1:]
+                    if xb_empty and rest and self.ends_flow(normal) and \
+                            not any(i.operation == Op.HLIL_LABEL for r in rest for i in _walk(r)):
+                        # `if (exc == 0) { ...; return; } rest`: rest only runs on an exception
+                        out.append(_ExcBranch(s, _StmtList(rest), kind))
+                        break
                     continue
                 out.append(s)
             return out
+
+        def ends_flow(self, items):
+            """the last printed statement of a flattened list never falls through"""
+            for s in reversed(items):
+                if isinstance(s, _ExcBranch) or self.is_exc_plumbing(s) or s.operation == Op.HLIL_NOP:
+                    continue
+                if s.operation in (Op.HLIL_ASSIGN, Op.HLIL_VAR_INIT):
+                    dest = s.dest if s.operation == Op.HLIL_VAR_INIT else \
+                        (s.dest.var if s.dest.operation == Op.HLIL_VAR else None)
+                    # `exc = v`: athrow inside a try range
+                    return dest is not None and self.is_exc_var(dest) and self.throw_value(s) is not None
+                return s.operation in (Op.HLIL_RET, Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_GOTO, Op.HLIL_NORET,
+                                       Op.HLIL_TAILCALL) or self.is_rethrow(s) or \
+                    (s.operation == Op.HLIL_INTRINSIC and s.intrinsic.name in ("athrow", "__propagate"))
+            return False
 
         def covering_handlers(self, pc):
             """handler pcs of the exception-table entries whose range holds pc"""
@@ -912,9 +1007,12 @@ if _HAVE_BN:
             for h, (blk, idx, whole) in sites.items():
                 if whole and idx == 0 and blk.expr_index == xb.expr_index:
                     return ('handler', h)
+                if isinstance(xb, _StmtList) and not whole and idx < len(self.stmts_of(blk)) and \
+                        self.stmts_of(blk)[idx].expr_index == xb.body[0].expr_index:
+                    return ('handler', h)
             stmts = [s for s in self.flatten(self.stmts_of(xb))
                      if not isinstance(s, _ExcBranch) and not self.is_exc_plumbing(s) and
-                     not self.in_monitor_code(s) and
+                     not self.in_monitor_code(s) and s.expr_index not in self.consumed and
                      s.operation not in (Op.HLIL_NOP, Op.HLIL_NORET, Op.HLIL_UNREACHABLE)]
             excs = [s for s in self.flatten(self.stmts_of(xb)) if isinstance(s, _ExcBranch) and
                     self.branch_class(s.branch, s.address - self.function.start)[0] not in ('hide', 'rethrow')]
@@ -937,6 +1035,8 @@ if _HAVE_BN:
                 if all(s.operation not in (Op.HLIL_GOTO, Op.HLIL_LABEL, Op.HLIL_RET) and
                        s.operation not in COMPOUND for s in cleanup):
                     return ('rethrow', cleanup)
+                if self.finally_printed() and not any(i.operation == Op.HLIL_RET for c in cleanup for i in _walk(c)):
+                    return ('rethrow', cleanup)  # a finally's rethrow path with branches: the finally prints it
             return ('code',)
 
         def is_rethrow(self, s):
@@ -997,9 +1097,11 @@ if _HAVE_BN:
             if whole:
                 return body[idx:]
             stop = len(body)
+            others = {self.stmts_of(b)[i].expr_index for hh, (b, i, w) in self.sites().items()
+                      if hh != h and not w and b.expr_index == blk.expr_index}
             for k in range(idx + 1, len(body)):
-                if body[k].operation == Op.HLIL_LABEL:
-                    stop = k
+                if body[k].operation == Op.HLIL_LABEL or body[k].expr_index in others:
+                    stop = k  # the next label, or where another handler's code starts
                     break
             return body[idx:stop]
 
@@ -1018,6 +1120,107 @@ if _HAVE_BN:
                         out.append((min(x.address for x in stmts), stmts[:-1]))
                 self._rethrows = out
             return self._rethrows
+
+        def jsr_target(self, s):
+            """start of the jsr subroutine a statement calls (old javac's finally: `jsr L` lifts to a call of a
+            function inside this method's code), else None"""
+            c = self.stmt_call(s)
+            if c.operation != Op.HLIL_CALL or c.dest.operation not in (Op.HLIL_CONST_PTR, Op.HLIL_CONST):
+                return None
+            t = c.dest.constant
+            start = self.function.start
+            return t if start < t < start + METHOD_STRIDE else None
+
+        def finally_subs(self):
+            """jsr subroutines that are finally bodies: called right before a rethrow of the caught exception
+            (javac's catch-any handler `astore t; jsr L; aload t; athrow`)"""
+            if self._finally_subs is None:
+                out = set()
+                for _, cleanup in self.rethrow_paths():
+                    real = [x for x in cleanup if not self.is_exc_plumbing(x)]
+                    if len(real) == 1 and self.jsr_target(real[0]) is not None:
+                        out.add(self.jsr_target(real[0]))
+                self._finally_subs = out
+            return self._finally_subs
+
+        def finally_printed(self):
+            """a try statement with a finally clause is printed (or being printed) in this method"""
+            ranges = self.placed | {(g[0], g[1]) for g in self.active_tries}
+            return any((g[0], g[1]) in ranges and any(not t for _, t in g[2]) for g in self.try_groups)
+
+        def emit_subroutine(self, call, tokens, settings):
+            """the body of a jsr subroutine in place of its call (a finally body); False if its shape is not
+            handled (then the call is printed)"""
+            sub = self.function.view.get_function_at(self.jsr_target(call))
+            hlil = sub.hlil if sub is not None else None
+            if hlil is None or hlil.root is None:
+                return False
+            items = self.flatten(self.stmts_of(hlil.root))
+            if not self.sub_shape_ok(items):
+                return False
+            c = self.stmt_call(call)
+            subst = dict(zip(list(sub.parameter_vars), list(c.params)))
+            saved = self.var_subst
+            self.var_subst = dict(saved)
+            self.var_subst.update(subst)
+            try:
+                self.emit_sub_items(items, hlil.root, tokens, settings)
+            finally:
+                self.var_subst = saved
+            return True
+
+        @staticmethod
+        def ret_only(instr):
+            body = list(instr.body) if instr.operation == Op.HLIL_BLOCK else [instr]
+            return len(body) == 1 and body[0].operation == Op.HLIL_RET
+
+        def sub_split(self, items):
+            """(index, kind) of the first top-level `return` / `if (c) return;` of a subroutine body"""
+            for k, s in enumerate(items):
+                if isinstance(s, _ExcBranch):
+                    continue
+                if s.operation == Op.HLIL_RET:
+                    return k, 'ret'
+                if s.operation == Op.HLIL_IF and s.as_ast and self.ret_only(s.true) and \
+                        (s.false is None or s.false.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE)):
+                    return k, 'if'
+            return len(items), None
+
+        def sub_shape_ok(self, items):
+            """every `return` of the subroutine is a top-level one sub_split handles"""
+            k, kind = self.sub_split(items)
+            for s in items[:k]:
+                if not isinstance(s, _ExcBranch) and any(i.operation == Op.HLIL_RET for i in _walk(s)):
+                    return False
+            return kind != 'if' or self.sub_shape_ok(items[k + 1:])
+
+        def emit_sub_items(self, items, block, tokens, settings):
+            k, kind = self.sub_split(items)
+            if k:
+                self.emit_list(items[:k], tokens, settings, block, own=True)
+            if kind == 'if':
+                # `if (c) return; rest` (the subroutine's ret) -> `if (!c) { rest }`
+                self.kw(tokens, "if ")
+                tokens.append_open_paren()
+                self.emit_negated(items[k].condition, tokens, settings)
+                tokens.append_close_paren()
+                tokens.begin_scope(ScopeType.BlockScopeType)
+                self.emit_sub_items(items[k + 1:], block, tokens, settings)
+                tokens.end_scope(ScopeType.BlockScopeType)
+                tokens.finalize_scope()
+                tokens.new_line()
+
+        def emit_negated(self, c, tokens, settings):
+            flip = {Op.HLIL_CMP_E: Op.HLIL_CMP_NE, Op.HLIL_CMP_NE: Op.HLIL_CMP_E}
+            if c.operation in flip:
+                text, prec = BINARY[flip[c.operation]]
+                self.emit_binary(text, prec, _Pair(c.left, c.right), tokens, settings, P.TopLevelOperatorPrecedence)
+                return
+            if c.operation == Op.HLIL_NOT:
+                self.expr(c.src, tokens, settings)
+                return
+            self.op(tokens, "!")
+            self.perform_get_expr_text(c, tokens, settings, P.UnaryOperatorPrecedence)
 
         def call_target(self, instr):
             """(pool index, owner, name, descriptor) of a call through a pool slot"""
@@ -1195,6 +1398,8 @@ if _HAVE_BN:
                 self.exc_names = []
                 self.hidden_gotos = {}
                 self._follow = []
+                self.deferred = set()
+                self.printed_handlers = set()
             self.emit_list(self.flatten(list(instr.body)), tokens, settings, instr, is_root)
 
         def emit_list(self, body, tokens, settings, block, is_root=False, own=False):
@@ -1270,6 +1475,14 @@ if _HAVE_BN:
             s = body[idx]
             if idx in plan["skip"] or (s.expr_index in self.consumed and s.expr_index not in plan.get("own", ())):
                 return need_separator
+            if s.expr_index in self.deferred and s.expr_index not in plan.get("own", ()):
+                return need_separator  # handler code: printed in its catch clause
+            for h, (blk, i, whole) in self.sites().items():
+                if not whole and i < len(self.stmts_of(blk)) and self.stmts_of(blk)[i].expr_index == s.expr_index \
+                        and h in self.placed_handlers and h not in self.printed_handlers:
+                    # the code of a handler whose catch clause is printed after this try body
+                    self.deferred.update(x.expr_index for x in self.handler_region(h) or [])
+                    return need_separator
             if isinstance(s, _ExcBranch):
                 return self.emit_exc_branch(s, tokens, settings, need_separator)
             if self.is_exc_plumbing(s) or self.in_monitor_code(s):
@@ -1313,6 +1526,17 @@ if _HAVE_BN:
                 return need_separator
             if self.is_implicit_super(s) or s.operation == Op.HLIL_NORET:
                 return need_separator
+            if not self.exc_names and self.is_rethrow(s) and s.params[0].operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) \
+                    and self.is_exc_var(s.params[0].var):
+                return need_separator  # an uncaught exception propagates: no Java statement
+            if self.jsr_target(s) in self.finally_subs():
+                if self._in_finally:
+                    if need_separator:
+                        tokens.scope_separator()
+                    if self.emit_subroutine(s, tokens, settings):
+                        return True
+                elif self.finally_printed():
+                    return need_separator  # the finally clause prints the subroutine (jvm-51)
             call = self.void_return_call(s) if s.operation == Op.HLIL_RET and self.returns_void else None
             if call is not None:
                 # `return f()` in a void method: f() is a statement (the value is the lifter's r register)
@@ -1423,7 +1647,7 @@ if _HAVE_BN:
                 self.consumed.add(xb.expr_index)
             else:
                 self.note(tokens, "/* on exception */" if item.kind == 'exc' else "/* other exception types */")
-                items = self.flatten(self.stmts_of(xb))
+                items = [s for s in self.flatten(self.stmts_of(xb)) if s.expr_index not in self.consumed]
             tokens.begin_scope(ScopeType.BlockScopeType)
             self.emit_list(items, tokens, settings, item.instr, own=True)
             tokens.end_scope(ScopeType.BlockScopeType)
@@ -1509,6 +1733,7 @@ if _HAVE_BN:
                 tokens.end_scope(ScopeType.BlockScopeType)
                 self.active_tries.pop()
             for hpc, ctype in handlers:
+                self.printed_handlers.add(hpc)
                 tokens.scope_continuation(False)
                 try:
                     if ctype:
@@ -1584,6 +1809,14 @@ if _HAVE_BN:
         def emit_finally(self, hpc, tokens, settings):
             """catch-all handler: `finally { cleanup }` when its code ends by rethrowing the caught exception,
             else `catch (Throwable t) { ... }`"""
+            saved = self._in_finally
+            self._in_finally = True
+            try:
+                self.emit_finally_body(hpc, tokens, settings)
+            finally:
+                self._in_finally = saved
+
+        def emit_finally_body(self, hpc, tokens, settings):
             items, var, blk = self.region_items(hpc)
             if items is not None:
                 real = [k for k, s in enumerate(items) if isinstance(s, _ExcBranch) or not (
@@ -1837,6 +2070,8 @@ if _HAVE_BN:
             elif o == Op.HLIL_CONST_DATA:
                 data, _ = instr.constant_data.data_and_builtin
                 tokens.append(_tok(TT.StringToken, java_string_literal(bytes(data).decode("latin-1"))))
+            elif o == Op.HLIL_VAR and self.var_subst and instr.var in self.var_subst:
+                self.perform_get_expr_text(self.var_subst[instr.var], tokens, settings, precedence)
             elif o == Op.HLIL_VAR:
                 self.emit_var(instr.var, instr, tokens)
             elif o == Op.HLIL_ASSIGN:
@@ -1953,7 +2188,9 @@ if _HAVE_BN:
                 tokens.append(_tok(TT.KeywordToken, "this"))
                 return
             if self.is_exc_var(var):
-                tokens.append(_tok(TT.LocalVariableToken, self.exc_names[-1] if self.exc_names else "e", context=InstructionTextTokenContext.LocalVariableTokenContext,
+                # outside a catch body the lifter's exception register has no Java name: print it as `exc`, so a
+                # leak of the plumbing is visible (and caught by the checks) instead of passing as `e`
+                tokens.append(_tok(TT.LocalVariableToken, self.exc_names[-1] if self.exc_names else "exc", context=InstructionTextTokenContext.LocalVariableTokenContext,
                                    address=instr.expr_index, value=var.identifier, size=instr.size))
                 return
             tokens.append(_tok(TT.LocalVariableToken, java_var_name(var.name), address=instr.expr_index,
@@ -1964,6 +2201,8 @@ if _HAVE_BN:
             # the initializer's type (descriptors, casts, `new`) beats the variable's propagated BN type: the
             # stack registers are shared by unrelated values, so BN's type for them is often a neighbour's
             type_name = self.expr_java_type(src) if src is not None else None
+            if type_name is None and src is None:
+                type_name = self.defs_java_type(var)
             if type_name is None:
                 code = self.var_code(var)  # e.g. `i = 0` ... `i++`: an int whatever BN propagated
                 type_name = PRIMITIVES.get(code) if code and code in "BCDFIJSZ" else java_type_of(var.type)
@@ -1973,6 +2212,19 @@ if _HAVE_BN:
                                size=instr.size, value=var.identifier,
                                context=InstructionTextTokenContext.LocalVariableTokenContext))
             return type_name
+
+        def defs_java_type(self, var):
+            """Java type of a declared-only variable when all its assignments agree (the lock of a synchronized
+            block is a stack register BN types as int32_t)"""
+            types = set()
+            try:
+                for d in self.hlil.get_var_definitions(var):
+                    if d.operation not in (Op.HLIL_VAR_INIT, Op.HLIL_ASSIGN):
+                        return None
+                    types.add(self.expr_java_type(d.src))
+            except Exception:
+                return None
+            return types.pop() if len(types) == 1 else None
 
         def expr_java_type(self, e):
             """Java type of an initializer, from descriptors / pool entries (None if unknown)"""

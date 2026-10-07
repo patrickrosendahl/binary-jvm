@@ -12,7 +12,7 @@ usage:
   python3 tests/vineflower_compare.py --decompile        # run Vineflower on CLASSES
   bnrun --parallel --timeout 600 tests/bn_pseudo_java_dump.py
   python3 tests/vineflower_compare.py [--show NAME] [--worst N] [--json FILE]
-                                     [--max K=V ...]     # exit 1 if a total exceeds K (e.g. --max lost_calls=0)
+                                     [--pj DIR] [--max K=V ...]  # exit 1 if a total exceeds V (e.g. --max lost_calls=0)
 """
 import argparse, glob, json, os, re, subprocess, sys
 
@@ -168,7 +168,7 @@ def leaked_catch_var(lines):
     names = sorted({m.group(1) for l in lines
                     for m in [re.search(r"catch \((?:[\w.$]+\s*\|\s*)*[\w.$]+ (\w+)\)", l)] if m})
     for l in lines:
-        code = strip_strings(re.sub(r"//.*", "", l))
+        code = re.sub(r"\.\s*[\w$]+", ".", strip_strings(re.sub(r"//.*", "", l)))  # member names are not variables
         m = re.search(r"catch \((?:[\w.$]+\s*\|\s*)*[\w.$]+ (\w+)\)", code)
         if m:
             stack.append((m.group(1), depth - code[:m.start()].count("}")))
@@ -220,6 +220,7 @@ def main():
     ap.add_argument("--show", help="print both versions of methods whose name contains this")
     ap.add_argument("--worst", type=int, default=15)
     ap.add_argument("--json")
+    ap.add_argument("--pj", default=os.path.join(OUT, "pj"), help="directory of the Pseudo Java dump")
     ap.add_argument("--max", nargs="*", default=[], help="K=V: fail if total K exceeds V")
     a = ap.parse_args()
     classes = a.classes or DEFAULT_CLASSES
@@ -229,7 +230,7 @@ def main():
     totals, rows = {}, []
     for rel in classes:
         simple = os.path.basename(rel)[:-len(".class")]
-        pj_path = os.path.join(OUT, "pj", rel[:-len(".class")] + ".pj")
+        pj_path = os.path.join(a.pj, rel[:-len(".class")] + ".pj")
         vf_path = os.path.join(OUT, "vf", os.path.dirname(rel), simple + ".java")
         if not (os.path.exists(pj_path) and os.path.exists(vf_path)):
             print("missing", pj_path if not os.path.exists(pj_path) else vf_path)
