@@ -1493,7 +1493,7 @@ if _HAVE_BN:
                     idx = last + 1
                     need_separator = True
                     continue
-                if idx in plan.setdefault("folded", set()):
+                if idx in plan.setdefault("folded", set()) or idx in plan.setdefault("done", set()):
                     idx += 1
                     continue
                 try:
@@ -1968,6 +1968,111 @@ if _HAVE_BN:
                 tokens.scope_separator()
                 self.emit_list(tail, tokens, settings, iff.true)
 
+        # --- gotos of if/else shapes (jvm-48) ---------------------------------------------------------
+        def label_uses(self, label_id):
+            try:
+                return len(self.hlil.get_label_uses(label_id))
+            except Exception:
+                return -1
+
+        def declared_in(self, items):
+            out = set()
+            for s in items:
+                for i in _walk(s.instr if isinstance(s, _ExcBranch) else s):
+                    if i.operation == Op.HLIL_VAR_INIT:
+                        out.add(i.dest)
+                    elif i.operation == Op.HLIL_VAR_DECLARE:
+                        out.add(i.var)
+            return out
+
+        def used_in(self, items, vars_):
+            for s in items:
+                for i in _walk(s.instr if isinstance(s, _ExcBranch) else s):
+                    if i.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and i.var in vars_:
+                        return True
+            return False
+
+        def if_goto_shape(self, body, idx, plan):
+            """('split', true part, false part, tail): `if (c) { A; L: T } else { B; goto L; }` (or mirrored);
+            ('skip', q): `if (c) goto L; S...; L:` with L at body[q] -- L reached by that goto only"""
+            s = body[idx]
+            no_else = s.false is None or s.false.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE)
+            t_items = self.flatten(self.stmts_of(s.true))
+            f_items = [] if no_else else self.flatten(self.stmts_of(s.false))
+            if no_else:
+                real = [x for x in t_items if not self.hidden_item(x)]
+                if len(real) == 1 and not isinstance(real[0], _ExcBranch) and real[0].operation == Op.HLIL_GOTO:
+                    lid = real[0].target.label_id
+                    if self.label_uses(lid) != 1:
+                        return None
+                    for q in range(idx + 1, len(body)):
+                        x = body[q]
+                        if not isinstance(x, _ExcBranch) and x.operation == Op.HLIL_LABEL and x.target.label_id == lid:
+                            skipped = body[idx + 1:q]
+                            if q - idx < 2 or any(k in plan.get("done", ()) for k in range(idx + 1, q + 1)):
+                                return None
+                            if self.used_in(body[q + 1:], self.declared_in(skipped)):
+                                return None
+                            return ('skip', q, idx)
+                return None
+            for x_items, y_items, x_true in ((t_items, f_items, True), (f_items, t_items, False)):
+                ry = [k for k, y in enumerate(y_items) if not self.hidden_item(y)]
+                if not ry:
+                    continue
+                g = y_items[ry[-1]]
+                if isinstance(g, _ExcBranch) or g.operation != Op.HLIL_GOTO:
+                    continue
+                lid = g.target.label_id
+                p = next((k for k, x in enumerate(x_items) if not isinstance(x, _ExcBranch) and
+                          x.operation == Op.HLIL_LABEL and x.target.label_id == lid), None)
+                if p is None or self.label_uses(lid) != 1:
+                    continue
+                head, other, tail = x_items[:p], y_items[:ry[-1]], x_items[p + 1:]
+                if self.used_in(tail + body[idx + 1:], self.declared_in(head + other)):
+                    continue
+                if not [h for h in head if not self.hidden_item(h)] and not [o for o in other if not self.hidden_item(o)]:
+                    continue
+                return ('split', head if x_true else other, other if x_true else head, tail)
+            return None
+
+        def emit_if_goto(self, s, shape, body, plan, tokens, settings, block):
+            if shape[0] == 'skip':
+                q, i0 = shape[1], shape[2]
+                self.kw(tokens, "if ")
+                tokens.append_open_paren()
+                self.emit_negated(s.condition, tokens, settings)
+                tokens.append_close_paren()
+                tokens.begin_scope(ScopeType.BlockScopeType)
+                self.emit_list(list(body[i0 + 1:q]), tokens, settings, block)
+                tokens.end_scope(ScopeType.BlockScopeType)
+                tokens.finalize_scope()
+                tokens.new_line()
+                plan.setdefault("done", set()).update(range(i0 + 1, q + 1))
+                return
+            _, t_part, f_part, tail = shape
+            t_real = [x for x in t_part if not self.hidden_item(x)]
+            self.kw(tokens, "if ")
+            tokens.append_open_paren()
+            if t_real:
+                self.expr(s.condition, tokens, settings)
+            else:
+                self.emit_negated(s.condition, tokens, settings)
+            tokens.append_close_paren()
+            tokens.begin_scope(ScopeType.BlockScopeType)
+            self.emit_list(t_part if t_real else f_part, tokens, settings, s.true if t_real else s.false)
+            tokens.end_scope(ScopeType.BlockScopeType)
+            if t_real and [x for x in f_part if not self.hidden_item(x)]:
+                tokens.scope_continuation(False)
+                self.kw(tokens, "else")
+                tokens.begin_scope(ScopeType.BlockScopeType)
+                self.emit_list(f_part, tokens, settings, s.false)
+                tokens.end_scope(ScopeType.BlockScopeType)
+            tokens.finalize_scope()
+            tokens.new_line()
+            if [x for x in tail if not self.hidden_item(x)]:
+                tokens.scope_separator()
+                self.emit_list(tail, tokens, settings, s.true)
+
         def emit_error(self, s, ex, tokens):
             """never lose a statement: if rendering fails, print its HLIL as a comment"""
             try:
@@ -2095,6 +2200,13 @@ if _HAVE_BN:
                     if need_separator is not None:
                         tokens.scope_separator()
                     self.emit_loop_cond(s, shape, tokens, settings)
+                    return True
+            if s.operation == Op.HLIL_IF and s.as_ast and not isinstance(s, _ExcBranch):
+                shape = self.if_goto_shape(body, idx, plan)
+                if shape is not None:
+                    if need_separator is not None:
+                        tokens.scope_separator()
+                    self.emit_if_goto(s, shape, body, plan, tokens, settings, block)
                     return True
             if s.operation == Op.HLIL_GOTO and self.label_after(body, idx, plan) == s.target.label_id:
                 # `goto L` right before L (also at the end of a branch whose statement is followed by L)
