@@ -14,7 +14,8 @@ LIMIT = globals().get("LIMIT", 1000)
 REFERENCE = globals().get("REFERENCE", ["com/is_teledata/cache/HashCache.class",
                                         "com/is_teledata/mdg/MDGAttributeDefinition.class",
                                         "com/is_teledata/property/PropLoader.class"])
-ACCESSOR = re.compile(r"\.[dq]\b")
+FIELDREF = re.compile(r"&[\w/$<>]+\.[\w$<>]+")  # &pkg/Class.field (a field may be called d or q)
+ACCESSOR = re.compile(r"[\w\]\)](:\d+)?(?<!sx)(?<!zx)\.[dq]\b(?!\()")  # var.d / var:4.q, not sx.q(...) or X.d(...) (same as bn_metrics.py)
 
 vt = b.BinaryViewType[VIEW_NAME]
 out_dir = os.path.join(REPO, "tests", "golden", LABEL)
@@ -48,7 +49,7 @@ for rel in paths:
         if all(str(t) == "int32_t" for t in [f.return_type] + [p.type for p in f.type.parameters]):
             m["int_only_sigs"] += 1
         lines = hlil_lines(f)
-        acc += sum(1 for l in lines if ACCESSOR.search(l))
+        acc += sum(1 for l in lines if ACCESSOR.search(FIELDREF.sub("", l)))
         if rel in REFERENCE:
             dump += ["", "// %s @ 0x%x" % (sig, f.start)] + lines
     m["accessor_lines"] += acc
