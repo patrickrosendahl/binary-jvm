@@ -253,6 +253,17 @@ def type_problems(lines):
     return ref_zero, casts, mismatch
 
 
+IF_ELSE_ASSIGN = re.compile(r"^\s*(%s) ([\w$]+);\n\s*if \(.*\) \{\n\s*\2 = [^\n]*;\n\s*\} else \{\n\s*\2 = [^\n]*;\n"
+                            r"\s*\}$" % JTYPE, re.M)
+
+
+def if_else_assigns(lines):
+    """`T x; if (c) { x = a; } else { x = b; }` -- a conditional expression in Vineflower (not when a value holds
+    one already: Vineflower does not nest them either)"""
+    return sum(1 for m in IF_ELSE_ASSIGN.finditer("\n".join(l for l in lines if l.strip()))
+               if " ? " not in strip_strings(m.group(0)))
+
+
 def compare_method(pj_body, vf_body):
     pj_text = "\n".join(pj_body)
     r = {k: len(p.findall(pj_text)) if k != "labels" else sum(1 for l in pj_body if p.match(l))
@@ -261,6 +272,7 @@ def compare_method(pj_body, vf_body):
     r["dead_code"] = dead_after_return(pj_body)
     r["leaked_catch_var"] = leaked_catch_var(pj_body)
     r["ref_zero"], r["double_casts"], r["type_mismatch"] = type_problems(pj_body)
+    r["if_else_assign"] = if_else_assigns(pj_body)
     r["lines"] = sum(1 for l in pj_body if l.strip() and l.strip() not in "{}")
     if vf_body is not None:
         vf_text = "\n".join(vf_body)
@@ -321,7 +333,7 @@ def main():
                 print("-" * 30, "Vineflower")
                 print("\n".join(vbody or ["(no match)"]))
     keys = ["lines", "vf_lines", "temps", "gotos", "labels", "sync_comments", "offset_stores", "while_true", "plumbing",
-            "dead_code", "leaked_catch_var", "ref_zero", "double_casts", "type_mismatch"]
+            "dead_code", "leaked_catch_var", "ref_zero", "double_casts", "type_mismatch", "if_else_assign"]
     for k in keys:
         totals[k] = sum(r.get(k, 0) for r in rows)
     totals["lost_calls"] = sum(len(r.get("lost_calls", [])) for r in rows)

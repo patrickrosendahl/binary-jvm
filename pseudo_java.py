@@ -63,6 +63,7 @@ LOOP_CONDITIONS = True       # while (true) { if (c) { tail; break; } ... } -> w
 RENAME_TEMPORARIES = True    # st0_lo_8 / r_12 / l3_lo -> names from their value: rawValue, vector, str (jvm-55)
 VARARGS_CALLS = True         # m(new T[]{a, b}) -> m(a, b) when m is varargs (jvm-57)
 SPLIT_CONDITIONS = True      # T x; if (a) { x = e; } if (!a || p(x)) -> if (!a || p(e)) (jvm-54)
+TERNARIES = True             # T x; if (c) { x = a; } else { x = b; } -> T x = c ? a : b (jvm-59)
 # intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
 PURE_INTRINSICS = {"getfield", "arraylength", "checkcast", "instanceof", "new", "newarray", "anewarray",
                    "multianewarray", "__exception"}
@@ -1958,6 +1959,12 @@ if _HAVE_BN:
                         self.merge_split_cond(body, k, hi)
                     except Exception:
                         pass
+            if TERNARIES and block.as_ast:
+                for k in range(lo, hi + 1):
+                    try:
+                        self.plan_ternary(body, k, hi, run_at, plan)
+                    except Exception:
+                        pass
             if LOOP_CONDITIONS and block.as_ast:
                 # loop shapes are decided before anything is printed: they may hide a declaration further up
                 shapes = plan.setdefault("loop_shapes", {})
@@ -2038,6 +2045,11 @@ if _HAVE_BN:
                 if s0.operation != Op.HLIL_VAR_INIT or self.var_count(var) != 2 or self.def_count(var) != 1:
                     return None
                 return var, ('new', plan["new_at"][k]), False
+            if k in plan.get("ternary", {}):
+                var, value = plan["ternary"][k]
+                if self.var_count(var) - self.refs(s, var) != 1:
+                    return None
+                return var, value, all(self.pure(v) for v in (s.condition, value[4], value[5]))
             if k in plan["skip"] or s.operation != Op.HLIL_VAR_INIT:
                 return None
             var = s.dest
@@ -2085,6 +2097,17 @@ if _HAVE_BN:
                     return out, True
                 value = self.inline.get(e.var)
                 if value is not None:
+                    if isinstance(value, tuple) and value[0] == 'ternary':
+                        # the condition, then one of the values: a read in them is only evaluated sometimes
+                        r = self.eval_nodes(value[2].condition, stop_var, out)
+                        if r[1] is not False:
+                            return r
+                        if stop_var is not None and any(self.refs(v, stop_var) for v in value[4:]):
+                            return out, None
+                        for v in value[4:]:
+                            self.eval_nodes(v, None, out)
+                        out.append(e)
+                        return out, False
                     if isinstance(value, tuple):  # ('new', entry): the constructor arguments; ('arr', ..): elements
                         for a in (value[2] if value[0] == 'arr' else value[1][3][5]):
                             r = self.eval_nodes(a, stop_var, out)
@@ -2175,6 +2198,8 @@ if _HAVE_BN:
             if j > hi or j in run_at or j in inside_runs:
                 return
             u = body[j]
+            if isinstance(value, tuple) and value[0] == 'ternary' and j in plan.get("ternary", {}):
+                return  # no conditional expression inside another one
             if isinstance(u, _ExcBranch) or u.operation in (Op.HLIL_LABEL, Op.HLIL_GOTO, Op.HLIL_WHILE,
                                                            Op.HLIL_DO_WHILE, Op.HLIL_FOR) or \
                     u.expr_index in site_stmts or self.is_exc_plumbing(u) or \
@@ -2195,6 +2220,9 @@ if _HAVE_BN:
             folded.add(k)
 
         def emit_inlined(self, value, tokens, settings, precedence):
+            if isinstance(value, tuple) and value[0] == 'ternary':
+                self.emit_ternary(value, None, tokens, settings, precedence)
+                return
             if isinstance(value, tuple) and value[0] == 'arr':
                 self.emit_array_literal(value[1], value[2], tokens, settings)
                 return
@@ -2748,6 +2776,92 @@ if _HAVE_BN:
                 tokens.scope_separator()
                 self.emit_list(tail, tokens, settings, iff.true)
 
+        # --- conditional expressions (jvm-59) ----------------------------------------------------------
+        def plan_ternary(self, body, k, hi, run_at, plan):
+            """`T x; if (c) { x = a; } else { x = b; }` -> `T x = c ? a : b;` when body[k] is that declaration,
+            both branches only set x (from a value without side effects, or a single call) and x is set nowhere
+            else. plan["ternary"][index of the if] = (x, ('ternary', x, if, flip, a, b)); folded into x's single
+            use like a temporary (fold_candidate)"""
+            ternary = plan.setdefault("ternary", {})
+            s = body[k]
+            if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_VAR_DECLARE or s.var in self.hidden_vars or \
+                    self.is_exc_var(s.var) or s.var in self.lock_only_vars():
+                return
+            x = s.var
+            j = k + 1
+            while j <= hi and self.fold_transparent(body, j, plan):
+                j += 1
+            if j > hi or j in ternary or any((a <= k <= b) != (a <= j <= b) for a, b, _ in run_at.values()):
+                return
+            iff = body[j]
+            if isinstance(iff, _ExcBranch) or iff.operation != Op.HLIL_IF or not iff.as_ast or \
+                    iff.expr_index in self.consumed or self.exc_if_parts(iff) is not None or \
+                    iff.false is None or iff.false.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE) or \
+                    self.mentions_exc(iff.condition):
+                return
+            values, assigns, news = [], set(), {}
+            for branch in (iff.true, iff.false):
+                items = [y for y in self.flatten(self.stmts_of(branch)) if not self.hidden_item(y)]
+                if len(items) > 1 and not any(isinstance(y, _ExcBranch) for y in items):
+                    # a concatenation's appends, or `T t = new C(..); x = t.m(..)` with t used once
+                    bplan = self.plan_block(items)
+                    rest = [i for i in range(len(items)) if i not in bplan["skip"]]
+                    if len(rest) == 2 and rest[0] in bplan["new_at"]:
+                        entry = bplan["new_at"][rest[0]]
+                        t = entry[1]
+                        if entry[0].operation != Op.HLIL_VAR_INIT or self.var_count(t) != 2 or \
+                                self.def_count(t) != 1 or self.refs(items[rest[1]], t) != 1:
+                            return
+                        news[t] = ('new', entry)
+                        rest = rest[1:]
+                    items = [items[i] for i in rest]
+                if len(items) != 1 or isinstance(items[0], _ExcBranch) or items[0].operation != Op.HLIL_ASSIGN or \
+                        items[0].dest.operation != Op.HLIL_VAR or items[0].dest.var != x:
+                    return
+                v = items[0].src
+                if self.mentions_exc(v) or self.refs(v, x) or not self.ternary_value(v):
+                    return
+                values.append(v)
+                assigns.add(items[0].expr_index)
+            if {d.expr_index for d in self.hlil.get_var_definitions(x)} != assigns:
+                return
+            c = iff.condition
+            # a negative test reads better turned round: `x != null ? x : ""`, `b ? " OK" : " Not OK"`
+            flip = c.operation == Op.HLIL_NOT or (
+                c.operation == Op.HLIL_CMP_E and c.right.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR) and
+                c.right.constant == 0 and (self.code_of(c.left) or "") in "L[Z" and self.code_of(c.left))
+            ternary[j] = (x, ('ternary', x, iff, bool(flip), values[0], values[1]))
+            self.hidden_vars.add(x)
+            self.inline.update(news)
+
+        def ternary_value(self, v):
+            """a value a conditional expression may hold: free of side effects, or a single call of such values"""
+            if self.pure(v):
+                return True
+            if v.operation == Op.HLIL_CALL or (v.operation == Op.HLIL_INTRINSIC and v.intrinsic.name.startswith("invoke")):
+                return v.expr_index not in self._concat and all(self.pure(a) for a in _children(v))
+            return False
+
+        def emit_ternary(self, value, code, tokens, settings, precedence):
+            _, x, iff, flip, a, b = value
+            if flip:
+                a, b = b, a
+            if code is None:
+                code = self.type_code(self.var_java_type(x))
+            parens = precedence > P.TernaryOperatorPrecedence
+            if parens:
+                tokens.append_open_paren()
+            if flip:
+                self.emit_negated(iff.condition, tokens, settings)
+            else:
+                self.perform_get_expr_text(iff.condition, tokens, settings, P.LogicalOrOperatorPrecedence)
+            self.op(tokens, " ? ")
+            self.emit_typed(a, code, tokens, settings, P.LogicalOrOperatorPrecedence)
+            self.op(tokens, " : ")
+            self.emit_typed(b, code, tokens, settings, P.TernaryOperatorPrecedence)
+            if parens:
+                tokens.append_close_paren()
+
         # --- gotos of if/else shapes (jvm-48) ---------------------------------------------------------
         def label_uses(self, label_id):
             try:
@@ -2942,6 +3056,16 @@ if _HAVE_BN:
                 return need_separator  # leaving the synchronized block
             if s.operation == Op.HLIL_VAR_DECLARE and (s.var in self.hidden_vars or s.var in self.lock_only_vars()):
                 return need_separator
+            if idx in plan.get("ternary", {}):
+                x, value = plan["ternary"][idx]
+                if need_separator:
+                    tokens.scope_separator()
+                type_name = self.emit_var_decl(x, s, tokens)
+                self.op(tokens, " = ")
+                self.emit_ternary(value, TYPE_CODES.get(type_name, 'L'), tokens, settings, P.AssignmentOperatorPrecedence)
+                tokens.append_semicolon()
+                tokens.new_line()
+                return False
             if s.operation == Op.HLIL_ASSIGN and s.dest.operation == Op.HLIL_VAR and \
                     s.dest.var in self.lock_only_vars():
                 # a lock variable whose synchronized block could not be printed: declared where it is set
