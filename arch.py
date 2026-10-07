@@ -58,12 +58,18 @@ def _build_regs():
     regs = {
         "s":   RegisterInfo("s", ADDR_SIZE),
         "lr":  RegisterInfo("lr", ADDR_SIZE),
-        "r":   RegisterInfo("r", 4),   # return value; rh:r for long/double
-        "rh":  RegisterInfo("rh", 4),
+        "r":   RegisterInfo("r", 4),   # 4-byte return value (int/float/reference)
+        "rh":  RegisterInfo("rh", 4),  # high half of the conventions' default 8-byte return (unused by the lifter)
+        # long/double return value: an independent 8-byte register, named as the explicit return location
+        # of every long/double function type (view.JavaTypes.return_value)
+        "r64": RegisterInfo("r64", 8),
     }
+    # local slot n: l<n>_lo holds a category-1 value, l<n> a long/double. Independent registers like st<n>
+    # (the verifier guarantees a slot is read with the width it was last written with); as a sub-register
+    # a slot holding a reference here and a long there merges into one variable (`l1.d = exc`)
     for n in range(NUM_LOCAL_REGS):
         regs["l%d" % n] = RegisterInfo("l%d" % n, 8)
-        regs["l%d_lo" % n] = RegisterInfo("l%d" % n, 4, 0)
+        regs["l%d_lo" % n] = RegisterInfo("l%d_lo" % n, 4)
     # outgoing invoke arguments, one register per argument (receiver first)
     for n in range(NUM_ARG_REGS):
         regs["a%d" % n] = RegisterInfo("a%d" % n, 8)
@@ -142,6 +148,10 @@ class JVMCallingConvention(CallingConvention):
     int_arg_regs = ["l%d_lo" % n for n in range(NUM_LOCAL_REGS)]
     int_return_reg = "r"
     high_int_return_reg = "rh"
+    # the platform default convention also decides which registers a call defines in LLIL SSA (before
+    # the call's own type is applied): r64 must be among them, or a long/double result read from r64
+    # after an invoke resolves to the value before the call
+    caller_saved_regs = ["r", "rh", "r64"]
     eligible_for_heuristics = False
 
 
@@ -150,11 +160,11 @@ class JVMCallCallingConvention(CallingConvention):
     # never clobbers the caller's locals l<n>
     name = "jvm_call"
     int_arg_regs = ["a%d" % n for n in range(NUM_ARG_REGS)]
-    # results like methods return them: r, or rh:r for long/double (an 8-byte return register yields no
-    # call outputs in BN 6.1 on this 32-bit architecture)
+    # results like methods return them: r, long/double in r64 (explicit return location on the function
+    # types; as the convention's int_return_reg an 8-byte register yields no call outputs in BN 6.1)
     int_return_reg = "r"
     high_int_return_reg = "rh"
-    caller_saved_regs = ["r", "rh", "exc"]  # exc: any call may throw
+    caller_saved_regs = ["r", "rh", "r64", "exc"]  # exc: any call may throw
     eligible_for_heuristics = False
 
 

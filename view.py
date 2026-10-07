@@ -97,9 +97,12 @@ class JavaTypes:
 
     def return_value(self, desc, arch):
         t = self.value_type(desc)
-        # jvm/jvm_call have no float registers: float results come back in r, double in rh:r
+        # jvm/jvm_call have no float registers: float results come back in r; long/double in the 8-byte
+        # register r64, which must be given explicitly (the conventions' default is the pair rh:r)
         if desc[0] == 'F':
             return ReturnValue(t, CoreVariable.reg(arch.get_reg_index("r")))
+        if desc[0] in 'JD':
+            return ReturnValue(t, CoreVariable.reg(arch.get_reg_index("r64")))
         return t
 
 def method_short_name(reader, content):
@@ -134,14 +137,15 @@ def name_locals(view, func, reader):
         if var.source_type != VariableSourceType.RegisterVariableSourceType or var in params:
             continue
         reg = arch.get_reg_name(var.storage)
-        if not reg.startswith("l") or not reg[1:].isdigit() or int(reg[1:]) not in entries:
+        slot = reg[1:-3] if reg.endswith("_lo") else reg[1:]  # l<n> (long/double) or l<n>_lo
+        if not reg.startswith("l") or not slot.isdigit() or int(slot) not in entries:
             continue
         if func.is_var_user_defined(var):
             continue  # named before (a second completion event, or a reopened .bndb)
         hits = {}
         for d in func.mlil.get_var_definitions(var):
             off = d.address - base
-            for start, length, name, desc in entries[int(reg[1:])]:
+            for start, length, name, desc in entries[int(slot)]:
                 if start - MAX_STORE_LENGTH <= off < start + length:
                     hits[(name, desc)] = max(hits.get((name, desc), 0), length)
         if hits:
@@ -397,8 +401,9 @@ class ClassView(BinaryView):
             self.define_data_var(pool_address(i), Type.pointer_of_width(ADDR_SIZE, func))
 
     def method_function_type(self, method, arch, cc):
-        """the function type of a method from its descriptor: parameters live in their local slots l<n>
-        (custom locations, since long/double take two slots), `this` first for instance methods"""
+        """the function type of a method from its descriptor: parameters live in their local slots
+        (custom locations l<n>_lo / l<n> for long/double, since those take two slots), `this` first for
+        instance methods"""
         static = bool(method.access_flags & ACC_STATIC)
         slots = method_parameter_slots(method.descriptor, static)
         if slots and slots[-1][0] + slot_count(slots[-1][1]) > NUM_LOCAL_REGS:
@@ -407,14 +412,15 @@ class ClassView(BinaryView):
         if names is not None and len(names) != len(slots):
             names = None  # synthetic/mandated parameters missing from MethodParameters: don't guess
         at_entry = {slot: name for start, length, name, desc, slot in method.local_variables() if start == 0 and name}
-        def loc(slot):
-            return CoreVariable.reg(arch.get_reg_index("l%d" % slot))
+        def loc(slot, desc="L"):
+            # the register the lifter reads the slot with: l<n> for long/double, l<n>_lo otherwise
+            return CoreVariable.reg(arch.get_reg_index(("l%d" if desc[0] in "JD" else "l%d_lo") % slot))
         params = []
         if not static:
             params.append(FunctionParameter(Type.pointer_of_width(ADDR_SIZE, self.class_type), "this", loc(0)))
         for k, (slot, desc) in enumerate(slots):
             name = (names[k] if names and names[k] else None) or at_entry.get(slot, "")
-            params.append(FunctionParameter(self.jtypes.value_type(desc), name, loc(slot)))
+            params.append(FunctionParameter(self.jtypes.value_type(desc), name, loc(slot, desc)))
         _, ret = split_method_descriptor(method.descriptor)
         return Type.function(self.jtypes.return_value(ret, arch), params, calling_convention=cc)
 
