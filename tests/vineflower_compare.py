@@ -237,6 +237,8 @@ def type_problems(lines):
             t = value_type(m.group(1), types)
             if t is not None and t not in PRIMITIVE_TYPES:
                 ref_zero += 1
+        ref_zero += sum(1 for t in re.findall(r"(?<![\w$)\]])\((%s)\)\s*0(?![\w.])" % JTYPE, code)
+                        if t not in PRIMITIVE_TYPES)  # (String[]) 0
         casts += len(re.findall(r"(?<![\w$)\]])\((%s)\)\s*\(\1\)" % JTYPE, code))
         for m in re.finditer(r"(?:^|[{;])\s*(?:(%s)\s+)?([A-Za-z_$][\w$]*)\s*=\s*([^=;][^;]*);" % JTYPE, code):
             decl, name, rhs = m.group(1), m.group(2), m.group(3)

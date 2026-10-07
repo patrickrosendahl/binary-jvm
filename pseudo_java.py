@@ -4198,7 +4198,11 @@ if _HAVE_BN:
             self.type_tok(tokens, type_name)
             tokens.append_close_paren()
             self.txt(tokens, " ")
-            self.perform_get_expr_text(src, tokens, settings, P.UnaryOperatorPrecedence)
+            if src.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR) and src.constant == 0 and \
+                    type_name not in PRIMITIVES.values():
+                self.kw(tokens, "null")  # (String[]) null: a reference cast's operand is a reference
+            else:
+                self.perform_get_expr_text(src, tokens, settings, P.UnaryOperatorPrecedence)
             if parens:
                 tokens.append_close_paren()
 
@@ -4401,12 +4405,15 @@ if _HAVE_BN:
             if not args or not desc:
                 return None
             last = args[-1]
-            if last.operation not in (Op.HLIL_VAR, Op.HLIL_VAR_SSA):
+            value = self.inline.get(last.var) if last.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) else last
+            if isinstance(value, tuple) and value[0] == 'arr':
+                elems = list(value[2])
+            elif value is not None and not isinstance(value, tuple) and value.operation == Op.HLIL_INTRINSIC and \
+                    value.intrinsic.name in ("newarray", "anewarray") and len(value.params) == 2 and \
+                    value.params[1].operation == Op.HLIL_CONST and value.params[1].constant == 0:
+                elems = []  # m(a, new T[0]) -> m(a)
+            else:
                 return None
-            value = self.inline.get(last.var)
-            if not (isinstance(value, tuple) and value[0] == 'arr'):
-                return None
-            elems = list(value[2])
             is_va, overloads = self.info.varargs(callee[0], callee[1], desc)
             if not is_va:
                 return None
