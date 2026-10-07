@@ -11,8 +11,9 @@ edges inside methods (jvm-42), a Pseudo Java language representation (jvm-43/44)
 
 **▶ Handoff (2026-10-08 01:10).** jvm-58…63 and jvm-65 are resolved (Vineflower comparison: statements 2217 → 2109,
 VF 1916; class view declarations match Vineflower). Open, in this order:
-1. **jvm-64** committed (`32b4db1`) but not resolved: its compare_all timed out under machine load; a rerun was
-   running at handoff -- check `.scratch/compare_all/result_*.txt` (4 TOTAL lines, problems 0) or rerun.
+1. **jvm-64** committed (`32b4db1`) but not resolved: compare_all did not finish twice under heavy machine load
+   (40-min script timeout, then the bnrun clients' socket timeout at ~41 min) -- rerun it on an idle machine
+   (dev load of main first) and resolve on 251/251.
 2. **jvm-67** (boolean returns) coded on branch **`wip/jvm-67`**, untested -- next steps in the ticket.
 3. jvm-66 (anonymous classes at their `new`), jvm-68 (split `shared/` for `../binary-cpp`).
 The installed plugin is still at `7e2336b`: a BN restart (user's OK) would load main's state. Run BN gates one at a
