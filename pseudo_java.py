@@ -56,6 +56,7 @@ from .constants import (ARCH_NAME, VIEW_NAME, PSEUDOMEMORY_TABLE, PSEUDOMEMORY_P
 HIDE_BOXING = True          # Integer.valueOf(x) / x.intValue() -> x
 FOLD_TEMPORARIES = True      # print a single-use operand-stack temporary inside its use (jvm-46)
 SYNC_BLOCKS = True           # monitorenter ... monitorexit -> synchronized (x) { ... } (jvm-47)
+ARRAY_LITERALS = True        # new T[n] + n element stores -> new T[]{...} (jvm-49)
 LOOP_CONDITIONS = True       # while (true) { if (c) { tail; break; } ... } -> while (!c) { ... } tail (jvm-50)
 # intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
 PURE_INTRINSICS = {"getfield", "arraylength", "checkcast", "instanceof", "new", "newarray", "anewarray",
@@ -687,6 +688,7 @@ if _HAVE_BN:
             self._in_finally = False
             self.inline = {}        # folded single-use temporary -> its value (expr, or ('new', entry)) (jvm-46)
             self.active_syncs = []  # lock variables of the synchronized blocks being printed (jvm-47)
+            self.array_lits = {}    # array variable -> (new instr, element values, other uses) (jvm-49)
             self.hidden_vars = set()  # lock variables whose definition moved into a synchronized header
             self._def_counts = None
             self.deferred = set()           # expr_index of handler code met in a try body, printed by its catch
@@ -1319,6 +1321,11 @@ if _HAVE_BN:
         # --- block planning (idioms + try regions) ------------------------------------------------
         def plan_block(self, body):
             plan = {"skip": set(), "new_at": {}}
+            if ARRAY_LITERALS:
+                try:
+                    self.plan_array_literals(body, plan)
+                except Exception:
+                    pass
             for i, s in enumerate(body):
                 nv = self.new_assignment(s)
                 if nv is None:
@@ -1335,6 +1342,85 @@ if _HAVE_BN:
                         self.plan_concat(body, j, var, cls_idx, shape, plan)
                     break
             return plan
+
+        def is_array_expr(self, e):
+            """e is a Java array (by what it is set from, its descriptor code or its type)"""
+            try:
+                if e.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA):
+                    v = e.var
+                    if v in self.param_codes:
+                        return self.param_codes[v] == '['
+                    t = self.defs_java_type(v)
+                    if t is None:
+                        for d in self.hlil.get_var_definitions(v):
+                            if d.operation == Op.HLIL_VAR_INIT:
+                                t = self.expr_java_type(d.src)
+                    return bool(t and t.endswith("[]")) or self.var_code(v) == '['
+                t = self.expr_java_type(e)
+                return bool(t and t.endswith("[]")) or self.code_of(e) == '['
+            except Exception:
+                return False
+
+        def array_store(self, s, var):
+            """`var[k] = x` statement -> (k, x), else None"""
+            if s.operation != Op.HLIL_ASSIGN:
+                return None
+            d = s.dest
+            if d.operation in (Op.HLIL_DEREF_FIELD, Op.HLIL_STRUCT_FIELD) and d.src.operation == Op.HLIL_VAR and \
+                    d.src.var == var and d.size and d.offset % d.size == 0:
+                return d.offset // d.size, s.src
+            if d.operation == Op.HLIL_DEREF:
+                arr = self.array_access(d.src, d.size)
+                if arr is not None and arr[0].operation == Op.HLIL_VAR and arr[0].var == var and isinstance(arr[1], int):
+                    return arr[1], s.src
+            return None
+
+        def plan_array_literals(self, body, plan):
+            """`T[] a = new T[n]; a[0] = x0; ... a[n-1] = x(n-1);` -> `T[] a = new T[]{x0, ...}` (jvm-49)"""
+            for i, s in enumerate(body):
+                if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_VAR_INIT or s.src.operation != Op.HLIL_INTRINSIC \
+                        or s.src.intrinsic.name not in ("newarray", "anewarray") or len(s.src.params) != 2 or \
+                        s.src.params[1].operation != Op.HLIL_CONST:
+                    continue
+                n, var = s.src.params[1].constant, s.dest
+                if not 0 < n <= 64 or self.def_count(var) != 1:
+                    continue
+                elems, stores, k = [], [], i + 1
+                while k < len(body) and len(elems) < n:
+                    x = body[k]
+                    if isinstance(x, _ExcBranch) or self.is_exc_plumbing(x) or x.operation == Op.HLIL_NOP:
+                        k += 1
+                        continue
+                    st = self.array_store(x, var)
+                    if st is None or st[0] != len(elems) or self.refs(st[1], var):
+                        break
+                    elems.append(st[1])
+                    stores.append(k)
+                    k += 1
+                if len(elems) != n or self.var_count(var) - n < 1:
+                    continue
+                plan["skip"].update(stores)
+                plan.setdefault("arr_stores", set()).update(stores)
+                self.array_lits[var] = (s.src, elems, self.var_count(var) - n)
+
+        def emit_array_literal(self, new_instr, elems, tokens, settings):
+            name = new_instr.intrinsic.name
+            p = list(new_instr.params)
+            if name == "newarray":
+                base = NEWARRAY_TYPES.get((_const_target(p[0]) or 0) - PSEUDOMEMORY_PRIMITIVES, "?")
+                code = {"boolean": 'Z', "char": 'C', "byte": 'B', "short": 'S', "int": 'I', "long": 'J'}.get(base)
+            else:
+                cls = self.info.class_ref(_pool_index(_const_target(p[0])) or 0) or "?"
+                base = field_type_name(cls) if cls.startswith("[") else java_class_name(cls)
+                code = 'L'
+            self.kw(tokens, "new ")
+            self.type_tok(tokens, base + "[]")
+            self.txt(tokens, "{")
+            for i, x in enumerate(elems):
+                if i:
+                    self.txt(tokens, ", ")
+                self.emit_typed(x, code, tokens, settings)
+            self.txt(tokens, "}")
 
         def plan_concat(self, body, j, var, cls_idx, init_shape, plan):
             """sb = new StringBuilder(x); sb.append(a)...; ... sb.append(b).toString() -> x + a + b"""
@@ -1422,6 +1508,7 @@ if _HAVE_BN:
                 self._follow = []
                 self.inline = {}
                 self.active_syncs = []
+                self.array_lits = {}
                 self.hidden_vars = set()
                 self.deferred = set()
                 self.printed_handlers = set()
@@ -1531,6 +1618,10 @@ if _HAVE_BN:
             if k in plan["skip"] or s.operation != Op.HLIL_VAR_INIT:
                 return None
             var = s.dest
+            if var in self.array_lits:
+                if self.array_lits[var][2] != 1 or var in self.hoisted:
+                    return None
+                return var, ('arr', s.src, self.array_lits[var][1]), all(self.pure(x) for x in self.array_lits[var][1])
             if self.var_count(var) != 1 or self.def_count(var) != 1 or self.is_exc_var(var) or \
                     var == self.this_var or var in self.hoisted or self.is_exc_value(s.src) or \
                     self.mentions_exc(s.src):
@@ -1571,8 +1662,8 @@ if _HAVE_BN:
                     return out, True
                 value = self.inline.get(e.var)
                 if value is not None:
-                    if isinstance(value, tuple):  # ('new', entry): the constructor arguments
-                        for a in value[1][3][5]:
+                    if isinstance(value, tuple):  # ('new', entry): the constructor arguments; ('arr', ..): elements
+                        for a in (value[2] if value[0] == 'arr' else value[1][3][5]):
                             r = self.eval_nodes(a, stop_var, out)
                             if r[1] is not False:
                                 return r
@@ -1626,7 +1717,7 @@ if _HAVE_BN:
             if self.is_exc_plumbing(s) or self.in_monitor_code(s) or s.operation == Op.HLIL_NOP:
                 return True
             if k in plan["skip"]:
-                if self.new_assignment(s) is not None:
+                if self.new_assignment(s) is not None or k in plan.get("arr_stores", ()):
                     return True
                 # a StringBuilder append of a concatenation printed later: only pure operands
                 return all(not self.side_effect(i) or (self.call_shape(i) or (0, 0, ""))[2] in ("append", "<init>")
@@ -1680,6 +1771,9 @@ if _HAVE_BN:
             folded.add(k)
 
         def emit_inlined(self, value, tokens, settings, precedence):
+            if isinstance(value, tuple) and value[0] == 'arr':
+                self.emit_array_literal(value[1], value[2], tokens, settings)
+                return
             if isinstance(value, tuple):
                 s, var, cls_idx, shape = value[1]
                 self.kw(tokens, "new ")
@@ -2695,10 +2789,17 @@ if _HAVE_BN:
             elif o == Op.HLIL_VAR_INIT and statement and self.var_count(instr.dest) == 0 and \
                     instr.src.operation in (Op.HLIL_CALL, Op.HLIL_INTRINSIC):
                 self.perform_get_expr_text(instr.src, tokens, settings, P.TopLevelOperatorPrecedence)
+            elif o == Op.HLIL_VAR_INIT and instr.dest in self.array_lits and instr.dest not in self.hoisted:
+                self.emit_var_decl(instr.dest, instr, tokens, instr.src)
+                self.op(tokens, " = ")
+                self.emit_array_literal(instr.src, self.array_lits[instr.dest][1], tokens, settings)
             elif o == Op.HLIL_VAR_INIT and instr.dest in self.hoisted:
                 self.emit_var(instr.dest, instr, tokens)
                 self.op(tokens, " = ")
-                self.perform_get_expr_text(instr.src, tokens, settings, P.AssignmentOperatorPrecedence)
+                if instr.dest in self.array_lits:
+                    self.emit_array_literal(instr.src, self.array_lits[instr.dest][1], tokens, settings)
+                else:
+                    self.perform_get_expr_text(instr.src, tokens, settings, P.AssignmentOperatorPrecedence)
             elif o == Op.HLIL_VAR_INIT:
                 type_name = self.emit_var_decl(instr.dest, instr, tokens, instr.src)
                 self.op(tokens, " = ")
@@ -2739,6 +2840,13 @@ if _HAVE_BN:
                     self.expr(d, tokens, settings)
                 self.op(tokens, " = ")
                 self.perform_get_expr_text(instr.src, tokens, settings, P.AssignmentOperatorPrecedence)
+            elif o in (Op.HLIL_STRUCT_FIELD, Op.HLIL_DEREF_FIELD) and instr.size and \
+                    instr.offset % instr.size == 0 and self.is_array_expr(instr.src):
+                # a constant-index array element BN typed as a field of the element's struct (jvm-49)
+                self.perform_get_expr_text(instr.src, tokens, settings, P.MemberAndFunctionOperatorPrecedence)
+                tokens.append_open_bracket()
+                tokens.append(_tok(TT.IntegerToken, str(instr.offset // instr.size), value=instr.offset // instr.size))
+                tokens.append_close_bracket()
             elif o in (Op.HLIL_STRUCT_FIELD, Op.HLIL_DEREF_FIELD):
                 parens = precedence > P.MemberAndFunctionOperatorPrecedence
                 if parens:
