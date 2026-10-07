@@ -1,4 +1,4 @@
-# Run inside Binary Ninja via the script bridge, after tests/bn_dev_load.py:
+# Run inside Binary Ninja via the script bridge (installed plugin, or after tests/bn_dev_load.py):
 #   bnrun --parallel --timeout 400 tests/bn_pseudo_java_compare.py
 #   (prepend DEV_PKG = "jvm_devN", CLASSES = [...], SHOW = True to print the Java of failing methods,
 #    ONLY_EXC = True to check only methods with an exception table)
@@ -19,7 +19,7 @@ CLASS_DIR = globals().get("CLASS_DIR", "/Users/patrick/dev/binary-jvm/sample/Act
 CLASSES = globals().get("CLASSES", ["com/is_teledata/cache/HashCache.class"])
 SHOW = globals().get("SHOW", False)
 ONLY_EXC = globals().get("ONLY_EXC", False)
-PKG = globals().get("DEV_PKG") or b._jvm_dev["pkg"].__name__
+PKG = globals().get("DEV_PKG") or (b._jvm_dev["pkg"].__name__ if hasattr(b, "_jvm_dev") else "binary-jvm")
 pj = sys.modules[PKG + ".pseudo_java"]
 vt = b.BinaryViewType[sys.modules[PKG + ".constants"].VIEW_NAME]
 Op = b.HighLevelILOperation
