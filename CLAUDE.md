@@ -76,10 +76,12 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
    timing); `bnrun --parallel tests/bn_golden.py` dumps reference HLIL + readability metrics. Views created this way are in-process but **not UI tabs**.
    **Pseudo Java gates** (after any `pseudo_java.py` change; wiki `vineflower-comparison.md`):
    `python3 tests/vineflower_compare.py --decompile` (once: Vineflower, the decompiler Recaf uses, local fork),
-   `bnrun --parallel --timeout 600 tests/bn_pseudo_java_dump.py` (prepend `DEV_PKG = "jvm_devN"` for a dev load), then
-   `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=2 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0`
-   (exit 1 on a regression); and `tests/bn_pseudo_java_compare_all.sh [jvm_devN]` (~25 min, run it in the
-   background): every mdg method with an exception table against HLIL -- must stay 251/251.
+ `bnrun --timeout 900 tests/bn_pseudo_java_dump.py` (~7-12 min; prepend `DEV_PKG = "jvm_devN"` for a dev load), then
+ `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=2 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0 ref_zero=0 double_casts=0 type_mismatch=0 if_else_assign=0 stmts=2168`
+ (exit 1 on a regression; `stmts` is the statement count, lower it as tickets land; `--excess N` lists where the
+ extra statements against Vineflower come from); and `tests/bn_pseudo_java_compare_all.sh [jvm_devN]` (~18-25 min):
+ every mdg method with an exception table against HLIL -- must stay 251/251. Run these one at a time: the
+ dump next to compare_all slows both into their timeouts.
 3. bnrun has two lanes: serialized (default; UI work and global registration like `bn_dev_load.py`)
    and `--parallel` (scripts on their own views, up to 4 at once, no lock). Always pass **`--timeout N`**; a running script can be stopped
    with `bnrun --cancel` (or Ctrl-C on the client), `bnrun --status` shows what is running.

@@ -7,11 +7,13 @@ Two inputs, both under OUT (default .scratch/vfcmp/, git-ignored):
 Per method it reports readability counters (stack temporaries, gotos, labels, synchronized comments,
 `__offset` array stores, `while (true)` / `do` loops, leaked exception plumbing, dead code after return, lines) and what Pseudo Java lost
 against Vineflower: called method names and string literals that Vineflower has and Pseudo Java does not.
+Size is measured in statements (stmts / vf_stmts: comments dropped, wrapped lines joined, as both sides wrap
+differently); EXCESS splits the extra statements by a guessed cause (--excess N lists the worst methods).
 
 usage:
   python3 tests/vineflower_compare.py --decompile        # run Vineflower on CLASSES
   bnrun --parallel --timeout 600 tests/bn_pseudo_java_dump.py
-  python3 tests/vineflower_compare.py [--show NAME] [--worst N] [--json FILE]
+  python3 tests/vineflower_compare.py [--show NAME] [--worst N] [--excess N] [--json FILE]
                                      [--pj DIR] [--max K=V ...]  # exit 1 if a total exceeds V (e.g. --max lost_calls=0)
 """
 import argparse, glob, json, os, re, subprocess, sys
@@ -264,7 +266,64 @@ def if_else_assigns(lines):
                if " ? " not in strip_strings(m.group(0)))
 
 
-def compare_method(pj_body, vf_body):
+def statements(lines):
+    """logical lines: comments dropped, wrapped continuation lines joined (a line that does not end with
+    `;`, `{`, `}` or `:` continues on the next one), lines of only braces not counted"""
+    out, cur = [], ""
+    for l in lines:
+        code = re.sub(r'("(?:\\.|[^"\\])*")|//.*', lambda m: m.group(1) or "", l).strip()
+        if not code:
+            continue
+        cur = cur + " " + code if cur else code
+        if code[-1] in ";{}:":
+            out.append(cur)
+            cur = ""
+    if cur:
+        out.append(cur)
+    return [s for s in out if s.replace(" ", "") not in ("", "{", "}", "{}")]
+
+
+INC_COPY = re.compile(r"^(?:%s) ([\w$]+) = ([\w$.]+)( [+-] 1)?;\n\2 = (?:\1 [+-] 1|\1);" % JTYPE, re.M)
+FIELD_COPY = re.compile(r"^(?:%s) [A-Z][\w$]*_[\w$]+_\d+ = [\w$.]+;" % JTYPE, re.M)
+BARE_DECL = re.compile(r"^(?:final )?(%s) [\w$]+;$" % JTYPE)
+RETURN = re.compile(r"^(?:\} else \{ )?return\b")
+BOOL_RETURN = re.compile(r"^if \(.*\{\n(?:\} else \{\n)?return (true|false);\n(?:\} else \{\n)?return (?!\1)(true|false);$",
+                         re.M)
+ARRAY_STORE = re.compile(r"^(?:%s )?([\w$]+) = new [\w$.]+\[\d+\];\n((?:\1\[\d+\] = [^\n]*;\n?)+)" % JTYPE, re.M)
+
+
+def excess_causes(pj_body, pj_stmts, vf_stmts, hoisted=()):
+    """a guess where Pseudo Java's extra statements come from: {cause: statements}; 'other' is the rest.
+    hoisted: fields Vineflower initialises in their declaration (only for <init> / <clinit>)"""
+    pj_text = "\n".join(pj_stmts)
+    excess = len(pj_stmts) - len(vf_stmts)
+    causes = {}
+    if excess <= 0:
+        return causes
+    causes["hoisted_field"] = sum(1 for s in pj_stmts
+                                  for m in [re.match(r"^(?:this|[A-Z][\w$]*)\.([\w$]+) = ", s)] if m and m.group(1) in hoisted)
+    if hoisted and not vf_stmts:
+        causes["hoisted_field"] += 1  # the header of an initialiser Vineflower dropped
+    ternary = if_else_assigns(pj_body)
+    causes["ternary"] = 4 * ternary  # T x; / if (c) { / x = a; / } else { / x = b; -- one statement in Vineflower
+    causes["bool_return"] = 2 * len(BOOL_RETURN.findall(pj_text))  # if (c) { return false; } return true;
+    causes["array_init"] = sum(m.group(2).count("\n") + 1 - m.group(2).endswith("\n")
+                               for m in ARRAY_STORE.finditer(pj_text))  # new T[n] + element stores
+    causes["increment"] = 2 * len(INC_COPY.findall(pj_text))
+    causes["field_copy"] = len(FIELD_COPY.findall(INC_COPY.sub("", pj_text)))
+    count = lambda p, ss: sum(1 for s in ss if p.match(s) and s.split()[0] not in NOT_TYPES)
+    causes["split_decl"] = max(0, count(BARE_DECL, pj_stmts) - count(BARE_DECL, vf_stmts) - ternary)
+    causes["early_return"] = max(0, sum(1 for s in pj_stmts if RETURN.match(s)) -
+                                 sum(1 for s in vf_stmts if RETURN.match(s)) - causes["bool_return"] // 2)
+    left = excess
+    for k in list(causes):
+        causes[k] = min(causes[k], left)
+        left -= causes[k]
+    causes["other"] = left
+    return {k: v for k, v in causes.items() if v}
+
+
+def compare_method(pj_body, vf_body, hoisted=()):
     pj_text = "\n".join(pj_body)
     r = {k: len(p.findall(pj_text)) if k != "labels" else sum(1 for l in pj_body if p.match(l))
          for k, p in COUNTERS.items()}
@@ -274,9 +333,14 @@ def compare_method(pj_body, vf_body):
     r["ref_zero"], r["double_casts"], r["type_mismatch"] = type_problems(pj_body)
     r["if_else_assign"] = if_else_assigns(pj_body)
     r["lines"] = sum(1 for l in pj_body if l.strip() and l.strip() not in "{}")
+    pj_stmts = statements(pj_body)
+    r["stmts"] = len(pj_stmts)
     if vf_body is not None:
         vf_text = "\n".join(vf_body)
         r["vf_lines"] = sum(1 for l in vf_body if l.strip() and l.strip() not in "{}")
+        vf_stmts = statements(vf_body)
+        r["vf_stmts"] = len(vf_stmts)
+        r["causes"] = excess_causes(pj_body, pj_stmts, vf_stmts, hoisted)
         lost = called_names(vf_text) - called_names(pj_text)
         r["lost_calls"] = sorted(lost)
         pj_strings = {s.replace(" ", "") for s in string_literals(pj_text)}
@@ -302,6 +366,7 @@ def main():
     ap.add_argument("--classes", nargs="*", default=None)
     ap.add_argument("--show", help="print both versions of methods whose name contains this")
     ap.add_argument("--worst", type=int, default=15)
+    ap.add_argument("--excess", type=int, default=0, help="list the N methods with the most extra statements")
     ap.add_argument("--json")
     ap.add_argument("--pj", default=os.path.join(OUT, "pj"), help="directory of the Pseudo Java dump")
     ap.add_argument("--max", nargs="*", default=[], help="K=V: fail if total K exceeds V")
@@ -318,13 +383,14 @@ def main():
         if not (os.path.exists(pj_path) and os.path.exists(vf_path)):
             print("missing", pj_path if not os.path.exists(pj_path) else vf_path)
             continue
-        vf, _fields = vf_methods(vf_path, simple)
+        vf, fields = vf_methods(vf_path, simple)
+        hoisted = {m.group(1) for f in fields for m in [re.search(r"([\w$]+)\s*=", f)] if m}
         pj = pj_methods(pj_path, simple)
         for key, body in pj.items():
             vbody = vf.get(key)
             if vbody is None and key.startswith(("<init>/", "<clinit>/")):
                 vbody = []  # Vineflower dropped an empty / fully hoisted initialiser
-            r = compare_method(body, vbody)
+            r = compare_method(body, vbody, hoisted if key.startswith(("<init>/", "<clinit>/")) else ())
             r["method"] = "%s.%s" % (simple, key)
             rows.append(r)
             if a.show and a.show in r["method"]:
@@ -332,7 +398,7 @@ def main():
                 print("\n".join(body))
                 print("-" * 30, "Vineflower")
                 print("\n".join(vbody or ["(no match)"]))
-    keys = ["lines", "vf_lines", "temps", "gotos", "labels", "sync_comments", "offset_stores", "while_true", "plumbing",
+    keys = ["stmts", "vf_stmts", "lines", "vf_lines", "temps", "gotos", "labels", "sync_comments", "offset_stores", "while_true", "plumbing",
             "dead_code", "leaked_catch_var", "ref_zero", "double_casts", "type_mismatch", "if_else_assign"]
     for k in keys:
         totals[k] = sum(r.get(k, 0) for r in rows)
@@ -340,7 +406,19 @@ def main():
     totals["lost_strings"] = sum(len(r.get("lost_strings", [])) for r in rows)
     totals["methods"] = len(rows)
     totals["unmatched"] = sum(1 for r in rows if "vf_lines" not in r)
+    matched = [r for r in rows if "vf_stmts" in r]
+    totals["more_stmts"] = sum(1 for r in matched if r["stmts"] > r["vf_stmts"])
+    totals["fewer_stmts"] = sum(1 for r in matched if r["stmts"] < r["vf_stmts"])
+    causes = {}
+    for r in matched:
+        for k, v in r["causes"].items():
+            causes[k] = causes.get(k, 0) + v
     print("TOTAL", json.dumps(totals))
+    print("EXCESS", json.dumps(dict(sorted(causes.items(), key=lambda kv: -kv[1]))))
+    for r in sorted(matched, key=lambda r: r["vf_stmts"] - r["stmts"])[:a.excess]:
+        if r["stmts"] <= r["vf_stmts"]:
+            break
+        print("  %-45s %3d/%-3d statements %s" % (r["method"], r["stmts"], r["vf_stmts"], r["causes"]))
     bad = lambda r: (r["temps"] + 5 * (r["gotos"] + r["sync_comments"] + r["offset_stores"]) +
                      20 * (r["plumbing"] + r["dead_code"] + r["leaked_catch_var"]) +
                      10 * (r["ref_zero"] + r["double_casts"] + r["type_mismatch"]) +
@@ -348,7 +426,7 @@ def main():
     for r in sorted(rows, key=bad, reverse=True)[:a.worst]:
         if bad(r) == 0:
             break
-        extra = {k: r[k] for k in keys[2:] if r.get(k)}
+        extra = {k: r[k] for k in keys[4:] if r.get(k)}
         if r.get("lost_calls"):
             extra["lost_calls"] = r["lost_calls"]
         if r.get("lost_strings"):
