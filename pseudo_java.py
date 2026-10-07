@@ -56,6 +56,7 @@ from .constants import (ARCH_NAME, VIEW_NAME, PSEUDOMEMORY_TABLE, PSEUDOMEMORY_P
 HIDE_BOXING = True          # Integer.valueOf(x) / x.intValue() -> x
 FOLD_TEMPORARIES = True      # print a single-use operand-stack temporary inside its use (jvm-46)
 SYNC_BLOCKS = True           # monitorenter ... monitorexit -> synchronized (x) { ... } (jvm-47)
+LOOP_CONDITIONS = True       # while (true) { if (c) { tail; break; } ... } -> while (!c) { ... } tail (jvm-50)
 # intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
 PURE_INTRINSICS = {"getfield", "arraylength", "checkcast", "instanceof", "new", "newarray", "anewarray",
                    "multianewarray", "__exception"}
@@ -1228,10 +1229,14 @@ if _HAVE_BN:
                 tokens.new_line()
 
         def emit_negated(self, c, tokens, settings):
-            flip = {Op.HLIL_CMP_E: Op.HLIL_CMP_NE, Op.HLIL_CMP_NE: Op.HLIL_CMP_E}
-            if c.operation in flip:
+            flip = {Op.HLIL_CMP_E: Op.HLIL_CMP_NE, Op.HLIL_CMP_NE: Op.HLIL_CMP_E,
+                    Op.HLIL_CMP_SLT: Op.HLIL_CMP_SGE, Op.HLIL_CMP_SGE: Op.HLIL_CMP_SLT,
+                    Op.HLIL_CMP_SLE: Op.HLIL_CMP_SGT, Op.HLIL_CMP_SGT: Op.HLIL_CMP_SLE,
+                    Op.HLIL_CMP_ULT: Op.HLIL_CMP_UGE, Op.HLIL_CMP_UGE: Op.HLIL_CMP_ULT,
+                    Op.HLIL_CMP_ULE: Op.HLIL_CMP_UGT, Op.HLIL_CMP_UGT: Op.HLIL_CMP_ULE}
+            if c.operation in flip:  # (integer compares only: a float compare with NaN is not its flip)
                 text, prec = BINARY[flip[c.operation]]
-                self.emit_binary(text, prec, _Pair(c.left, c.right), tokens, settings, P.TopLevelOperatorPrecedence)
+                self.emit_binary(text, prec, _Cmp(c.left, c.right, c), tokens, settings, P.TopLevelOperatorPrecedence)
                 return
             if c.operation == Op.HLIL_NOT:
                 self.expr(c.src, tokens, settings)
@@ -1765,6 +1770,11 @@ if _HAVE_BN:
             return self.is_exc_plumbing(s) or s.operation == Op.HLIL_NOP or \
                 (s.expr_index in self.consumed) or self.in_monitor_code(s)
 
+        def prints_nothing(self, s):
+            """hidden_item, or a jsr call of a finally body that the finally clause prints"""
+            return self.hidden_item(s) or (not isinstance(s, _ExcBranch) and
+                                           self.jsr_target(s) in self.finally_subs() and self.finally_printed())
+
         def exit_leaves(self, after):
             """the statements after a monitorexit leave the block at once (return / throw)"""
             for y in after:
@@ -1869,6 +1879,94 @@ if _HAVE_BN:
                 tokens.end_scope(ScopeType.BlockScopeType)
             tokens.finalize_scope()
             tokens.new_line()
+
+        # --- loop conditions (jvm-50) ---------------------------------------------------------------
+        def loop_breaks(self, items):
+            """break / continue statements of the loop these items belong to (not of nested loops/switches),
+            outside exceptional branches"""
+            out = []
+            stack = [x for x in items if not isinstance(x, _ExcBranch)]
+            while stack:
+                i = stack.pop()
+                if i.operation in (Op.HLIL_BREAK, Op.HLIL_CONTINUE):
+                    out.append(i)
+                    continue
+                if i.operation in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE, Op.HLIL_FOR, Op.HLIL_SWITCH):
+                    continue
+                if i.operation == Op.HLIL_IF and self.exc_if_parts(i) is not None:
+                    _, xb, nb = self.exc_if_parts(i)
+                    if nb is not None:
+                        stack.append(nb)
+                    continue
+                stack.extend(_children(i))
+            return out
+
+        def loop_cond_shape(self, w):
+            """(defs, if statement, tail items, rest items) for `while (true) { defs; if (c) { tail; break; } rest }`"""
+            cond = w.condition
+            if not ((cond.operation == Op.HLIL_CONST and cond.constant != 0) or self.normal_value(cond) is True):
+                return None
+            items = self.flatten(self.stmts_of(w.body))
+            k = 0
+            defs = []
+            while k < len(items) and (self.hidden_item(items[k]) or
+                                      (not isinstance(items[k], _ExcBranch) and items[k].operation == Op.HLIL_VAR_INIT)):
+                if not self.hidden_item(items[k]):
+                    defs.append(items[k])
+                k += 1
+            if k >= len(items) or isinstance(items[k], _ExcBranch) or items[k].operation != Op.HLIL_IF:
+                return None
+            iff = items[k]
+            if self.exc_if_parts(iff) is not None or \
+                    not (iff.false is None or iff.false.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE)):
+                return None
+            t_items = self.flatten(self.stmts_of(iff.true))
+            real = [x for x in t_items if not self.hidden_item(x)]
+            if not real or isinstance(real[-1], _ExcBranch):
+                return None
+            if real[-1].operation == Op.HLIL_BREAK:
+                tail = t_items[:t_items.index(real[-1])]
+            elif real[-1].operation not in (Op.HLIL_CONTINUE, Op.HLIL_GOTO) and self.ends_flow([real[-1]]):
+                tail = t_items  # `if (c) { ...; return x; }`: the loop is only left there
+            else:
+                return None
+            rest = items[k + 1:]
+            if self.loop_breaks(tail) or self.loop_breaks(rest) and \
+                    any(b.operation == Op.HLIL_BREAK for b in self.loop_breaks(rest)):
+                return None
+            if any(i.operation == Op.HLIL_LABEL for x in tail + rest if not isinstance(x, _ExcBranch) for i in _walk(x)):
+                return None
+            # every def is read once, in the condition, where it can be evaluated
+            saved = dict(self.inline)
+            for d in reversed(defs):
+                var = d.dest
+                if self.var_count(var) != 1 or self.def_count(var) != 1 or self.mentions_exc(d.src):
+                    self.inline = saved
+                    return None
+                before, found = self.eval_nodes(iff.condition, var)
+                if found is not True or any(self.side_effect(i) for i in before) or \
+                        (not self.pure(d.src) and any(self.reads_memory(i) for i in before)):
+                    self.inline = saved
+                    return None
+                self.inline[var] = d.src
+            return defs, iff, tail, rest
+
+        def emit_loop_cond(self, w, shape, tokens, settings):
+            defs, iff, tail, rest = shape
+            for d in defs:
+                self.consumed.add(d.expr_index)
+            self.kw(tokens, "while ")
+            tokens.append_open_paren()
+            self.emit_negated(iff.condition, tokens, settings)
+            tokens.append_close_paren()
+            tokens.begin_scope(ScopeType.BlockScopeType)
+            self.emit_list(rest, tokens, settings, w.body)
+            tokens.end_scope(ScopeType.BlockScopeType)
+            tokens.finalize_scope()
+            tokens.new_line()
+            if [x for x in tail if not self.prints_nothing(x)]:
+                tokens.scope_separator()
+                self.emit_list(tail, tokens, settings, iff.true)
 
         def emit_error(self, s, ex, tokens):
             """never lose a statement: if rendering fails, print its HLIL as a comment"""
@@ -1991,6 +2089,13 @@ if _HAVE_BN:
                     tokens.new_line()
                     need_separator = False
                 return need_separator
+            if s.operation == Op.HLIL_WHILE and s.as_ast and LOOP_CONDITIONS:
+                shape = self.loop_cond_shape(s)
+                if shape is not None:
+                    if need_separator is not None:
+                        tokens.scope_separator()
+                    self.emit_loop_cond(s, shape, tokens, settings)
+                    return True
             if s.operation == Op.HLIL_GOTO and self.label_after(body, idx, plan) == s.target.label_id:
                 # `goto L` right before L (also at the end of a branch whose statement is followed by L)
                 self.hidden_gotos[s.target.label_id] = self.hidden_gotos.get(s.target.label_id, 0) + 1
@@ -3246,6 +3351,12 @@ if _HAVE_BN:
         """stand-in with .left/.right for rendering fmod(a, b) as a % b"""
         def __init__(self, left, right):
             self.left, self.right = left, right
+
+    class _Cmp:
+        """stand-in for a compare with another operator (a negated condition): the operands of the original"""
+        def __init__(self, left, right, orig):
+            self.left, self.right, self.orig = left, right, orig
+            self.expr_type = orig.expr_type
 
     BINARY = {
         Op.HLIL_ADD: ("+", P.AddOperatorPrecedence), Op.HLIL_FADD: ("+", P.AddOperatorPrecedence),

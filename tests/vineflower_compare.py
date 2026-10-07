@@ -5,7 +5,7 @@ Two inputs, both under OUT (default .scratch/vfcmp/, git-ignored):
   pj/<pkg/Class>.pj     Pseudo Java, dumped inside Binary Ninja by tests/bn_pseudo_java_dump.py
 
 Per method it reports readability counters (stack temporaries, gotos, labels, synchronized comments,
-`__offset` array stores, leaked exception plumbing, dead code after return, lines) and what Pseudo Java lost
+`__offset` array stores, `while (true)` / `do` loops, leaked exception plumbing, dead code after return, lines) and what Pseudo Java lost
 against Vineflower: called method names and string literals that Vineflower has and Pseudo Java does not.
 
 usage:
@@ -55,6 +55,7 @@ COUNTERS = {
     "labels": re.compile(r"^\s*label_\w+:"),
     "sync_comments": re.compile(r"//\s*\}?\s*synchronized"),
     "offset_stores": re.compile(r"__offset"),
+    "while_true": re.compile(r"\bwhile \(true\)|\bdo \{"),
     "plumbing": re.compile(r"\b(exc(_\d+)?|__exception|__propagate)\b|\binstanceof\(|could not render|render raised"),
 }
 
@@ -249,8 +250,8 @@ def main():
                 print("\n".join(body))
                 print("-" * 30, "Vineflower")
                 print("\n".join(vbody or ["(no match)"]))
-    keys = ["lines", "vf_lines", "temps", "gotos", "labels", "sync_comments", "offset_stores", "plumbing", "dead_code",
-            "leaked_catch_var"]
+    keys = ["lines", "vf_lines", "temps", "gotos", "labels", "sync_comments", "offset_stores", "while_true", "plumbing",
+            "dead_code", "leaked_catch_var"]
     for k in keys:
         totals[k] = sum(r.get(k, 0) for r in rows)
     totals["lost_calls"] = sum(len(r.get("lost_calls", [])) for r in rows)
