@@ -2951,6 +2951,19 @@ if _HAVE_BN:
                 a, b = b, a
             if code is None:
                 code = self.type_code(self.var_java_type(x))
+            consts = [v.constant if v.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR) else None for v in (a, b)]
+            if code == 'Z' and consts in ([1, 0], [0, 1]):
+                # `c ? true : false` is c
+                parens = precedence > P.LogicalOrOperatorPrecedence
+                if parens:
+                    tokens.append_open_paren()
+                if flip == (consts == [1, 0]):
+                    self.emit_negated(iff.condition, tokens, settings)
+                else:
+                    self.perform_get_expr_text(iff.condition, tokens, settings, P.LogicalOrOperatorPrecedence)
+                if parens:
+                    tokens.append_close_paren()
+                return
             parens = precedence > P.TernaryOperatorPrecedence
             if parens:
                 tokens.append_open_paren()
@@ -4427,6 +4440,11 @@ if _HAVE_BN:
 
         def emit_typed(self, e, code, tokens, settings, precedence=None):
             """a value in a context of known descriptor type: 1 -> true for Z, 'x' for C, 0 -> null for L/["""
+            if e.operation == Op.HLIL_VAR and self.inline and isinstance(self.inline.get(e.var), tuple) and \
+                    self.inline[e.var][0] == 'ternary':
+                self.emit_ternary(self.inline[e.var], code, tokens, settings,
+                                  P.TopLevelOperatorPrecedence if precedence is None else precedence)
+                return
             if e.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR) and code:
                 c = e.constant
                 if code == 'Z' and c in (0, 1):
