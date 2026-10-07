@@ -58,6 +58,7 @@ FOLD_TEMPORARIES = True      # print a single-use operand-stack temporary inside
 SYNC_BLOCKS = True           # monitorenter ... monitorexit -> synchronized (x) { ... } (jvm-47)
 ARRAY_LITERALS = True        # new T[n] + n element stores -> new T[]{...} (jvm-49)
 LOOP_CONDITIONS = True       # while (true) { if (c) { tail; break; } ... } -> while (!c) { ... } tail (jvm-50)
+SPLIT_CONDITIONS = True      # T x; if (a) { x = e; } if (!a || p(x)) -> if (!a || p(e)) (jvm-54)
 # intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
 PURE_INTRINSICS = {"getfield", "arraylength", "checkcast", "instanceof", "new", "newarray", "anewarray",
                    "multianewarray", "__exception"}
@@ -464,6 +465,11 @@ if _HAVE_BN:
     Op = HighLevelILOperation
     TT = InstructionTextTokenType
     P = OperatorPrecedence
+    NEGATED_CMP = {Op.HLIL_CMP_E: Op.HLIL_CMP_NE, Op.HLIL_CMP_NE: Op.HLIL_CMP_E,
+                   Op.HLIL_CMP_SLT: Op.HLIL_CMP_SGE, Op.HLIL_CMP_SGE: Op.HLIL_CMP_SLT,
+                   Op.HLIL_CMP_SLE: Op.HLIL_CMP_SGT, Op.HLIL_CMP_SGT: Op.HLIL_CMP_SLE,
+                   Op.HLIL_CMP_ULT: Op.HLIL_CMP_UGE, Op.HLIL_CMP_UGE: Op.HLIL_CMP_ULT,
+                   Op.HLIL_CMP_ULE: Op.HLIL_CMP_UGT, Op.HLIL_CMP_UGT: Op.HLIL_CMP_ULE}
 
     COMPOUND = None  # filled below
 
@@ -797,6 +803,9 @@ if _HAVE_BN:
             self._finally_subs = None
             self._concat = {}       # expr_index of toString / indy call -> [(expr|str, is_string)]
             self._var_counts = None
+            self.count_discount = {}  # var -> reads that no longer print (merged split conditions, jvm-54)
+            self.break_subst = {}     # expr_index of a loop break -> (items, block) printed in its place (jvm-54)
+            self.break_used = set()
             self._exc_storage = None
             try:
                 self._exc_storage = func.arch.regs["exc"].index if "exc" in func.arch.regs else None
@@ -1331,11 +1340,14 @@ if _HAVE_BN:
                 tokens.new_line()
 
         def emit_negated(self, c, tokens, settings):
-            flip = {Op.HLIL_CMP_E: Op.HLIL_CMP_NE, Op.HLIL_CMP_NE: Op.HLIL_CMP_E,
-                    Op.HLIL_CMP_SLT: Op.HLIL_CMP_SGE, Op.HLIL_CMP_SGE: Op.HLIL_CMP_SLT,
-                    Op.HLIL_CMP_SLE: Op.HLIL_CMP_SGT, Op.HLIL_CMP_SGT: Op.HLIL_CMP_SLE,
-                    Op.HLIL_CMP_ULT: Op.HLIL_CMP_UGE, Op.HLIL_CMP_UGE: Op.HLIL_CMP_ULT,
-                    Op.HLIL_CMP_ULE: Op.HLIL_CMP_UGT, Op.HLIL_CMP_UGT: Op.HLIL_CMP_ULE}
+            flip = NEGATED_CMP
+            if c.operation in (Op.HLIL_OR, Op.HLIL_AND) and c.size == 0 and \
+                    all(x.operation in flip or x.operation not in (Op.HLIL_OR, Op.HLIL_AND) for x in (c.left, c.right)):
+                # De Morgan: !(a || b) -> !a && !b, !(a && b) -> !a || !b
+                self.emit_negated(c.left, tokens, settings)
+                self.op(tokens, " && " if c.operation == Op.HLIL_OR else " || ")
+                self.emit_negated(c.right, tokens, settings)
+                return
             if c.operation in flip:  # (integer compares only: a float compare with NaN is not its flip)
                 text, prec = BINARY[flip[c.operation]]
                 self.emit_binary(text, prec, _Cmp(c.left, c.right, c), tokens, settings, P.TopLevelOperatorPrecedence)
@@ -1416,7 +1428,7 @@ if _HAVE_BN:
                 except Exception:
                     pass
                 self._var_counts = counts
-            return self._var_counts.get(var, 0)
+            return self._var_counts.get(var, 0) - self.count_discount.get(var, 0)
 
         # --- block planning (idioms + try regions) ------------------------------------------------
         def plan_block(self, body):
@@ -1612,6 +1624,9 @@ if _HAVE_BN:
                 self.hidden_vars = set()
                 self.deferred = set()
                 self.printed_handlers = set()
+                self.count_discount = {}
+                self.break_subst = {}
+                self.break_used = set()
             self.emit_list(self.flatten(list(instr.body)), tokens, settings, instr, is_root)
 
         def emit_list(self, body, tokens, settings, block, is_root=False, own=False):
@@ -1650,6 +1665,23 @@ if _HAVE_BN:
             for r in run_at.values():
                 self.placed.add((r[2][0], r[2][1]))
                 self.placed_handlers.update(h for h, _ in r[2][2])
+            if SPLIT_CONDITIONS and block.as_ast:
+                for k in range(lo, hi + 1):
+                    try:
+                        self.merge_split_cond(body, k, hi)
+                    except Exception:
+                        pass
+            if LOOP_CONDITIONS and block.as_ast:
+                # loop shapes are decided before anything is printed: they may hide a declaration further up
+                shapes = plan.setdefault("loop_shapes", {})
+                for k in range(lo, hi + 1):
+                    s = body[k]
+                    if not isinstance(s, _ExcBranch) and s.operation in (Op.HLIL_WHILE, Op.HLIL_FOR, Op.HLIL_DO_WHILE) \
+                            and s.as_ast and k not in shapes:
+                        try:
+                            shapes[k] = self.loop_cond_shape(s, [(j, body[j]) for j in range(k + 1, hi + 1)], block)
+                        except Exception:
+                            shapes[k] = None
             if FOLD_TEMPORARIES and block.as_ast:
                 try:
                     self.plan_folds(body, lo, hi, run_at, plan)
@@ -1814,7 +1846,8 @@ if _HAVE_BN:
                 return cls[0] in ('hide', 'rethrow') or (cls[0] == 'handler' and cls[1] in self.placed_handlers)
             if s.expr_index in self.consumed and s.expr_index not in plan.get("own", ()):
                 return True
-            if self.is_exc_plumbing(s) or self.in_monitor_code(s) or s.operation == Op.HLIL_NOP:
+            if self.is_exc_plumbing(s) or self.in_monitor_code(s) or s.operation == Op.HLIL_NOP or \
+                    (s.operation == Op.HLIL_VAR_DECLARE and s.var in self.hidden_vars):
                 return True
             if k in plan["skip"]:
                 if self.new_assignment(s) is not None or k in plan.get("arr_stores", ()):
@@ -1962,7 +1995,8 @@ if _HAVE_BN:
                 cls = self.branch_class(s.branch, s.address - self.function.start)
                 return cls[0] in ('hide', 'rethrow') or (cls[0] == 'handler' and cls[1] in self.placed_handlers)
             return self.is_exc_plumbing(s) or s.operation == Op.HLIL_NOP or \
-                (s.expr_index in self.consumed) or self.in_monitor_code(s)
+                (s.expr_index in self.consumed) or self.in_monitor_code(s) or \
+                (s.operation == Op.HLIL_VAR_DECLARE and s.var in self.hidden_vars)
 
         def prints_nothing(self, s):
             """hidden_item, or a jsr call of a finally body that the finally clause prints"""
@@ -2087,20 +2121,57 @@ if _HAVE_BN:
                     continue
                 if i.operation in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE, Op.HLIL_FOR, Op.HLIL_SWITCH):
                     continue
+                if i.operation == Op.HLIL_IF:
+                    test = self.exc_test(i.condition)
+                    if test is not None and test[0] == 'exc':
+                        # `if (exc != 0) break;`: leaving a loop on an exception goes to its handler
+                        nb = i.false if test[1] else i.true
+                        if nb is not None:
+                            stack.append(nb)
+                        continue
                 if i.operation == Op.HLIL_IF and self.exc_if_parts(i) is not None:
                     _, xb, nb = self.exc_if_parts(i)
                     if nb is not None:
                         stack.append(nb)
                     continue
+                if i.operation == Op.HLIL_BLOCK:
+                    for st in i.body:
+                        stack.append(st)
+                        test = self.exc_test(st.condition) if st.operation == Op.HLIL_IF else None
+                        if test is not None and test[0] == 'exc' and (st.false is None or st.false.operation ==
+                                                                      Op.HLIL_NOP):
+                            nb = st.false if test[1] else st.true
+                            if nb is not None and self.ends_flow(self.flatten(self.stmts_of(nb))):
+                                break  # `if (exc == 0) goto L; break;`: the rest is the exceptional path
+                    continue
                 stack.extend(_children(i))
             return out
 
-        def loop_cond_shape(self, w):
-            """(defs, if statement, tail items, rest items) for `while (true) { defs; if (c) { tail; break; } rest }`"""
+        def infinite_loop(self, w):
+            """a loop that is only left by break / return / throw: `while (true)`, `do { } while (true)` and the
+            lifter's `for (exc = __exception(); exc == 0; exc = __exception())` (left by an exception only)"""
             cond = w.condition
-            if not ((cond.operation == Op.HLIL_CONST and cond.constant != 0) or self.normal_value(cond) is True):
-                return None
+            true = (cond.operation == Op.HLIL_CONST and cond.constant != 0) or self.normal_value(cond) is True
+            if w.operation == Op.HLIL_FOR:
+                return true and all(x.operation == Op.HLIL_NOP or self.is_exc_plumbing(x) for x in (w.init, w.update))
+            return true
+
+        def loop_cond_shape(self, w, after=(), block=None):
+            """(defs, if statement, tail items, rest items, moved) for
+            `while (true) { defs; if (c) { tail; break; } rest }`; moved: indexes of the code after the loop that
+            is printed at the loop's single other break (`if (x) break; ... } return y;` -> `if (x) { return y; }`)"""
+            do_cond = None
+            if not self.infinite_loop(w):
+                if w.operation != Op.HLIL_DO_WHILE or self.exc_test(w.condition) is not None:
+                    return None
+                do_cond = w.condition  # do { body } while (d) == while (true) { body; if (!d) break; }
             items = self.flatten(self.stmts_of(w.body))
+            if SPLIT_CONDITIONS:
+                for k in range(len(items)):
+                    try:
+                        self.merge_split_cond(items, k, len(items) - 1)
+                    except Exception:
+                        pass
             k = 0
             defs = []
             while k < len(items) and (self.hidden_item(items[k]) or
@@ -2125,11 +2196,30 @@ if _HAVE_BN:
             else:
                 return None
             rest = items[k + 1:]
-            if self.loop_breaks(tail) or self.loop_breaks(rest) and \
-                    any(b.operation == Op.HLIL_BREAK for b in self.loop_breaks(rest)):
+            moved = []
+            if self.loop_breaks(tail):
                 return None
-            if any(i.operation == Op.HLIL_LABEL for x in tail + rest if not isinstance(x, _ExcBranch) for i in _walk(x)):
-                return None
+            rest_breaks = [b for b in self.loop_breaks(rest) if b.operation == Op.HLIL_BREAK]
+            if do_cond is not None:
+                if rest_breaks or self.loop_breaks(rest):
+                    return None  # (a continue would skip the moved `if (!d)` test)
+                moved = self.search_loop_tail([None], tail, after)
+                last = [x for x in rest if not self.hidden_item(x)]
+                if moved is None or not last or isinstance(last[-1], _ExcBranch) or \
+                        last[-1].operation != Op.HLIL_ASSIGN or last[-1].dest.operation != Op.HLIL_VAR:
+                    return None
+                x, asg = last[-1].dest.var, last[-1]
+                if self.var_count(x) - self.refs(asg, x) != 1 or self.refs(do_cond, x) != 1 or \
+                        self.def_count(x) != 2 or self.mentions_exc(asg.src) or \
+                        self.eval_nodes(do_cond, x)[1] is not True or \
+                        any(self.side_effect(i) or self.reads_memory(i) for i in self.eval_nodes(do_cond, x)[0]):
+                    return None
+            elif rest_breaks:
+                moved = self.search_loop_tail(rest_breaks, tail, after)
+                if moved is None:
+                    return None
+            if any(i.operation == Op.HLIL_LABEL for x in tail if not isinstance(x, _ExcBranch) for i in _walk(x)):
+                return None  # (rest stays in the loop body: its labels keep their place)
             # every def is read once, in the condition, where it can be evaluated
             saved = dict(self.inline)
             for d in reversed(defs):
@@ -2143,10 +2233,103 @@ if _HAVE_BN:
                     self.inline = saved
                     return None
                 self.inline[var] = d.src
-            return defs, iff, tail, rest
+            if do_cond is not None:
+                # `x = v; } while (x)`: the test moves to the end of the body as `if (!v) { <code after> }`
+                self.inline[x] = asg.src
+                self.hidden_vars.add(x)
+                self.consumed.add(asg.expr_index)
+                self.break_subst[w.expr_index] = ([y for _, y in after], block)
+                return defs, iff, tail, rest, ([j for j, _ in after], w.expr_index, do_cond)
+            if moved:
+                self.break_subst[rest_breaks[0].expr_index] = ([x for _, x in after], block)
+            return defs, iff, tail, rest, ([j for j, _ in after], rest_breaks[0].expr_index) if moved else None
+
+        def search_loop_tail(self, breaks, tail, after):
+            """the code after a loop can be printed at its single break instead (Vineflower's MergeHelper):
+            the loop is only left there and by `tail`, which must not fall through; the code is short, ends the
+            method (return / throw) and has no label"""
+            if len(breaks) != 1 or not self.ends_flow(tail):
+                return None  # (`if (c) { tail; break; }`: tail falls through to that code too)
+            items = [x for _, x in after]
+            real = [x for x in items if not self.hidden_item(x)]
+            if not real or len(real) > 4 or not self.ends_flow(items):
+                return None
+            for x in items:
+                if isinstance(x, _ExcBranch):
+                    continue
+                if any(i.operation == Op.HLIL_LABEL for i in _walk(x)) or \
+                        (x.operation == Op.HLIL_VAR_INIT and x.dest in self.inline):
+                    return None
+            return items
+
+        # --- split short-circuit conditions (jvm-54) ----------------------------------------------------
+        def negation_of(self, a, b):
+            """b is the condition !a (integer compare flipped, or a NOT)"""
+            if b.operation == Op.HLIL_NOT:
+                return str(b.src) == str(a)
+            if a.operation == Op.HLIL_NOT:
+                return str(a.src) == str(b)
+            flip = NEGATED_CMP.get(a.operation)
+            return flip is not None and b.operation == flip and str(a.left) == str(b.left) and \
+                str(a.right) == str(b.right)
+
+        def merge_split_cond(self, items, k, hi):
+            """BN splits `if (!a || p(e))` into `T x; if (a) { x = e; } if (!a || p(x))` (same with `a && p(x)`).
+            Print the second test with e in place of x and drop the first: e is still only evaluated when a holds,
+            in the same order"""
+            s = items[k]
+            if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_IF or s.expr_index in self.consumed or \
+                    self.exc_if_parts(s) is not None or \
+                    not (s.false is None or s.false.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE)):
+                return False
+            a = s.condition
+            if self.mentions_exc(a) or not self.pure(a):
+                return False
+            assigns = [x for x in self.flatten(self.stmts_of(s.true)) if not self.hidden_item(x)]
+            if not assigns or any(isinstance(x, _ExcBranch) or x.operation != Op.HLIL_ASSIGN or
+                                  x.dest.operation != Op.HLIL_VAR for x in assigns):
+                return False
+            xs = [x.dest.var for x in assigns]
+            if len(set(xs)) != len(xs):
+                return False
+            j = k + 1
+            while j <= hi and self.hidden_item(items[j]):
+                j += 1
+            if j > hi or isinstance(items[j], _ExcBranch) or items[j].operation != Op.HLIL_IF:
+                return False
+            c = items[j].condition
+            if c.operation not in (Op.HLIL_OR, Op.HLIL_AND) or c.size != 0:
+                return False
+            if not (self.negation_of(a, c.left) if c.operation == Op.HLIL_OR else str(c.left) == str(a)):
+                return False
+            r = c.right
+            for x, asg in zip(xs, assigns):
+                if self.is_exc_var(x) or self.mentions_exc(asg.src) or self.refs(c.left, x) or self.refs(r, x) != 1 \
+                        or self.var_count(x) - self.refs(s, x) != 1:
+                    return False
+            # Java order: the values are evaluated in assignment order, nothing with an effect before them
+            order = [i.var for i in self.eval_nodes(r)[0] if i.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and i.var in xs]
+            if order != xs:
+                return False
+            for x, asg in zip(xs, assigns):
+                before, found = self.eval_nodes(r, x)
+                if found is not True:
+                    return False
+                others = [i for i in before if not (i.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and i.var in xs)]
+                if any(self.side_effect(i) for i in others) or \
+                        (not self.pure(asg.src) and any(self.reads_memory(i) for i in others)):
+                    return False
+            for x, asg in zip(xs, assigns):
+                self.inline[x] = asg.src
+                self.hidden_vars.add(x)
+            self.consumed.add(s.expr_index)
+            for i in _walk(a):
+                if i.operation == Op.HLIL_VAR:
+                    self.count_discount[i.var] = self.count_discount.get(i.var, 0) + 1
+            return True
 
         def emit_loop_cond(self, w, shape, tokens, settings):
-            defs, iff, tail, rest = shape
+            defs, iff, tail, rest, moved = shape
             for d in defs:
                 self.consumed.add(d.expr_index)
             self.kw(tokens, "while ")
@@ -2155,9 +2338,28 @@ if _HAVE_BN:
             tokens.append_close_paren()
             tokens.begin_scope(ScopeType.BlockScopeType)
             self.emit_list(rest, tokens, settings, w.body)
+            if moved and len(moved) > 2:  # do-while: the loop test, leaving to the moved code
+                items, blk = self.break_subst[moved[1]]
+                self.break_used.add(moved[1])
+                tokens.scope_separator()
+                self.kw(tokens, "if ")
+                tokens.append_open_paren()
+                self.emit_negated(moved[2], tokens, settings)
+                tokens.append_close_paren()
+                tokens.begin_scope(ScopeType.BlockScopeType)
+                self.emit_list(items, tokens, settings, blk)
+                tokens.end_scope(ScopeType.BlockScopeType)
+                tokens.finalize_scope()
+                tokens.new_line()
+            lost = [moved[1]] if moved and moved[1] not in self.break_used else []
             tokens.end_scope(ScopeType.BlockScopeType)
             tokens.finalize_scope()
             tokens.new_line()
+            for b in lost:  # never expected: the break was printed some other way -- keep the code visible
+                items, blk = self.break_subst[b]
+                self.note(tokens, "// code after the loop, reached by its break:")
+                tokens.new_line()
+                self.emit_list(items, tokens, settings, blk)
             if [x for x in tail if not self.prints_nothing(x)]:
                 tokens.scope_separator()
                 self.emit_list(tail, tokens, settings, iff.true)
@@ -2300,6 +2502,13 @@ if _HAVE_BN:
                     return need_separator
             if isinstance(s, _ExcBranch):
                 return self.emit_exc_branch(s, tokens, settings, need_separator)
+            if s.operation == Op.HLIL_BREAK and s.expr_index in self.break_subst:
+                items, blk = self.break_subst[s.expr_index]
+                self.break_used.add(s.expr_index)
+                if need_separator:
+                    tokens.scope_separator()
+                self.emit_list(items, tokens, settings, blk)  # the code after a search loop, moved to its break
+                return True
             if (s.operation == Op.HLIL_VAR_INIT and s.dest in self.inline) or \
                     (idx in plan["new_at"] and plan["new_at"][idx][1] in self.inline):
                 return need_separator  # folded into its use (jvm-46)
@@ -2388,9 +2597,15 @@ if _HAVE_BN:
                     tokens.new_line()
                     need_separator = False
                 return need_separator
-            if s.operation == Op.HLIL_WHILE and s.as_ast and LOOP_CONDITIONS:
-                shape = self.loop_cond_shape(s)
+            if s.operation in (Op.HLIL_WHILE, Op.HLIL_FOR, Op.HLIL_DO_WHILE) and s.as_ast and LOOP_CONDITIONS:
+                shapes = plan.setdefault("loop_shapes", {})
+                if idx not in shapes:
+                    shapes[idx] = self.loop_cond_shape(s, [(j, body[j]) for j in range(idx + 1, len(body))], block)
+                shape = shapes[idx]
+                plan.setdefault("done", set())
                 if shape is not None:
+                    if shape[4]:
+                        plan["done"].update(shape[4][0])  # moved to the loop's break (search loop)
                     if need_separator is not None:
                         tokens.scope_separator()
                     self.emit_loop_cond(s, shape, tokens, settings)
@@ -2703,6 +2918,11 @@ if _HAVE_BN:
             """a block, or a single statement terminated like one"""
             if instr.operation != Op.HLIL_BLOCK and self.is_exc_plumbing(instr):
                 return
+            if instr.operation == Op.HLIL_BREAK and instr.expr_index in self.break_subst:
+                items, blk = self.break_subst[instr.expr_index]
+                self.break_used.add(instr.expr_index)
+                self.emit_list(items, tokens, settings, blk)  # the code after a search loop (jvm-54)
+                return
             self.perform_get_expr_text(instr, tokens, settings, P.TopLevelOperatorPrecedence, True)
             if instr.operation != Op.HLIL_BLOCK:
                 if self.needs_semicolon(instr):
@@ -2794,7 +3014,12 @@ if _HAVE_BN:
                     self._scoped(instr, instr.body, tokens, settings)
                     tokens.finalize_scope()
             elif o == Op.HLIL_DO_WHILE:
-                if instr.as_ast:
+                if instr.as_ast and self.infinite_loop(instr):
+                    self.kw(tokens, "while ")  # do { } while (true) is while (true) { }
+                    self._loop_cond(instr.condition, tokens, settings)
+                    self._scoped(instr, instr.body, tokens, settings)
+                    tokens.finalize_scope()
+                elif instr.as_ast:
                     self.kw(tokens, "do")
                     self._scoped(instr, instr.body, tokens, settings)
                     tokens.scope_continuation(True)
