@@ -2722,7 +2722,7 @@ if _HAVE_BN:
                 moved = self.search_loop_tail(rest_breaks, tail, after)
                 if moved is None:
                     return None
-            if any(i.operation == Op.HLIL_LABEL for x in tail if not isinstance(x, _ExcBranch) for i in _walk(x)):
+            if not self.labels_internal(tail):
                 return None  # (rest stays in the loop body: its labels keep their place)
             # every def is read once, in the condition, where it can be evaluated
             saved = dict(self.inline)
@@ -2747,6 +2747,17 @@ if _HAVE_BN:
             if moved:
                 self.break_subst[rest_breaks[0].expr_index] = ([x for _, x in after], block)
             return defs, iff, tail, rest, ([j for j, _ in after], rest_breaks[0].expr_index) if moved else None
+
+        def labels_internal(self, items):
+            """every label in items is only jumped to from items (they can move as a whole, e.g. out of a loop)"""
+            labels, gotos = set(), {}
+            for x in items:
+                for i in _walk(x.instr if isinstance(x, _ExcBranch) else x):
+                    if i.operation == Op.HLIL_LABEL:
+                        labels.add(i.target.label_id)
+                    elif i.operation == Op.HLIL_GOTO:
+                        gotos[i.target.label_id] = gotos.get(i.target.label_id, 0) + 1
+            return all(gotos.get(lid, 0) == self.label_uses(lid) for lid in labels)
 
         def search_loop_tail(self, breaks, tail, after):
             """the code after a loop can be printed at its single break instead (Vineflower's MergeHelper):
