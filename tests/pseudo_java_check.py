@@ -106,6 +106,26 @@ check("var name", pj.java_var_name("com/is_teledata/mdg/MDGAttributeDefinition.L
 check("int lit", [pj.java_int_literal(0xffffffff, 4), pj.java_int_literal(0x7fffffff, 4), pj.java_int_literal(5, 8)],
       ["-1", "0x7fffffff", "5L"])
 check("register under stub", pj.register(), None)
+# field initialisers (jvm-52): common prefix of the constructors, declaration order, delegating ctors skipped
+fields = [("a", False), ("b", False), ("c", False), ("K", True), ("L", True)]
+inits, ctors, clinit = pj.hoist_field_initializers(
+    "Foo", fields,
+    [["this.a = new Hashtable();", "this.b = 5;", "this.c = arg1;", "f();"],
+     ["super(x);", "this.a = new Hashtable();", "this.b = 5;", "this.c = 0;"],
+     ["this(1);", "g();"]],
+    ["Foo.K = \"\";", "Foo.L = Level.DEBUG;", "h();"])
+check("hoist inits", inits, {"a": "new Hashtable()", "b": "5", "K": '""', "L": "Level.DEBUG"})
+check("hoist ctors", ctors, [["this.c = arg1;", "f();"], ["super(x);", "this.c = 0;"], ["this(1);", "g();"]])
+check("hoist clinit", clinit, ["h();"])
+inits, ctors, _ = pj.hoist_field_initializers("Foo", fields, [["this.b = 1;", "this.a = 2;"]])
+check("hoist order", (inits, ctors), ({"b": "1"}, [["this.a = 2;"]]))
+inits, ctors, _ = pj.hoist_field_initializers("Foo", fields, [["this.a = arg1.x();"]])
+check("hoist not simple", inits, {})
+check("constant literals", [pj.constant_literal("int", 0xffffffff, "I"), pj.constant_literal("int", 1, "Z"),
+                            pj.constant_literal("int", 65, "C"), pj.constant_literal("long", (1 << 64) - 2, "J"),
+                            pj.constant_literal("float", 1.5, "F"), pj.constant_literal("double", float("inf"), "D"),
+                            pj.constant_literal("string", 'a"b', "Ljava/lang/String;")],
+      ["-1", "true", "'A'", "-2L", "1.5f", "Double.POSITIVE_INFINITY", '"a\\"b"'])
 
 if failures:
     print("\n".join(failures))

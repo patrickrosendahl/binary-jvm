@@ -853,6 +853,23 @@ class JVMClassReader():
 # class names are dotted (java.lang.String); descriptors and member names are raw (<init>, (I)V).
 CLASS_METADATA_KEY = "jvm.class"
 
+def field_constant(cls, f):
+    """the field's ConstantValue attribute as a Java literal (static final constants), or None"""
+    try:
+        attr = find_attribute(f.attributes, "ConstantValue")
+        if attr is None:
+            return None
+        entry = cls.classReader.constantPool.get(attr.constantvalue_index)
+        kind = {"JVMIntegerInfo": "int", "JVMLongInfo": "long", "JVMFloatInfo": "float",
+                "JVMDoubleInfo": "double", "JVMStringReference": "string"}.get(type(entry).__name__)
+        if kind is None:
+            return None
+        value = str(entry.poolContent.get(entry.index)) if kind == "string" else entry.value
+        from .pseudo_java import constant_literal
+        return constant_literal(kind, value, f.descriptor)
+    except Exception:
+        return None
+
 def class_metadata(cls):
     """{name, super, interfaces, access_flags, signature, source_file, inner_classes, fields, methods}"""
     def d(name):
@@ -867,7 +884,8 @@ def class_metadata(cls):
         "inner_classes": [{"inner": d(e["inner"]), "outer": d(e["outer"]), "name": e["name"] or "",
                            "access_flags": e["access_flags"]} for e in cls.inner_classes()],
         "fields": [{"name": f.name, "descriptor": f.descriptor, "access_flags": f.access_flags,
-                    "signature": f.generic_signature() or ""} for f in cls.fields],
+                    "signature": f.generic_signature() or "", "constant": field_constant(cls, f) or ""}
+                   for f in cls.fields],
         "methods": [{"name": m.name, "descriptor": m.descriptor, "access_flags": m.access_flags,
                      "address": method_address(m.index) if m.code_attribute is not None else 0,
                      "signature": m.generic_signature() or ""} for m in cls.methods],

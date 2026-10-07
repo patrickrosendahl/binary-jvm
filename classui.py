@@ -15,6 +15,10 @@ try:
     from .pseudo_java import render_body  # body only: the skeleton prints the header and braces itself
 except ImportError:
     render_body = None
+try:
+    from .pseudo_java import hoist_field_initializers
+except ImportError:
+    hoist_field_initializers = None
 
 INDENT = "    "
 
@@ -113,13 +117,45 @@ def render_class(bv):
             out.append(INDENT + "// inner class %s" % e["inner"])
     if info["fields"]:
         out.append("")
+    funcs = {id(m): (bv.get_function_at(m["address"]) if m["address"] else None) for m in info["methods"]}
+    bodies = {id(m): method_body(funcs[id(m)]) for m in info["methods"] if funcs[id(m)] is not None}
+    inits = {}
+    if hoist_field_initializers is not None and render_body is not None:
+        # field initialisers back on the fields (jvm-52); an emptied static {} / default constructor goes away
+        ctors = [m for m in info["methods"] if m["name"] == "<init>" and id(m) in bodies]
+        clinit = [m for m in info["methods"] if m["name"] == "<clinit>" and id(m) in bodies]
+        try:
+            inits, new_ctors, new_clinit = hoist_field_initializers(
+                simple_name(info["name"].replace(".", "/")).rsplit("$", 1)[-1],
+                [(f["name"], bool(f["access_flags"] & ACC_STATIC)) for f in info["fields"]],
+                [bodies[id(m)] for m in ctors], bodies[id(clinit[0])] if clinit else None)
+            for m, b in zip(ctors, new_ctors):
+                bodies[id(m)] = b
+            if clinit:
+                bodies[id(clinit[0])] = new_clinit
+        except Exception:
+            inits = {}
+    hidden = set()
+    if inits:
+        access = 0x0001 | 0x0002 | 0x0004  # public / private / protected: Java's default constructor has the class's
+        for m in info["methods"]:
+            if id(m) in bodies and not any(l.strip() for l in bodies[id(m)]) and \
+                    (m["name"] == "<clinit>" or (m["name"] == "<init>" and m["descriptor"] == "()V" and
+                     m["access_flags"] & access == flags & access and
+                     sum(1 for x in info["methods"] if x["name"] == "<init>") == 1)):
+                hidden.add(id(m))
     for f in info["fields"]:
         if f["signature"]:
             out.append(INDENT + "// generic signature: %s" % f["signature"])
         words = modifiers(f["access_flags"], "field") + [java_type_name(f["descriptor"], short=True), f["name"]]
-        out.append(INDENT + " ".join(words) + ";" + ("  // synthetic" if f["access_flags"] & ACC_SYNTHETIC else ""))
+        value = inits.get(f["name"]) or f.get("constant")  # hoisted initialiser / ConstantValue attribute
+        init = " = " + value if value else ""
+        out.append(INDENT + " ".join(words) + init + ";" +
+                   ("  // synthetic" if f["access_flags"] & ACC_SYNTHETIC else ""))
     for m in info["methods"]:
-        func = bv.get_function_at(m["address"]) if m["address"] else None
+        if id(m) in hidden:
+            continue
+        func = funcs[id(m)]
         out.append("")
         if m["signature"]:
             out.append(INDENT + "// generic signature: %s" % m["signature"])
@@ -128,7 +164,7 @@ def render_class(bv):
             out.append(INDENT + head + ";")
             continue
         out.append(INDENT + head + " {  // %s @ 0x%x" % (func.name, func.start))
-        out += [INDENT * 2 + line for line in method_body(func)]
+        out += [INDENT * 2 + line for line in bodies[id(m)]]
         out.append(INDENT + "}")
     out.append("}")
     return out

@@ -227,6 +227,31 @@ def java_string_literal(s, quote='"'):
     return quote + "".join(out) + quote
 
 
+def constant_literal(kind, value, descriptor):
+    """a ConstantValue attribute as a Java literal: kind 'int' / 'long' (unsigned as read from the class
+    file), 'float' / 'double', 'string' (the text); descriptor picks boolean / char for 'int'"""
+    import math
+    if kind == "int":
+        v = value - (1 << 32) if value >= 1 << 31 else value
+        if descriptor == "Z":
+            return "true" if v else "false"
+        if descriptor == "C":
+            return java_string_literal(chr(v & 0xffff), "'")
+        return str(v)
+    if kind == "long":
+        return str(value - (1 << 64) if value >= 1 << 63 else value) + "L"
+    if kind in ("float", "double"):
+        box = "Float" if kind == "float" else "Double"
+        if math.isnan(value):
+            return box + ".NaN"
+        if math.isinf(value):
+            return box + (".POSITIVE_INFINITY" if value > 0 else ".NEGATIVE_INFINITY")
+        return repr(float(value)) + ("f" if kind == "float" else "")
+    if kind == "string":
+        return java_string_literal(value)
+    return None
+
+
 def concat_recipe_parts(recipe, args, constants=()):
     """invokedynamic makeConcatWithConstants: recipe '\\x01 = \\x01' with args [a, b] ->
     [('arg', a), ('lit', ' = '), ('arg', b)]; \\x02 takes the next bootstrap constant."""
@@ -342,6 +367,81 @@ def try_runs(stmt_pcs, groups, active=()):
             break  # one run per group: a try range is one region
         # (a second run of the same group would duplicate the catch clause)
     return sorted(runs, key=lambda r: r[0])
+
+
+_LIT = r'(?:-?\d+(?:\.\d+)?[LlFfDd]?|"(?:\\.|[^"\\])*"|' + r"'(?:\\.|[^'\\])+'|true|false|null|-?0x[0-9a-fA-F]+L?)"
+_SIMPLE_INIT = __import__("re").compile(
+    r'^(?:%s|new [\w.$]+\((?:%s(?:, %s)*)?\)|new [\w.$]+\[\d+\]|[A-Z][\w$]*(?:\.[\w$]+)+'
+    r'|[A-Z][\w$]*\.[\w$]+\((?:%s(?:, %s)*)?\)|[\w.$]+\.class)$' % (_LIT, _LIT, _LIT, _LIT, _LIT))
+
+
+def hoist_field_initializers(owner, fields, ctors, clinit=None):
+    """Field initialisers back on their fields (jvm-52, after Vineflower's InitializerProcessor).
+
+    owner: the class's simple name; fields: [(name, is_static)] in declaration order; ctors: the body lines
+    of every constructor; clinit: the body lines of `static {}` or None. A leading run of
+    `this.f = <simple>;` lines (after an optional `super(...);`) that is the same in every constructor not
+    delegating to `this(...)`, and a leading run of `Owner.f = <simple>;` in static {}, move to the fields --
+    in declaration order only, so the evaluation order stays the same. <simple> is a literal, `new X(literals)`,
+    `new T[n]`, a static field or a static call with literal arguments.
+    Returns (initialiser per field name, new constructor bodies, new clinit body)."""
+    import re
+    order = {n: i for i, (n, _) in enumerate(fields)}
+    static = {n for n, st in fields if st}
+    inits = {}
+
+    def lead(body):
+        i = 0
+        while i < len(body) and not body[i].strip():
+            i += 1
+        if i < len(body) and re.match(r"^\s*super\(.*\);\s*$", body[i]):
+            i += 1
+        return i
+
+    def take(bodies, pattern, want_static):
+        starts = [lead(b) for b in bodies]
+        taken, last = [], -1
+        while True:
+            lines = []
+            for b, st in zip(bodies, starts):
+                k = st + len(taken)
+                while k < len(b) and not b[k].strip():
+                    k += 1
+                lines.append(b[k].strip() if k < len(b) else None)
+            if not lines or lines[0] is None or any(l != lines[0] for l in lines):
+                break
+            m = re.match(pattern, lines[0])
+            if not m or m.group(1) not in order or (m.group(1) in static) != want_static or \
+                    m.group(1) in inits or order[m.group(1)] <= last or not _SIMPLE_INIT.match(m.group(2)):
+                break
+            inits[m.group(1)] = m.group(2)
+            last = order[m.group(1)]
+            taken.append(lines[0])
+        out = []
+        for b, st in zip(bodies, starts):
+            rest, n = list(b[:st]), len(taken)
+            for l in b[st:]:
+                if n and l.strip():
+                    if l.strip() == taken[len(taken) - n]:
+                        n -= 1
+                        continue
+                if n and not l.strip():
+                    continue
+                rest.append(l)
+            while rest and not rest[0].strip():
+                rest.pop(0)
+            out.append(rest)
+        return out
+
+    plain = [i for i, b in enumerate(ctors) if not any(re.match(r"^\s*this\(.*\);\s*$", l) for l in b[:lead(b) + 1])]
+    new_ctors = list(ctors)
+    if plain:
+        for i, b in zip(plain, take([ctors[i] for i in plain], r"^this\.([\w$]+) = (.+);$", False)):
+            new_ctors[i] = b
+    new_clinit = clinit
+    if clinit is not None:
+        new_clinit = take([clinit], r"^%s\.([\w$]+) = (.+);$" % re.escape(owner), True)[0]
+    return inits, new_ctors, new_clinit
 
 
 # ---------------------------------------------------------------------------------------------------
