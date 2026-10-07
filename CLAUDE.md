@@ -82,6 +82,9 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
  extra statements against Vineflower come from); and `tests/bn_pseudo_java_compare_all.sh [jvm_devN]` (~18-25 min):
  every mdg method with an exception table against HLIL -- must stay 251/251. Run these one at a time: the
  dump next to compare_all slows both into their timeouts.
+ **Class view gate** (after a `classui.py` / class metadata change): `bnrun --timeout 900 tests/bn_class_view_dump.py`
+ (~2 min; `DEV_PKG` as above), then `python3 tests/class_view_compare.py --max imports=2 headers=0 fields=0 override=0 head=0 throws=0 missing=0`
+ (declarations against Vineflower; the 2 imports are types Vineflower names for locals we fold away).
 3. bnrun has two lanes: serialized (default; UI work and global registration like `bn_dev_load.py`)
    and `--parallel` (scripts on their own views, up to 4 at once, no lock). Always pass **`--timeout N`**; a running script can be stopped
    with `bnrun --cancel` (or Ctrl-C on the client), `bnrun --status` shows what is running.
