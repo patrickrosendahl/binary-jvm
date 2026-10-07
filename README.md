@@ -13,7 +13,7 @@ This is a **Python 3 port** of [`Pusty/BinaryNinjaPlugins` → `binary-jvm`](htt
 
 > **▶ Resumed (2026-10-06).** The pause (jvm-28) was lifted to build Java-level output: operand
 > stack as registers (jvm-33), typed signatures + names (jvm-35), compare fusion (jvm-32), exception
-> edges inside methods (jvm-42), a Pseudo-Java language representation (jvm-43/44) and a class view
+> edges inside methods (jvm-42), a Pseudo Java language representation (jvm-43/44) and a class view
 > (jvm-41). The plugin is **installed** again (symlink + `files.container.excludedTransforms = ["Universal"]`).
 
 **Python 3 port done; lifter rewritten — every JVM opcode lifts to LLIL.** Tested live in

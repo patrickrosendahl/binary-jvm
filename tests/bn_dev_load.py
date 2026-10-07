@@ -3,7 +3,7 @@
 # and imports it, so the lifter can be iterated without restarting Binary Ninja (BN can't unregister an
 # architecture or view type). Dev views are never offered for auto-detection (the GUI's view list only shows
 # the installed "JVM Class Format"); create them explicitly with BinaryViewType[VIEW_NAME].create(...). Their
-# long name is "JVM Class Format (devN)". The Pseudo-Java language follows ARCH_NAME.
+# long name is "JVM Class Format (devN)". The Pseudo Java language follows ARCH_NAME.
 import importlib.util, os, shutil, sys
 import binaryninja as _bn
 
@@ -36,7 +36,7 @@ _view.is_valid_for_data = classmethod(lambda cls, data: False)  # explicit creat
 _dev["views"].append(_view)
 _dev["pkg"] = _mod
 _dev["ns"] = {"VIEW_NAME": sys.modules[_name + ".constants"].VIEW_NAME, "ARCH_NAME": sys.modules[_name + ".constants"].ARCH_NAME}
-# the Pseudo-Java language name derives from ARCH_NAME ("Pseudo-Java JVM-devN"), so it is fresh per load too
+# the Pseudo Java language name derives from ARCH_NAME ("Pseudo Java JVM-devN"), so it is fresh per load too
 _pj = sys.modules.get(_name + ".pseudo_java")
 _dev["ns"]["LANGUAGE_NAME"] = getattr(_pj, "LANGUAGE_NAME", None)
 print("registered", _dev["ns"]["ARCH_NAME"], "/", _dev["ns"]["VIEW_NAME"], "/", _dev["ns"]["LANGUAGE_NAME"])

@@ -849,7 +849,7 @@ class JVMClassReader():
 
 
 # jvm-41: class metadata stored in the view under this key (bv.query_metadata(CLASS_METADATA_KEY)).
-# Contract with the Pseudo-Java printer -- keep the keys. Missing strings are "" (Metadata has no None);
+# Contract with the Pseudo Java printer -- keep the keys. Missing strings are "" (Metadata has no None);
 # class names are dotted (java.lang.String); descriptors and member names are raw (<init>, (I)V).
 CLASS_METADATA_KEY = "jvm.class"
 

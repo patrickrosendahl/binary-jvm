@@ -334,7 +334,7 @@ class ClassView(BinaryView):
             if rank < entry_rank:
                 self.entry_address, entry_rank = base, rank
             # exception handlers are part of the method (the lifter models the exception edges, jvm-42);
-            # the exception table is kept for the Pseudo-Java printer: [[start_pc, end_pc, handler_pc,
+            # the exception table is kept for the Pseudo Java printer: [[start_pc, end_pc, handler_pc,
             # catch class ("" = any)], ...], pcs relative to the method's base
             if code.exception_table:
                 func = self.get_function_at(base)

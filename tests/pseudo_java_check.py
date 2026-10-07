@@ -49,8 +49,8 @@ def check(name, got, want):
         failures.append("%s: got %r, want %r" % (name, got, want))
 
 
-check("lang JVM", pj.language_name_for("JVM"), "Pseudo-Java")
-check("lang dev", pj.language_name_for("JVM-dev3"), "Pseudo-Java JVM-dev3")
+check("lang JVM", pj.language_name_for("JVM"), "Pseudo Java")
+check("lang dev", pj.language_name_for("JVM-dev3"), "Pseudo Java JVM-dev3")
 check("class simple", pj.java_class_name("java/lang/String"), "String")
 check("class full", pj.java_class_name("java/lang/String", False), "java.lang.String")
 check("inner", pj.java_class_name("com/x/Outer$Inner"), "Outer.Inner")
@@ -78,6 +78,21 @@ table = [[0, 10, 20, "java/io/IOException"], [0, 10, 30, ""], [2, 6, 40, "java/l
 groups = pj.group_try_entries(table)
 check("groups", groups, [(0, 10, [(20, "java/io/IOException"), (30, "")]),
                          (2, 6, [(40, "java/lang/RuntimeException")])])
+# javac shapes (jvm-42 tables): try/catch/finally of PropLoader.collectProperties, incl. the jsr subroutine's own try
+check("groups catch+finally", pj.group_try_entries(
+    [[2, 162, 168, "java/lang/Exception"], [2, 165, 206, ""], [168, 203, 206, ""], [206, 211, 206, ""],
+     [220, 224, 227, "java/lang/Exception"]]),
+    [(2, 165, [(168, "java/lang/Exception"), (206, "")]), (220, 224, [(227, "java/lang/Exception")])])
+check("groups split finally", pj.group_try_entries([[0, 5, 20, ""], [8, 12, 20, ""], [20, 22, 20, ""]]),
+      [(0, 12, [(20, "")])])
+check("groups catch inside try-finally", pj.group_try_entries([[2, 6, 8, "E"], [0, 14, 20, ""], [20, 22, 20, ""]]),
+      [(0, 14, [(20, "")]), (2, 6, [(8, "E")])])
+check("groups multi-catch", pj.group_try_entries([[0, 10, 12, "A"], [0, 10, 20, "B"]]),
+      [(0, 10, [(12, "A"), (20, "B")])])
+check("groups two catches + finally", pj.group_try_entries(
+    [[0, 10, 12, "A"], [0, 10, 20, "B"], [0, 11, 30, ""], [12, 18, 30, ""], [20, 26, 30, ""], [30, 32, 30, ""]]),
+    [(0, 11, [(12, "A"), (20, "B"), (30, "")])])
+check("groups self-covering only", pj.group_try_entries([[5, 9, 12, ""], [12, 15, 12, ""]]), [(5, 9, [(12, "")])])
 # statements at pcs 0, 3, 8, 12 (outside), 20 (handler)
 pcs = [[0], [3], [8], [12], [20]]
 check("runs outer", pj.try_runs(pcs, groups), [(0, 2, groups[0])])

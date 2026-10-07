@@ -1,7 +1,7 @@
 # Run inside Binary Ninja via the script bridge, after tests/bn_dev_load.py:
 #   bnrun --parallel --timeout 300 tests/bn_pseudo_java.py   (prepend DEV_PKG = "jvm_devN", CLASSES = [...],
 #   FUNCS = [...], HLIL = False)
-# Creates the dev JVM view for a few classes and prints every method through the dev Pseudo-Java language
+# Creates the dev JVM view for a few classes and prints every method through the dev Pseudo Java language
 # (pseudo_java.render_method), optionally next to the plain HLIL.
 import os, sys, time
 import binaryninja as b
