@@ -1,5 +1,6 @@
 """Class-file parser: reads the structure into Binary Ninja types and keeps the constant pool for the lifter."""
 import ctypes
+import re
 import struct
 
 from binaryninja import Type, TypeBuilder
@@ -888,8 +889,31 @@ def class_metadata(cls):
                    for f in cls.fields],
         "methods": [{"name": m.name, "descriptor": m.descriptor, "access_flags": m.access_flags,
                      "address": method_address(m.index) if m.code_attribute is not None else 0,
-                     "signature": m.generic_signature() or ""} for m in cls.methods],
+                     "signature": m.generic_signature() or "", "exceptions": [d(e) for e in method_exceptions(m)]}
+                    for m in cls.methods],
+        "referenced": sorted(d(n) for n in referenced_classes(cls)),
     }
+
+def method_exceptions(m):
+    """binary names of the classes in a method's Exceptions attribute (its `throws` clause)"""
+    attr = find_attribute(m.attributes, "Exceptions")
+    if attr is None:
+        return []
+    return [n for n in (pool_text(m.classReader, i) for i in attr.exception_index_table) if n]
+
+def referenced_classes(cls):
+    """binary names of the classes the pool mentions: Class entries and names inside descriptors / signatures"""
+    out = set()
+    for e in cls.classReader.constantPool.poolContent:
+        if isinstance(e, JVMClassReference) and not isinstance(e, (JVMModuleReference, JVMPackageReference)):
+            name = str(e)
+            if not name.startswith("["):
+                out.add(name)
+            elif name.lstrip("[").startswith("L"):
+                out.add(name.lstrip("[")[1:-1])
+        elif isinstance(e, JVMUTF8Info):
+            out.update(re.findall(r"L([\w/$]+)[;<]", str(e)))
+    return out
 
 
 # Registry of parsed classes, keyed by the core BinaryView handle, so the lifter can resolve
