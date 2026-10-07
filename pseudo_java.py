@@ -64,6 +64,7 @@ RENAME_TEMPORARIES = True    # st0_lo_8 / r_12 / l3_lo -> names from their value
 VARARGS_CALLS = True         # m(new T[]{a, b}) -> m(a, b) when m is varargs (jvm-57)
 SPLIT_CONDITIONS = True      # T x; if (a) { x = e; } if (!a || p(x)) -> if (!a || p(e)) (jvm-54)
 TERNARIES = True             # T x; if (c) { x = a; } else { x = b; } -> T x = c ? a : b (jvm-59)
+INCREMENT_VALUES = True      # int t = f; f = t + 1; use(t) -> use(f++); int t = f + 1; f = t; use(t) -> use(++f) (jvm-60)
 # intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
 PURE_INTRINSICS = {"getfield", "arraylength", "checkcast", "instanceof", "new", "newarray", "anewarray",
                    "multianewarray", "__exception"}
@@ -1769,6 +1770,9 @@ if _HAVE_BN:
             if d.operation in (Op.HLIL_DEREF_FIELD, Op.HLIL_STRUCT_FIELD) and d.src.operation == Op.HLIL_VAR and \
                     d.src.var == var and d.size and d.offset % d.size == 0:
                 return d.offset // d.size, s.src
+            if d.operation == Op.HLIL_ARRAY_INDEX and d.src.operation == Op.HLIL_VAR and d.src.var == var and \
+                    d.index.operation == Op.HLIL_CONST:
+                return d.index.constant, s.src
             if d.operation == Op.HLIL_DEREF:
                 arr = self.array_access(d.src, d.size)
                 if arr is not None and arr[0].operation == Op.HLIL_VAR and arr[0].var == var and isinstance(arr[1], int):
@@ -1827,10 +1831,12 @@ if _HAVE_BN:
             if self.info.class_ref(cls_idx) not in STRING_BUILDERS:
                 return
             operands = []
+            evaluated_at = []  # (statement index, operand): where an operand is computed, before the concatenation's use
             idesc = init_shape[3] or ""
             if init_shape[5] and (idesc.startswith("(Ljava/lang/String;") or
                                   idesc.startswith("(Ljava/lang/CharSequence;")):
                 operands.append((init_shape[5][0], True))
+                evaluated_at.append((j, init_shape[5][0]))
             sb = var
             used = 1  # the <init> call
             appends = []
@@ -1845,6 +1851,7 @@ if _HAVE_BN:
                 if chain is not None and chain[1] is None:
                     appends.append(k)
                     operands.extend(chain[0])
+                    evaluated_at.extend((k, op[0]) for op in chain[0])
                     used += n if cur == sb else 0
                     continue
                 if s.operation == Op.HLIL_VAR_INIT and n == 1:
@@ -1853,6 +1860,7 @@ if _HAVE_BN:
                     if chain is not None and self.var_count(s.dest) == 1 and chain[0]:
                         appends.append(k)
                         operands.extend(chain[0])
+                        evaluated_at.extend((k, op[0]) for op in chain[0])
                         used += n if cur == sb else 0
                         cur = s.dest
                         continue
@@ -1877,6 +1885,8 @@ if _HAVE_BN:
             plan["skip"].add(j)
             plan["new_at"].pop(j, None)
             self._concat[e.expr_index] = operands
+            plan.setdefault("evaluated_at", []).extend(evaluated_at)
+            plan.setdefault("append_of", {}).update((a, k) for a in appends)  # append -> the concatenation's statement
 
         def append_chain(self, instr, var, top=False):
             """append(append(var, a), b) -> ([(a, is_str), (b, is_str)], None); top-level statement form when
@@ -1976,6 +1986,12 @@ if _HAVE_BN:
                             shapes[k] = self.loop_cond_shape(s, [(j, body[j]) for j in range(k + 1, hi + 1)], block)
                         except Exception:
                             shapes[k] = None
+            if FOLD_TEMPORARIES and INCREMENT_VALUES and block.as_ast:
+                for k in range(lo, hi):
+                    try:
+                        self.plan_incdec(body, k, plan)
+                    except Exception:
+                        pass
             if FOLD_TEMPORARIES and block.as_ast:
                 try:
                     self.plan_folds(body, lo, hi, run_at, plan)
@@ -2050,6 +2066,9 @@ if _HAVE_BN:
                 if self.var_count(var) - self.refs(s, var) != 1:
                     return None
                 return var, value, all(self.pure(v) for v in (s.condition, value[4], value[5]))
+            if k in plan.get("incdec", {}):
+                var, value = plan["incdec"][k]
+                return var, value, False
             if k in plan["skip"] or s.operation != Op.HLIL_VAR_INIT:
                 return None
             var = s.dest
@@ -2097,6 +2116,13 @@ if _HAVE_BN:
                     return out, True
                 value = self.inline.get(e.var)
                 if value is not None:
+                    if isinstance(value, tuple) and value[0] == 'incdec':
+                        r = self.eval_nodes(value[1], stop_var, out)
+                        if r[1] is not False:
+                            return r
+                        out.append(value[4])  # the store
+                        out.append(e)
+                        return out, False
                     if isinstance(value, tuple) and value[0] == 'ternary':
                         # the condition, then one of the values: a read in them is only evaluated sometimes
                         r = self.eval_nodes(value[2].condition, stop_var, out)
@@ -2192,10 +2218,19 @@ if _HAVE_BN:
             if c is None or body[k].expr_index in site_stmts:
                 return
             var, value, value_pure = c
+            store = value[5] if isinstance(value, tuple) and value[0] == 'incdec' else None
+            # appends of a concatenation in the use itself: their operands are checked in its evaluation order
+            appends, append_of = [], plan.get("append_of", {})
             j = k + 1
-            while j <= hi and j not in run_at and j not in inside_runs and self.fold_transparent(body, j, plan):
-                j += 1
-            if j > hi or j in run_at or j in inside_runs:
+            while j <= hi and j not in run_at and j not in inside_runs:
+                if j == store or self.fold_transparent(body, j, plan):
+                    j += 1
+                elif j in append_of:
+                    appends.append(j)
+                    j += 1
+                else:
+                    break
+            if j > hi or j in run_at or j in inside_runs or any(append_of[a] != j for a in appends):
                 return
             u = body[j]
             if isinstance(value, tuple) and value[0] == 'ternary' and j in plan.get("ternary", {}):
@@ -2212,14 +2247,71 @@ if _HAVE_BN:
             before, found = self.eval_nodes(u, var)
             if found is not True:
                 return
+            # concatenation operands appended before body[k] are computed before it, not at their use
+            earlier = {i.expr_index for at, op in plan.get("evaluated_at", ()) if at < k for i in _walk(op)}
+            before = [i for i in before if i.expr_index not in earlier]
             if any(self.side_effect(i) for i in before):
                 return
             if not value_pure and any(self.reads_memory(i) for i in before):
                 return
             self.inline[var] = value
             folded.add(k)
+            if store is not None:
+                folded.add(store)
+
+        def plan_incdec(self, body, k, plan):
+            """`int t = f; f = t + 1; use(t)` (post) / `int t = f + 1; f = t; use(t)` (pre), f a local, static or
+            instance field: plan["incdec"][k] = (t, ('incdec', load of f, "+" / "-", pre, store, store index));
+            plan_fold folds it into the use as f++ / ++f, the store with it"""
+            s, st = body[k], body[k + 1]
+            if isinstance(s, _ExcBranch) or isinstance(st, _ExcBranch) or s.operation != Op.HLIL_VAR_INIT or \
+                    k in plan["skip"] or k + 1 in plan["skip"]:
+                return
+            t = s.dest
+            if self.def_count(t) != 1 or self.var_count(t) != 2 or self.is_exc_var(t) or t in self.hoisted or \
+                    t == self.this_var:
+                return
+            if st.operation == Op.HLIL_ASSIGN:
+                dest, val = st.dest, st.src
+                same = lambda e: self.same_lvalue(dest, e)
+            elif st.operation == Op.HLIL_INTRINSIC and st.intrinsic.name == "putfield" and len(st.params) == 3:
+                obj, fld, val = st.params
+                same = lambda e: self.same_field(obj, fld, e)
+            else:
+                return
+            is_t = lambda e: e.operation == Op.HLIL_VAR and e.var == t
+            step = self.unit_step(val, is_t)
+            if step is not None and same(s.src):
+                load, pre = s.src, False
+            else:
+                step = self.unit_step(s.src, same)
+                if step is None or not is_t(val):
+                    return
+                load, pre = s.src.left, True
+            plan.setdefault("incdec", {})[k] = (t, ('incdec', load, step, pre, st, k + 1))
+
+        @staticmethod
+        def unit_step(e, is_base):
+            """"+" / "-" when e is `base + 1` / `base - 1` (also `base + -1`) and is_base(base), else None"""
+            if e.operation not in (Op.HLIL_ADD, Op.HLIL_SUB) or e.right.operation != Op.HLIL_CONST or \
+                    not is_base(e.left) or e.right.size not in (1, 2, 4, 8):
+                return None
+            c = e.right.constant & ((1 << (8 * e.right.size)) - 1)
+            if c >= 1 << (8 * e.right.size - 1):
+                c -= 1 << (8 * e.right.size)
+            if c not in (1, -1):
+                return None
+            return "+" if (c == 1) == (e.operation == Op.HLIL_ADD) else "-"
 
         def emit_inlined(self, value, tokens, settings, precedence):
+            if isinstance(value, tuple) and value[0] == 'incdec':
+                _, load, step, pre, _, _ = value
+                if pre:
+                    self.op(tokens, step * 2)
+                self.perform_get_expr_text(load, tokens, settings, P.UnaryOperatorPrecedence)
+                if not pre:
+                    self.op(tokens, step * 2)
+                return
             if isinstance(value, tuple) and value[0] == 'ternary':
                 self.emit_ternary(value, None, tokens, settings, precedence)
                 return

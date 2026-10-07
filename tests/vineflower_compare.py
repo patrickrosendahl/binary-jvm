@@ -52,7 +52,8 @@ CALL_IGNORE = {"append", "toString", "valueOf", "intValue", "longValue", "boolea
                "floatValue", "shortValue", "byteValue", "charValue", "makeConcatWithConstants", "super", "this",
                "if", "while", "for", "switch", "catch", "synchronized", "return", "new", "throw"}
 COUNTERS = {
-    "temps": re.compile(r"\b(st\d+_lo(_\d+)?|st\d+_\d+|r_\d+|r64_\d+|r64|r)\b"),
+    # stack temporaries, and copies of a static field that BN named Class_field_N (jvm-60)
+    "temps": re.compile(r"\b(st\d+_lo(_\d+)?|st\d+_\d+|r_\d+|r64_\d+|r64|r|[A-Z][A-Za-z0-9$]*_[\w$]+_\d+)\b"),
     "gotos": re.compile(r"\bgoto\b"),
     "labels": re.compile(r"^\s*label_\w+:"),
     "sync_comments": re.compile(r"//\s*\}?\s*synchronized"),
