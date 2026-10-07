@@ -54,6 +54,10 @@ from .constants import (ARCH_NAME, VIEW_NAME, PSEUDOMEMORY_TABLE, PSEUDOMEMORY_P
 # configuration
 # ---------------------------------------------------------------------------------------------------
 HIDE_BOXING = True          # Integer.valueOf(x) / x.intValue() -> x
+FOLD_TEMPORARIES = True      # print a single-use operand-stack temporary inside its use (jvm-46)
+# intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
+PURE_INTRINSICS = {"getfield", "arraylength", "checkcast", "instanceof", "new", "newarray", "anewarray",
+                   "multianewarray", "__exception"}
 QUALIFY_OWN_STATICS = False  # print `m(x)` instead of `ThisClass.m(x)` for static calls into the own class
 SIMPLE_CLASS_NAMES = True    # java.lang.String -> String
 
@@ -679,6 +683,8 @@ if _HAVE_BN:
                 ends = [e for s, e, hh, _ in self.table if hh == h and s >= h]
                 self.monitor_windows.append((h, (max(ends) if ends else h + 4) + 3))
             self._in_finally = False
+            self.inline = {}        # folded single-use temporary -> its value (expr, or ('new', entry)) (jvm-46)
+            self._def_counts = None
             self.deferred = set()           # expr_index of handler code met in a try body, printed by its catch
             self.printed_handlers = set()   # handler pcs whose catch/finally clause was printed
             self.var_subst = {}     # subroutine parameter -> caller expression (jsr finally bodies, jvm-51)
@@ -795,7 +801,17 @@ if _HAVE_BN:
 
         def is_type_test(self, e):
             return e.operation == Op.HLIL_INTRINSIC and e.intrinsic.name in ("instanceof", "__instanceof") and \
-                e.params and self.is_exc_value(e.params[0]) and self.mentions_exc(e.params[0])
+                e.params and self.is_exc_value(e.params[0]) and self.mentions_exc(e.params[0]) and \
+                not self.user_instanceof(e)
+
+        def user_instanceof(self, e):
+            """an instanceof the method's code does itself (`if (e instanceof T)` in a catch body, on the caught
+            exception BN propagated into exc): its address holds the instanceof opcode -- the lifter's handler
+            dispatch tests sit on the throwing instruction"""
+            try:
+                return self.function.view.read(e.address, 1) == b"\xc1"
+            except Exception:
+                return False
 
         def type_temps(self):
             """variables BN parks a handler's type test in: `temp0 = instanceof(exc, T)`"""
@@ -913,8 +929,7 @@ if _HAVE_BN:
                 ne = c.operation == Op.HLIL_CMP_NE
                 if self.is_exc_value(left) and self.mentions_exc(left):
                     kind, exc_true = 'exc', ne
-                elif left.operation == Op.HLIL_INTRINSIC and left.intrinsic.name in ("instanceof", "__instanceof") \
-                        and left.params and self.is_exc_value(left.params[0]) and self.mentions_exc(left.params[0]):
+                elif self.is_type_test(left):
                     kind, exc_true = 'type', not ne  # instanceof(...) == 0: true branch = other types
                 else:
                     return None
@@ -922,8 +937,7 @@ if _HAVE_BN:
                 kind, exc_true = 'exc', True
             elif c.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and c.var in self.type_temps():
                 kind, exc_true = 'type', False
-            elif c.operation == Op.HLIL_INTRINSIC and c.intrinsic.name in ("instanceof", "__instanceof") and \
-                    c.params and self.is_exc_value(c.params[0]) and self.mentions_exc(c.params[0]):
+            elif self.is_type_test(c):
                 kind, exc_true = 'type', False
             else:
                 return None
@@ -1398,6 +1412,7 @@ if _HAVE_BN:
                 self.exc_names = []
                 self.hidden_gotos = {}
                 self._follow = []
+                self.inline = {}
                 self.deferred = set()
                 self.printed_handlers = set()
             self.emit_list(self.flatten(list(instr.body)), tokens, settings, instr, is_root)
@@ -1431,6 +1446,11 @@ if _HAVE_BN:
             for r in runs:
                 self.placed.add((r[2][0], r[2][1]))
                 self.placed_handlers.update(h for h, _ in r[2][2])
+            if FOLD_TEMPORARIES and block.as_ast:
+                try:
+                    self.plan_folds(body, lo, hi, run_at, plan)
+                except Exception:
+                    pass
             need_separator = None  # None: nothing emitted yet in this range
             idx = lo
             while idx <= hi:
@@ -1445,12 +1465,200 @@ if _HAVE_BN:
                     idx = last + 1
                     need_separator = True
                     continue
+                if idx in plan.setdefault("folded", set()):
+                    idx += 1
+                    continue
                 try:
                     need_separator = self.emit_statement(body, idx, plan, tokens, settings, block, need_separator)
                 except Exception as ex:
                     self.emit_error(body[idx], ex, tokens)
                     need_separator = True
                 idx += 1
+
+        # --- folding single-use temporaries (jvm-46) -------------------------------------------------
+        def def_count(self, var):
+            if self._def_counts is None:
+                counts = {}
+                try:
+                    for i in _walk(self.hlil.root):
+                        if i.operation == Op.HLIL_VAR_INIT:
+                            counts[i.dest] = counts.get(i.dest, 0) + 1
+                        elif i.operation == Op.HLIL_VAR_DECLARE:
+                            counts[i.var] = counts.get(i.var, 0) + 2  # declared apart: assigned elsewhere
+                except Exception:
+                    pass
+                self._def_counts = counts
+            return self._def_counts.get(var, 0)
+
+        def fold_candidate(self, body, k, plan):
+            """(var, value, value is free of side effects) when body[k] defines a temporary that is read once"""
+            s = body[k]
+            if isinstance(s, _ExcBranch):
+                return None
+            if k in plan["new_at"]:
+                s0, var = plan["new_at"][k][0], plan["new_at"][k][1]
+                if s0.operation != Op.HLIL_VAR_INIT or self.var_count(var) != 2 or self.def_count(var) != 1:
+                    return None
+                return var, ('new', plan["new_at"][k]), False
+            if k in plan["skip"] or s.operation != Op.HLIL_VAR_INIT:
+                return None
+            var = s.dest
+            if self.var_count(var) != 1 or self.def_count(var) != 1 or self.is_exc_var(var) or \
+                    var == self.this_var or var in self.hoisted or self.is_exc_value(s.src) or \
+                    self.mentions_exc(s.src):
+                return None
+            return var, s.src, self.pure(s.src)
+
+        def pure(self, e):
+            """no side effects (calls, stores, allocation with a constructor) when evaluated"""
+            for i in self.eval_nodes(e)[0]:
+                if self.side_effect(i):
+                    return False
+            return True
+
+        def side_effect(self, i):
+            o = i.operation
+            if o in (Op.HLIL_CALL, Op.HLIL_TAILCALL, Op.HLIL_ASSIGN, Op.HLIL_VAR_INIT, Op.HLIL_ASSIGN_UNPACK):
+                return i.expr_index not in self._concat or o != Op.HLIL_CALL
+            if o == Op.HLIL_INTRINSIC:
+                return i.intrinsic.name not in PURE_INTRINSICS
+            return False
+
+        @staticmethod
+        def reads_memory(i):
+            o = i.operation
+            if o in (Op.HLIL_DEREF, Op.HLIL_DEREF_FIELD, Op.HLIL_ARRAY_INDEX):
+                return True
+            return o == Op.HLIL_INTRINSIC and i.intrinsic.name in ("getfield", "arraylength")
+
+        def eval_nodes(self, e, stop_var=None, out=None):
+            """the nodes of e in Java evaluation order (operands before the operation); folded temporaries are
+            expanded to their values, a concatenation to its operands. With stop_var: stops at its read and
+            returns (nodes before it, True); a read in a conditionally evaluated operand returns (.., None)"""
+            if out is None:
+                out = []
+            o = e.operation
+            if o in (Op.HLIL_VAR, Op.HLIL_VAR_SSA):
+                if stop_var is not None and e.var == stop_var:
+                    return out, True
+                value = self.inline.get(e.var)
+                if value is not None:
+                    if isinstance(value, tuple):  # ('new', entry): the constructor arguments
+                        for a in value[1][3][5]:
+                            r = self.eval_nodes(a, stop_var, out)
+                            if r[1] is not False:
+                                return r
+                        out.append(e)
+                        return out, False
+                    return self.eval_nodes(value, stop_var, out)
+                out.append(e)
+                return out, False
+            if o in (Op.HLIL_CALL, Op.HLIL_INTRINSIC) and e.expr_index in self._concat:
+                kids = [op[0] for op in self._concat[e.expr_index] if not isinstance(op[0], str)]
+            elif o in (Op.HLIL_AND, Op.HLIL_OR) and e.size == 0:
+                r = self.eval_nodes(e.left, stop_var, out)
+                if r[1] is not False:
+                    return r
+                if stop_var is not None and any(i.operation == Op.HLIL_VAR and i.var == stop_var
+                                                for i in _walk(e.right)):
+                    return out, None  # only evaluated sometimes
+                kids = [e.right]
+            elif o == Op.HLIL_ASSIGN:
+                d = e.dest
+                kids = ([] if d.operation == Op.HLIL_VAR else list(_children(d))) + [e.src]
+            elif o == Op.HLIL_VAR_INIT:
+                kids = [e.src]
+            elif o in (Op.HLIL_IF, Op.HLIL_SWITCH):
+                kids = [e.condition]
+            elif o in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE, Op.HLIL_FOR, Op.HLIL_BLOCK):
+                if stop_var is not None:
+                    return out, None
+                kids = []
+            else:
+                kids = list(_children(e))
+            for c in kids:
+                r = self.eval_nodes(c, stop_var, out)
+                if r[1] is not False:
+                    return r
+            out.append(e)
+            return out, False
+
+        def fold_transparent(self, body, k, plan):
+            """body[k] is not printed between a definition and its use, and has no effect that matters"""
+            s = body[k]
+            if k in plan.get("folded", ()):
+                return True  # its value moved into the use
+            if isinstance(s, _ExcBranch):
+                if s.branch.expr_index in self.consumed:
+                    return True
+                cls = self.branch_class(s.branch, s.address - self.function.start)
+                return cls[0] in ('hide', 'rethrow') or (cls[0] == 'handler' and cls[1] in self.placed_handlers)
+            if s.expr_index in self.consumed and s.expr_index not in plan.get("own", ()):
+                return True
+            if self.is_exc_plumbing(s) or self.in_monitor_code(s) or s.operation == Op.HLIL_NOP:
+                return True
+            if k in plan["skip"]:
+                if self.new_assignment(s) is not None:
+                    return True
+                # a StringBuilder append of a concatenation printed later: only pure operands
+                return all(not self.side_effect(i) or (self.call_shape(i) or (0, 0, ""))[2] in ("append", "<init>")
+                           for i in _walk(s) if i.operation != Op.HLIL_VAR_INIT)
+            return False
+
+        def plan_folds(self, body, lo, hi, run_at, plan):
+            folded = plan.setdefault("folded", set())
+            inside_runs = set()
+            for first, last, _ in run_at.values():
+                inside_runs.update(range(first, last + 1))
+            site_stmts = {self.stmts_of(blk)[i].expr_index for blk, i, whole in self.sites().values()
+                          if not whole and i < len(self.stmts_of(blk))}
+            for k in range(hi, lo - 1, -1):
+                if k in inside_runs or k in folded:
+                    continue
+                try:
+                    self.plan_fold(body, k, hi, run_at, inside_runs, site_stmts, plan, folded)
+                except Exception:
+                    pass  # this statement stays as it is
+
+        def plan_fold(self, body, k, hi, run_at, inside_runs, site_stmts, plan, folded):
+            """fold body[k] into the next printed statement when that is safe (see plan_folds)"""
+            c = self.fold_candidate(body, k, plan)
+            if c is None or body[k].expr_index in site_stmts:
+                return
+            var, value, value_pure = c
+            j = k + 1
+            while j <= hi and j not in run_at and j not in inside_runs and self.fold_transparent(body, j, plan):
+                j += 1
+            if j > hi or j in run_at or j in inside_runs:
+                return
+            u = body[j]
+            if isinstance(u, _ExcBranch) or u.operation in (Op.HLIL_LABEL, Op.HLIL_GOTO, Op.HLIL_WHILE,
+                                                           Op.HLIL_DO_WHILE, Op.HLIL_FOR) or \
+                    u.expr_index in site_stmts or self.is_exc_plumbing(u) or \
+                    (j in plan["skip"]) or self.jsr_target(u) is not None or \
+                    (u.expr_index in self.consumed and u.expr_index not in plan.get("own", ())):
+                return
+            uses = sum(1 for i in self.eval_nodes(u)[0] if i.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and i.var == var)
+            if uses != 1:  # (a concatenation's operands count: their HLIL sits in skipped append statements)
+                return
+            before, found = self.eval_nodes(u, var)
+            if found is not True:
+                return
+            if any(self.side_effect(i) for i in before):
+                return
+            if not value_pure and any(self.reads_memory(i) for i in before):
+                return
+            self.inline[var] = value
+            folded.add(k)
+
+        def emit_inlined(self, value, tokens, settings, precedence):
+            if isinstance(value, tuple):
+                s, var, cls_idx, shape = value[1]
+                self.kw(tokens, "new ")
+                self.type_tok(tokens, java_class_name(self.info.class_ref(cls_idx) or "?"))
+                self.typed_args(tokens, settings, shape[5], shape[3])
+                return
+            self.perform_get_expr_text(value, tokens, settings, precedence)
 
         def emit_error(self, s, ex, tokens):
             """never lose a statement: if rendering fails, print its HLIL as a comment"""
@@ -1485,6 +1693,9 @@ if _HAVE_BN:
                     return need_separator
             if isinstance(s, _ExcBranch):
                 return self.emit_exc_branch(s, tokens, settings, need_separator)
+            if (s.operation == Op.HLIL_VAR_INIT and s.dest in self.inline) or \
+                    (idx in plan["new_at"] and plan["new_at"][idx][1] in self.inline):
+                return need_separator  # folded into its use (jvm-46)
             if self.is_exc_plumbing(s) or self.in_monitor_code(s):
                 return need_separator
             if s.operation == Op.HLIL_GOTO:
@@ -2070,6 +2281,8 @@ if _HAVE_BN:
             elif o == Op.HLIL_CONST_DATA:
                 data, _ = instr.constant_data.data_and_builtin
                 tokens.append(_tok(TT.StringToken, java_string_literal(bytes(data).decode("latin-1"))))
+            elif o == Op.HLIL_VAR and self.inline and instr.var in self.inline:
+                self.emit_inlined(self.inline[instr.var], tokens, settings, precedence)
             elif o == Op.HLIL_VAR and self.var_subst and instr.var in self.var_subst:
                 self.perform_get_expr_text(self.var_subst[instr.var], tokens, settings, precedence)
             elif o == Op.HLIL_VAR:
