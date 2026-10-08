@@ -322,9 +322,15 @@ def _parse_rendered(lines):
     return header, members
 
 
-def _anon_literal(lines, new_args, base):
+def _paren(expr):
+    return expr if re.match(r"^[\w.$]+$", expr) else "(" + expr + ")"
+
+
+def _anon_literal(lines, new_args, base, outer_this="this"):
     """`new Super(real args) { methods }` for a rendered anonymous class, captured locals rewritten to the
-    expressions passed at this new (this.val$x = argN, and argN is new_args[N])"""
+    expressions passed at this new (this.val$x = argN, and argN is new_args[N]). The outer instance
+    (this.this$0 = argN where the new passes `this`) becomes outer_this: `Outer.this`, or `this` when the
+    enclosing class is itself anonymous -- its own this$0 / val$x are rewritten one level up (jvm-69)"""
     header, members = _parse_rendered(lines)
     if header is None:
         return None
@@ -342,15 +348,17 @@ def _anon_literal(lines, new_args, base):
             sm = re.match(r"\s*super\((.*)\)\s*;\s*$", line.strip())
             if sm and not super_args:
                 super_args = sm.group(1).strip()
-            am = re.match(r"\s*this\.(\w+)\s*=\s*(\w+)\s*;\s*$", line)
+            am = re.match(r"\s*this\.([\w$]+)\s*=\s*([\w$]+)\s*;\s*$", line)  # javac: this$0, val$x
             if am and am.group(2) in params:
                 captures[am.group(1)] = params.index(am.group(2))
         if super_args:
-            for idx, name in sorted(enumerate(params), key=lambda kv: -len(kv[1])):
-                if idx < len(new_args):
-                    expr = new_args[idx]
-                    repl = expr if re.match(r"^[\w.]+$", expr) else "(" + expr + ")"
-                    super_args = re.sub(r"\b%s\b" % re.escape(name), repl, super_args)
+            # each parameter in one pass (no re-substitution); a whole argument needs no parentheses
+            value = {name: new_args[idx] for idx, name in enumerate(params) if idx < len(new_args)}
+            parts = _scan_call(super_args + ")", 0)[0] or [super_args]
+            parts = [value[a] if a in value else
+                     re.sub(r"(?<![\w$.])([\w$]+)(?![\w$])", lambda m: _paren(value[m.group(1)])
+                            if m.group(1) in value else m.group(1), a) for a in parts]
+            super_args = ", ".join(parts)
     if extends and extends != "Object":
         head = "new %s(%s)" % (extends, super_args)
         if implements:
@@ -362,7 +370,8 @@ def _anon_literal(lines, new_args, base):
             head += " implements " + ", ".join(ifaces[1:])
     else:
         head = "new Object()"
-    field_expr = {f: new_args[i] for f, i in captures.items() if i < len(new_args)}
+    field_expr = {f: outer_this if new_args[i] == "this" else new_args[i]
+                  for f, i in captures.items() if i < len(new_args)}
     body = []
     for mem in members:
         if mem[0] == "field":
@@ -375,19 +384,21 @@ def _anon_literal(lines, new_args, base):
         body.append(INDENT + "}")
     pad = " " * base
     rewritten = []
+    capture = re.compile(r"\bthis\.(%s)(?![\w$])" % "|".join(map(re.escape, field_expr))) if field_expr else None
     for line in body:
-        for field, expr in sorted(field_expr.items(), key=lambda kv: -len(kv[0])):
-            repl = expr if re.match(r"^[\w.]+$", expr) else "(" + expr + ")"
-            line = re.sub(r"\bthis\.%s\b" % re.escape(field), repl, line)
+        if capture is not None:  # one pass: a replacement is not rewritten again
+            line = capture.sub(lambda m: _paren(field_expr[m.group(1)]), line)
         rewritten.append(pad + line if line.strip() else "")
     close = "\n" + pad + "}"
     return head + " {\n" + "\n".join(rewritten) + close
 
 
-def _embed_news(bv, info, lines, refs, cache):
+def _embed_news(bv, info, lines, refs, cache, anonymous=False):
     """anonymous classes go to the `new` that creates them; a non-static member's `new C(this, ...)`
-    drops the outer instance. returns (lines, binary names that were inlined)"""
+    drops the outer instance. anonymous: info is itself an anonymous class. returns (lines, binary names
+    that were inlined)"""
     text, used = "\n".join(lines), set()
+    outer_this = "this" if anonymous else shown_class_name(info["name"]) + ".this"
     anons, members = [], []
     for e in info["inner_classes"]:
         inner = e["inner"]
@@ -419,7 +430,7 @@ def _embed_news(bv, info, lines, refs, cache):
 
         def build(args, base, e=e):
             got = rendered(e)
-            return None if not got else _anon_literal(got, args, base)
+            return None if not got else _anon_literal(got, args, base, outer_this)
 
         text, n = _replace_calls(text, name, build)
         if n:
@@ -542,7 +553,7 @@ def render_class(bv, nested=None, refs=None, cache=None):
         out.append(INDENT + head + " {  // %s @ 0x%x" % (func.name, func.start))
         out += [INDENT * 2 + line for line in bodies[id(m)]]
         out.append(INDENT + "}")
-    out, used = _embed_news(bv, info, out, refs, cache)
+    out, used = _embed_news(bv, info, out, refs, cache, nested is not None and nested["anonymous"])
     for e in info["inner_classes"]:
         inner = e["inner"]
         if inner in used:
