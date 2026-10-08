@@ -32,13 +32,19 @@ class JavaTypes:
     ELEMENTS = {'Z': lambda: Type.bool(), 'B': lambda: Type.int(1, True), 'C': lambda: Type.int(2, False),
                 'S': lambda: Type.int(2, True)}
 
-    def __init__(self, view):
+    def __init__(self, view, reuse=False):
         self.view = view
         self.refs = {}
+        self.reuse = reuse  # a reopened .bndb already has these types; don't redefine them (jvm-19)
 
     def _named(self, name, make, width=0):
         # a reference (by type id) to the named type, defining it on first use
         t = self.refs.get(name)
+        if t is None and self.reuse:
+            existing = self.view.get_type_by_name(name)
+            if existing is not None:
+                self.refs[name] = existing
+                return existing
         if t is None:
             tid = Type.generate_auto_type_id("jvm", name)
             body = make()
@@ -254,12 +260,16 @@ class ClassView(BinaryView):
             self.cR.classStruct = classStruct
             version = java_version(classStruct.major_version, classStruct.minor_version)
             log_info("%s: %s" % (classStruct.name, version))
-            self.set_comment_at(CLASSFILE_BASE, version)
-           
+            # reopened .bndb: keep user symbols, types and comments (jvm-18/19). Segments and
+            # functions are recreated; a symbol the user already owns is not redefined.
+            restored = bool(self.file.has_database)
+            self.define_class_types(classStruct, restored)
+            if not self.get_comment_at(CLASSFILE_BASE):
+                self.set_comment_at(CLASSFILE_BASE, version)
+
             self.add_auto_segment(CLASSFILE_BASE, self.cR.index(), 0, self.cR.index(), SegmentFlag.SegmentReadable)
             self.add_auto_section("<data>", CLASSFILE_BASE, self.cR.index(), SectionSemantics.ReadOnlyCodeSectionSemantics)
             self.define_data_var(CLASSFILE_BASE, classStruct.resultingType())
-            self.define_class_types(classStruct)
             self.define_methods(classStruct)
             
             for i in range(len(self.cR.constantPool.poolContent)):
@@ -276,14 +286,14 @@ class ClassView(BinaryView):
                     t = SymbolType.DataSymbol
                
                 if t == SymbolType.ImportAddressSymbol:
-                    self.define_user_symbol(Symbol(t, pool_address(i), method_short_name(self.cR, content),
-                                                   full_name=str(content), raw_name=str(content)))
+                    self._define_unless_user(Symbol(t, pool_address(i), method_short_name(self.cR, content),
+                                                    full_name=str(content), raw_name=str(content)))
                 else:
-                    self.define_user_symbol(Symbol(t, pool_address(i), str(content), full_name="pool_"+str(i)))
-                
+                    self._define_unless_user(Symbol(t, pool_address(i), str(content), full_name="pool_"+str(i)))
+
             primitive_names = ["Not Used","Not Used","Not Used","Not Used","Boolean","Char","Float","Double","Byte","Short","Int","Long"]
             for i in range(4,12):
-                self.define_user_symbol(Symbol(SymbolType.DataSymbol, i+PSEUDOMEMORY_PRIMITIVES, primitive_names[i], full_name="primitive_"+str(i)))
+                self._define_unless_user(Symbol(SymbolType.DataSymbol, i+PSEUDOMEMORY_PRIMITIVES, primitive_names[i], full_name="primitive_"+str(i)))
 
             # static fields are lifted as loads/stores of their pool entry: type them by descriptor
             for i, content in enumerate(self.cR.constantPool.poolContent):
@@ -295,9 +305,9 @@ class ClassView(BinaryView):
             self.define_method_slots(classStruct)
             self.type_methods(classStruct)
             self.store_metadata(CLASS_METADATA_KEY, class_metadata(classStruct), MetadataStoreFlag.MetadataStorePersistent)
-            # reopened from a .bndb: its components are restored after init -- decide once analysis is done
-            self.cR.pending_components = self.file.has_database
-            if not self.cR.pending_components:
+            # reopened from a .bndb: components are restored after init
+            self.cR.pending_components = restored
+            if not restored:
                 define_components(self, self.cR)
 
             self.add_analysis_completion_event(completeUpdateWhenDone)
@@ -307,8 +317,9 @@ class ClassView(BinaryView):
             print(traceback.format_exc())
             return False
         
-    def define_methods(self, classStruct):
-        # each method with code gets its own segment, function and symbol
+    def define_methods(self, classStruct, define=True):
+        # each method with code gets its own segment, function and symbol.
+        # define=False only records the entry point (a reopened database already has the functions).
         names = set()
         self.entry_address = 0  # the class-file header, unless some method qualifies (see below)
         entry_rank = 3
@@ -323,10 +334,13 @@ class ClassView(BinaryView):
                 posfix += 1
             names.add(name)
             base = method_address(method.index)
-            length = code.end_address-code.start_address
-            self.add_auto_segment(base, length, code.start_address, length, SegmentFlag.SegmentReadable | SegmentFlag.SegmentExecutable)
-            self.add_function(base)
-            self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, base, name))
+            if define:
+                length = code.end_address-code.start_address
+                self.add_auto_segment(base, length, code.start_address, length, SegmentFlag.SegmentReadable | SegmentFlag.SegmentExecutable)
+                self.add_function(base)
+                # a user symbol, so a rename survives re-analysis (an auto symbol would be replaced).
+                # on reopen, leave a symbol the user already owns alone (jvm-18)
+                self._define_unless_user(Symbol(SymbolType.FunctionSymbol, base, name))
             # entry point: public static void main(String[]), else <clinit>, else the first method
             if method.name == "main" and method.descriptor == "([Ljava/lang/String;)V" and method.access_flags & ACC_STATIC:
                 rank = 0
@@ -339,7 +353,7 @@ class ClassView(BinaryView):
             # exception handlers are part of the method (the lifter models the exception edges, jvm-42);
             # the exception table is kept for the Pseudo Java printer: [[start_pc, end_pc, handler_pc,
             # catch class ("" = any)], ...], pcs relative to the method's base
-            if code.exception_table:
+            if define and code.exception_table:
                 func = self.get_function_at(base)
                 if func is not None:
                     func.store_metadata("jvm.exception_table", [
@@ -370,9 +384,9 @@ class ClassView(BinaryView):
                 off += length
         return kinds
 
-    def define_class_types(self, classStruct):
+    def define_class_types(self, classStruct, reuse=False):
         # jvm-35: the viewed class's struct first (so it is not defined opaque), then every class in the pool
-        self.jtypes = self.cR.jtypes = JavaTypes(self)
+        self.jtypes = self.cR.jtypes = JavaTypes(self, reuse)
         self.class_type = self.jtypes.define_class(classStruct)
         for name in classStruct.referenced_class_names():
             self.jtypes.class_struct(name)
@@ -439,10 +453,16 @@ class ClassView(BinaryView):
             if func is None or sym is None:
                 continue
             ftype = self.method_function_type(method, arch, cc)
-            if ftype is not None:
-                # attached to the function symbol with full confidence; Function.set_auto_type() before the
-                # first analysis is replaced by the inferred type
-                self.define_auto_symbol_and_var_or_function(sym, ftype, type_confidence=255)
+            if ftype is not None and not func.has_user_type:
+                # a user type sticks across re-analysis; set_auto_type() is replaced by inference.
+                # define_auto_symbol_and_var_or_function would also replace a renamed user symbol.
+                func.set_user_type(ftype)
+
+    def _define_unless_user(self, sym):
+        existing = self.get_symbol_at(sym.address)
+        if existing is not None and not existing.auto:
+            return
+        self.define_user_symbol(sym)
 
     def perform_is_executable(self):
         return True
