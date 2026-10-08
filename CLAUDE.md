@@ -20,7 +20,7 @@ and runs the installed plugin at HEAD; restart again after plugin changes, or us
 **`jvm`** (`miniwiki tree jvm`; `tickets/` there is a read-only mirror of minitick). There is no
 code reviewer: finished tickets go straight to **RESOLVED** with a verification comment. The
 project skill **`skills/jvm/SKILL.md`** summarises the workflow and gotchas — load it. `.claude/` is git-ignored;
-Claude Code finds the skill through a local symlink, so after a fresh clone run `ln -s ../skills .claude/skills`.
+Claude Code finds the skill through a local symlink, so after a fresh clone run `mkdir -p .claude && ln -s ../skills .claude/skills`.
 
 ## What this is
 
