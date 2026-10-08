@@ -2,7 +2,8 @@
 and methods in source order, built from the "jvm.class" metadata the view stores. Method bodies come
 from `pseudo_java.render_body(func)` when that module exists, else from the function's HLIL text.
 jvm-62: imports and simple names, generic signatures, `throws`, `@Override` (supertypes from the class files
-of the same unpacked jar, else JDK_TYPES), member and anonymous classes from their own class files."""
+of the same unpacked jar, else JDK_TYPES). Anonymous classes are printed at the `new` that creates them;
+other member classes come from their own class files."""
 import os
 import re
 import traceback
@@ -50,9 +51,9 @@ JDK_TYPES = {
 }
 
 try:
-    from .pseudo_java import render_body  # body only: the skeleton prints the header and braces itself
+    from .pseudo_java import render_body, java_class_name  # body only: the skeleton prints the header and braces itself
 except ImportError:
-    render_body = None
+    render_body = java_class_name = None
 try:
     from .pseudo_java import hoist_field_initializers
 except ImportError:
@@ -204,10 +205,242 @@ def imports(info, text, refs=()):
         by_simple.setdefault(simple_name(top), set()).add(dotted(top))
     return sorted("import %s;" % next(iter(v)) for s, v in by_simple.items() if len(v) == 1 and s in words)
 
-def render_class(bv, nested=None, refs=None):
-    """the class skeleton as a list of text lines, member / anonymous classes at its end (from their class files
-    next to this one). nested: {flags, anonymous, outer} when rendering such a class; refs collects the
-    classes all of them mention (for the imports)"""
+def shown_class_name(dotted):
+    """the name Pseudo Java prints for a binary name ('a.b.Outer$Inner' -> 'Outer.Inner', '$1' stays)"""
+    if java_class_name is None:
+        return dotted.rsplit(".", 1)[-1]
+    return java_class_name(dotted.replace(".", "/"))
+
+
+def _scan_call(text, start):
+    """text[start:] begins at the first argument of a call; return (args, index after the closing paren).
+    args keep their inner whitespace collapsed to one line"""
+    args, cur, depth, angle, i, in_str = [], [], 0, 0, start, False
+    while i < len(text):
+        c = text[i]
+        if in_str:
+            cur.append(c)
+            if c == "\\" and i + 1 < len(text):
+                cur.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            if depth == 0 and angle == 0:
+                tail = "".join(cur).strip()
+                if tail:
+                    args.append(" ".join(tail.split()))
+                return args, i + 1
+            depth -= 1
+        elif c == "<":
+            angle += 1
+        elif c == ">":
+            angle = max(0, angle - 1)
+        if c == "," and depth == 0 and angle == 0 and not in_str:
+            args.append(" ".join("".join(cur).split()))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    return None, start
+
+
+def _line_indent(text, pos):
+    line = text.rfind("\n", 0, pos) + 1
+    n = 0
+    while line + n < len(text) and text[line + n] == " ":
+        n += 1
+    return n
+
+
+def _replace_calls(text, name, build):
+    """replace `new name(args)` with build(args, indent) when that returns text. build None leaves the call"""
+    needle, out, i, n = "new " + name + "(", [], 0, 0
+    while True:
+        j = text.find(needle, i)
+        if j < 0:
+            out.append(text[i:])
+            return "".join(out), n
+        parsed = _scan_call(text, j + len(needle))
+        if parsed[0] is None:
+            out.append(text[i:j + len(needle)])
+            i = j + len(needle)
+            continue
+        args, end = parsed
+        lit = build(args, _line_indent(text, j))
+        if lit is None:
+            out.append(text[i:end])
+            i = end
+            continue
+        out.append(text[i:j])
+        out.append(lit)
+        i = end
+        n += 1
+
+
+def _parse_rendered(lines):
+    """(header, [(kind, ...)]) of a render_class result. method entries are (header lines, body lines)"""
+    header, members, i = None, [], 0
+    while i < len(lines):
+        line = lines[i]
+        if header is None:
+            if re.search(r"\bclass\s+\S", line):
+                header = line
+            i += 1
+            continue
+        if line == "}":
+            break
+        if line.strip() == "" or not line.startswith(INDENT) or line.startswith(INDENT + " "):
+            i += 1
+            continue
+        if line.rstrip().endswith(";") and "{" not in line:
+            members.append(("field", [line]))
+            i += 1
+            continue
+        head = []
+        while i < len(lines) and lines[i].startswith(INDENT) and not lines[i].startswith(INDENT + " "):
+            head.append(lines[i])
+            i += 1
+            if "{" in head[-1]:
+                break
+        if not head or "{" not in head[-1]:
+            continue
+        body = []
+        while i < len(lines) and lines[i] != INDENT + "}":
+            body.append(lines[i])
+            i += 1
+        if i < len(lines):
+            i += 1
+        members.append(("method", head, body))
+    return header, members
+
+
+def _anon_literal(lines, new_args, base):
+    """`new Super(real args) { methods }` for a rendered anonymous class, captured locals rewritten to the
+    expressions passed at this new (this.val$x = argN, and argN is new_args[N])"""
+    header, members = _parse_rendered(lines)
+    if header is None:
+        return None
+    m = re.search(r"\bclass\s+(\S+?)(?:\s+extends\s+([^{\s]+))?(?:\s+implements\s+([^{]+?))?\s*\{", header)
+    if m is None:
+        return None
+    extends, implements = m.group(2), (m.group(3) or "").strip()
+    ctor = next((mem for mem in members if mem[0] == "method" and any("// <init>" in h for h in mem[1])), None)
+    params, captures, super_args = [], {}, ""
+    if ctor is not None:
+        sig = " ".join(h.strip() for h in ctor[1])
+        sig = sig[sig.find("(") + 1:sig.rfind(")")]
+        params = [p.strip().rsplit(" ", 1)[-1] for p in _scan_call("(" + sig + ")", 1)[0] or [] if p.strip()]
+        for line in ctor[2]:
+            sm = re.match(r"\s*super\((.*)\)\s*;\s*$", line.strip())
+            if sm and not super_args:
+                super_args = sm.group(1).strip()
+            am = re.match(r"\s*this\.(\w+)\s*=\s*(\w+)\s*;\s*$", line)
+            if am and am.group(2) in params:
+                captures[am.group(1)] = params.index(am.group(2))
+        if super_args:
+            for idx, name in sorted(enumerate(params), key=lambda kv: -len(kv[1])):
+                if idx < len(new_args):
+                    expr = new_args[idx]
+                    repl = expr if re.match(r"^[\w.]+$", expr) else "(" + expr + ")"
+                    super_args = re.sub(r"\b%s\b" % re.escape(name), repl, super_args)
+    if extends and extends != "Object":
+        head = "new %s(%s)" % (extends, super_args)
+        if implements:
+            head += " implements " + implements
+    elif implements:
+        ifaces = [s.strip() for s in implements.split(",")]
+        head = "new %s(%s)" % (ifaces[0], super_args)
+        if len(ifaces) > 1:
+            head += " implements " + ", ".join(ifaces[1:])
+    else:
+        head = "new Object()"
+    field_expr = {f: new_args[i] for f, i in captures.items() if i < len(new_args)}
+    body = []
+    for mem in members:
+        if mem[0] == "field":
+            body.extend(mem[1])
+            continue
+        if mem is ctor:
+            continue
+        body.extend(mem[1])
+        body.extend(mem[2])
+        body.append(INDENT + "}")
+    pad = " " * base
+    rewritten = []
+    for line in body:
+        for field, expr in sorted(field_expr.items(), key=lambda kv: -len(kv[0])):
+            repl = expr if re.match(r"^[\w.]+$", expr) else "(" + expr + ")"
+            line = re.sub(r"\bthis\.%s\b" % re.escape(field), repl, line)
+        rewritten.append(pad + line if line.strip() else "")
+    close = "\n" + pad + "}"
+    return head + " {\n" + "\n".join(rewritten) + close
+
+
+def _embed_news(bv, info, lines, refs, cache):
+    """anonymous classes go to the `new` that creates them; a non-static member's `new C(this, ...)`
+    drops the outer instance. returns (lines, binary names that were inlined)"""
+    text, used = "\n".join(lines), set()
+    anons, members = [], []
+    for e in info["inner_classes"]:
+        inner = e["inner"]
+        if not inner or inner == info["name"]:
+            continue
+        if e["outer"] == info["name"] and e["name"]:
+            if not e["access_flags"] & ACC_STATIC:
+                members.append(shown_class_name(inner))
+            continue
+        if not e["outer"] and inner.rsplit("$", 1)[0] == info["name"] and not e["name"]:
+            anons.append(e)
+
+    def rendered(e):
+        key = e["inner"]
+        if key not in cache:
+            iv = open_sibling(bv, info, key)
+            if iv is None:
+                cache[key] = None
+            else:
+                try:
+                    cache[key] = render_class(iv, {"flags": e["access_flags"], "anonymous": True,
+                                                   "outer": info["name"]}, refs, cache)
+                finally:
+                    iv.file.close()
+        return cache[key]
+
+    for e in sorted(anons, key=lambda e: -len(e["inner"])):
+        name = shown_class_name(e["inner"])
+
+        def build(args, base, e=e):
+            got = rendered(e)
+            return None if not got else _anon_literal(got, args, base)
+
+        text, n = _replace_calls(text, name, build)
+        if n:
+            used.add(e["inner"])
+    for name in members:
+        def build(args, base, name=name):
+            if not args or args[0] != "this":
+                return None
+            return "new %s(%s)" % (name, ", ".join(args[1:]))
+
+        text, _ = _replace_calls(text, name, build)
+    return text.splitlines(), used
+
+
+def render_class(bv, nested=None, refs=None, cache=None):
+    """the class skeleton as a list of text lines. anonymous classes are printed at the `new` that creates
+    them (jvm-66); other member classes stay at the end, from their class files next to this one.
+    nested: {flags, anonymous, outer} when rendering such a class; refs collects the classes all of them
+    mention (for the imports)"""
+    if cache is None:
+        cache = {}
     info = class_info(bv)
     if info is None:
         return ["// no JVM class metadata in this view"]
@@ -306,21 +539,31 @@ def render_class(bv, nested=None, refs=None):
         out.append(INDENT + head + " {  // %s @ 0x%x" % (func.name, func.start))
         out += [INDENT * 2 + line for line in bodies[id(m)]]
         out.append(INDENT + "}")
+    out, used = _embed_news(bv, info, out, refs, cache)
     for e in info["inner_classes"]:
         inner = e["inner"]
+        if inner in used:
+            continue  # printed at its new (jvm-66)
         member = e["outer"] == info["name"] and e["name"]
         local = not e["outer"] and inner and inner.rsplit("$", 1)[0] == info["name"]  # anonymous / local class
         if inner == info["name"] or not (member or local):
             continue
-        iv = open_sibling(bv, info, inner)
-        if iv is None:
-            out += ["", INDENT + "// inner class %s (no class file next to this one)" % inner]
-            continue
-        try:
-            lines = render_class(iv, {"flags": e["access_flags"], "anonymous": not e["name"],
-                                      "outer": info["name"]}, refs)
-        finally:
-            iv.file.close()
+        if inner in cache:
+            lines = cache[inner]
+            if not lines:
+                out += ["", INDENT + "// inner class %s (no class file next to this one)" % inner]
+                continue
+        else:
+            iv = open_sibling(bv, info, inner)
+            if iv is None:
+                out += ["", INDENT + "// inner class %s (no class file next to this one)" % inner]
+                continue
+            try:
+                lines = render_class(iv, {"flags": e["access_flags"], "anonymous": not e["name"],
+                                          "outer": info["name"]}, refs, cache)
+            finally:
+                iv.file.close()
+            cache[inner] = lines
         out.append("")
         out += [INDENT + l if l else l for l in lines]
     out.append("}")

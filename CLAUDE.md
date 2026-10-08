@@ -9,10 +9,10 @@ stack as registers (jvm-33), typed signatures + names (jvm-35), compare fusion (
 edges inside methods (jvm-42), a Pseudo Java language representation (jvm-43/44) and a class view
 (jvm-41). The plugin is **installed** again (symlink + `files.container.excludedTransforms = ["Universal"]`).
 
-**▶ Handoff (2026-10-08 08:06).** jvm-58…67 are resolved (Vineflower comparison: statements 2217 → 2017,
-VF 1916; jvm-67 removed the bool_return excess). Open, in this order:
-1. jvm-66 (anonymous classes at their `new`), jvm-68 (split `shared/` for `../binary-cpp`).
-The installed plugin is still at `7e2336b`: a BN restart (user's OK) would load main's state. Run BN gates one at a
+**▶ Handoff (2026-10-08 08:55).** jvm-58…67 and jvm-66 are resolved (Vineflower comparison: statements 2017,
+VF 1916; anonymous classes print at their `new`). Open:
+1. jvm-68 (split `shared/` for `../binary-cpp`), when binary-cpp needs one of those parts.
+The running Binary Ninja loaded `6568e61` at startup; a restart picks up later commits. Run BN gates one at a
 time; under heavy machine load compare_all needs > 40 min and times out.
 
 **Project tracking:** tickets live in minitick project **`jvm`** (`jvm-N`; CLI
