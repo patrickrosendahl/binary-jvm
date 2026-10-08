@@ -25,13 +25,18 @@ Convention: **downloaded external documentation lives in this `docs/` directory*
 
 | major | Java | major | Java |
 |---|---|---|---|
-| 45 | 1.1 | 55 | 11 |
-| 46 | 1.2 | 56 | 12 |
-| 47 | 1.3 | 57 | 13 |
-| 48 | 1.4 | 58 | 14 |
-| 49 | 5.0 | 59 | 15 |
-| 50 | 6 | 60 | 16 |
-| 51 | 7 (adds `invokedynamic`) | 61 | 17 |
-| 52 | 8 | 62 | 18 |
-| 53 | 9 | 65 | 21 |
+| 45 | 1.1 | 58 | 14 |
+| 46 | 1.2 | 59 | 15 |
+| 47 | 1.3 | 60 | 16 |
+| 48 | 1.4 | 61 | 17 |
+| 49 | 5 | 62 | 18 |
+| 50 | 6 | 63 | 19 |
+| 51 | 7 (`invokedynamic`) | 64 | 20 |
+| 52 | 8 | 65 | 21 |
+| 53 | 9 | 66 | 22 |
 | 54 | 10 | 67 | 23 |
+| 55 | 11 | 68 | 24 |
+| 56 | 12 | 69 | 25 |
+| 57 | 13 | | |
+
+From 49 up, the release number is `major - 44`. Minor `65535` (`0xFFFF`) is a preview build of that major (jvm-25).

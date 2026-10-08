@@ -53,7 +53,7 @@ reload plugins). Open a `.class` file → it should be recognized as **JVM Class
 
 ## Roadmap / TODO
 
-### 1. Finish the Python 3 port ✅ first pass / ⬜ verified in BN 6.1
+### 1. Finish the Python 3 port ✅ verified in BN 6.1 (jvm-1)
 - [x] `bytes`/`str` fixes in `convert_to_nop`, `invert_branch`, `always_branch`,
       `is_never_branch_patch_available` (data is `bytes`; `data[0]` is an `int`).
 - [x] `assemble()` returns `bytes` (BN 6.1 `Architecture._assemble` does
@@ -61,13 +61,10 @@ reload plugins). Open a `.class` file → it should be recognized as **JVM Class
       `None` still signals an assemble error.
 - [x] `Type.float(w, False)` → `Type.float(w)` (2nd arg is `alternate_name: str`, not a sign).
 - [x] `py_compile` clean; no `print`-statement / `iteritems` / `xrange` left.
-- [ ] **Load it in BN 6.1 against a real `.class` and confirm: view recognized, methods
-      appear as functions, disassembly + the constant-pool/primitive pseudo-symbols render.**
-      (Most of the Type/Structure API — `TypeBuilder.structure()`, `Type.structure_type`,
-      `Type.int(w, False, "u1")`, `StructureBuilder.append/packed` — was verified to still
-      exist unchanged in 6.1, so this should be close. The fragile spot is
-      `JVMStructure.resultingType()`'s type-dedup using `itype.structure(...).members` — the
-      `Type.structure` accessor shape may need a tweak; test and adjust.)
+- [x] **Loaded in BN 6.1 against real `.class` files** (2026-10-08, `ErrorHandler` and
+      `Login`): the JVM Class view is selected, every method with code is a named function,
+      disassembly renders, and the constant-pool (`pool_N`) and primitive (`primitive_N`)
+      symbols are present. The entry point is a real method (jvm-31).
 
 ### 2. Opcode / IL coverage ✅ (lifter rewrite done — tickets jvm-2…jvm-11)
 All 202 opcodes decode, render and lift; nothing falls through to `unimplemented`.
@@ -139,20 +136,11 @@ survive save → close → reopen.
 
 ## Open questions (decide, then record the answer here)
 
-- **Should we support several JVM versions / opcode sets?**
-  Analysis: the **opcode set is effectively frozen** — the last new instruction was
-  `invokedynamic` (`0xba`) in Java 7 (class major version 51); nothing has been added since.
-  So we almost certainly do **not** need per-version opcode tables. Versioning in `.class`
-  files lives elsewhere:
-  - the `major_version`/`minor_version` header (45=JDK1.1 … 52=Java 8 … 65=Java 21 — table in
-    `docs/references.md`); the parser already reads it but doesn't surface it;
-  - **constant-pool tags** added over time — `MethodHandle`(15)/`MethodType`(16)/
-    `InvokeDynamic`(18) are handled, but `Dynamic`(17, Java 11), `Module`(19) and
-    `Package`(20) are **not**, so modern classes will error in `JVMConstantPool.read()`;
-  - new **attributes** (`StackMapTable`, `BootstrapMethods`, `NestHost/NestMembers`,
-    `Record`, `PermittedSubclasses`, …).
-  **Tentative recommendation:** one opcode table, but extend constant-pool tag + attribute
-  coverage and display the detected Java version. Confirm and update this section.
+- **Should we support several JVM versions / opcode sets?** **No — one opcode table (jvm-26).**
+  The opcode set has been frozen since `invokedynamic` (`0xba`) in Java 7 (class major 51).
+  What still changes is the `major_version` header (shown on the class, jvm-25), constant-pool
+  tags (`Dynamic`/`Module`/`Package` are not parsed yet), and attributes (`StackMapTable`,
+  nest host, `Record`, …) — that work is jvm-21 / jvm-24.
 
 - Should the view show decompiled/source-like output, or is annotated LLIL enough?
 - How should constant-pool references render in-line (currently `Pool@N` pseudo-pointers into

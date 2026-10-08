@@ -3,6 +3,20 @@
 PRIMITIVE_NAMES = {'B': "byte", 'C': "char", 'D': "double", 'F': "float", 'I': "int", 'J': "long",
                    'S': "short", 'Z': "boolean", 'V': "void"}
 
+def java_version(major, minor):
+    """the release a class-file version denotes: 'Java 8 (52.0)', 'Java 21 preview (65.65535)'.
+    Major 45 is 1.1; 46..48 are 1.2..1.4; 49 and up are major-44 (5 .. 21 ..). Minor 0xFFFF marks
+    a preview build of that major (Java 12+). An older major stays 'class file M.m'."""
+    if major < 45:
+        return "class file %d.%d" % (major, minor)
+    if major <= 48:
+        release = "1.%d" % (major - 44)
+    else:
+        release = "%d" % (major - 44)
+    preview = " preview" if minor == 0xFFFF else ""
+    return "Java %s%s (%d.%d)" % (release, preview, major, minor)
+
+
 def dotted(binary_name):
     """'java/lang/String' -> 'java.lang.String' (inner classes keep their '$')"""
     return binary_name.replace("/", ".")

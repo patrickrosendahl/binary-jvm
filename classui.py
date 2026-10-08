@@ -13,7 +13,7 @@ from binaryninja import (PluginCommand, LinearViewObject, LinearViewCursor, Line
 
 from .classfile import CLASS_METADATA_KEY
 from .javatypes import (ACC_STATIC, ACC_ENUM, ACC_SYNTHETIC, ACC_BRIDGE, ACC_PRIVATE, ACC_INTERFACE, class_keyword,
-                        java_type_name, modifiers, split_method_descriptor, simple_name, source_class_name,
+                        java_type_name, java_version, modifiers, split_method_descriptor, simple_name, source_class_name,
                         package_of, dotted, class_signature, field_signature, method_signature)
 from .constants import ARCH_NAME
 try:
@@ -448,6 +448,9 @@ def render_class(bv, nested=None, refs=None, cache=None):
     pkg, _, name = info["name"].rpartition(".")
     if nested is None:
         refs = set()
+        if info.get("major_version"):
+            label = info.get("java_version") or java_version(info["major_version"], info.get("minor_version", 0))
+            out.append("// " + label)
         if info["source_file"]:
             out.append("// source file: %s" % info["source_file"])
         if pkg:

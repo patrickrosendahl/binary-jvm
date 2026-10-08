@@ -4,12 +4,12 @@ import traceback
 
 from binaryninja import (Architecture, BinaryView, Symbol, SymbolType, SegmentFlag, SectionSemantics, Settings,
                          SettingsScope, Type, TypeBuilder, FunctionParameter, ReturnValue, BaseStructure,
-                         CoreVariable, VariableSourceType, MetadataStoreFlag, NamedTypeReferenceClass)
+                         CoreVariable, VariableSourceType, MetadataStoreFlag, NamedTypeReferenceClass, log_info)
 
 from .constants import *
 from .opcodes import decode_instruction
 from .classfile import *
-from .javatypes import dotted, split_method_descriptor, method_parameter_slots, slot_count
+from .javatypes import dotted, java_version, split_method_descriptor, method_parameter_slots, slot_count
 from .methodinfo import method_info
 
 METHOD_POOL_CLASSES = (JVMMethodReference, JVMInterfaceMethodReference, JVMInvokeDynamic)
@@ -252,6 +252,9 @@ class ClassView(BinaryView):
             
             classStruct = JVMClassStructure(self.cR) # read class structure and add symbols
             self.cR.classStruct = classStruct
+            version = java_version(classStruct.major_version, classStruct.minor_version)
+            log_info("%s: %s" % (classStruct.name, version))
+            self.set_comment_at(CLASSFILE_BASE, version)
            
             self.add_auto_segment(CLASSFILE_BASE, self.cR.index(), 0, self.cR.index(), SegmentFlag.SegmentReadable)
             self.add_auto_section("<data>", CLASSFILE_BASE, self.cR.index(), SectionSemantics.ReadOnlyCodeSectionSemantics)

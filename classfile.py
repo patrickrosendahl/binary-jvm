@@ -6,6 +6,7 @@ import struct
 from binaryninja import Type, TypeBuilder
 
 from .constants import method_address
+from .javatypes import java_version
 
 _type_cache = {}
 
@@ -872,7 +873,7 @@ def field_constant(cls, f):
         return None
 
 def class_metadata(cls):
-    """{name, super, interfaces, access_flags, signature, source_file, inner_classes, fields, methods}"""
+    """{name, super, interfaces, access_flags, signature, source_file, java_version, inner_classes, fields, methods}"""
     def d(name):
         return name.replace("/", ".") if name else ""
     return {
@@ -882,6 +883,9 @@ def class_metadata(cls):
         "access_flags": cls.access_flags,
         "signature": cls.generic_signature() or "",
         "source_file": cls.source_file() or "",
+        "major_version": cls.major_version,
+        "minor_version": cls.minor_version,
+        "java_version": java_version(cls.major_version, cls.minor_version),
         "inner_classes": [{"inner": d(e["inner"]), "outer": d(e["outer"]), "name": e["name"] or "",
                            "access_flags": e["access_flags"]} for e in cls.inner_classes()],
         "fields": [{"name": f.name, "descriptor": f.descriptor, "access_flags": f.access_flags,
