@@ -65,6 +65,7 @@ VARARGS_CALLS = True         # m(new T[]{a, b}) -> m(a, b) when m is varargs (jv
 SPLIT_CONDITIONS = True      # T x; if (a) { x = e; } if (!a || p(x)) -> if (!a || p(e)) (jvm-54)
 TERNARIES = True             # T x; if (c) { x = a; } else { x = b; } -> T x = c ? a : b (jvm-59)
 INCREMENT_VALUES = True      # int t = f; f = t + 1; use(t) -> use(f++); int t = f + 1; f = t; use(t) -> use(++f) (jvm-60)
+RETURN_VALUES = True         # if (c) { return false; } return true; -> return !c; if (a) { return x; } return y; -> return a ? x : y (jvm-67)
 # intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
 PURE_INTRINSICS = {"getfield", "arraylength", "checkcast", "instanceof", "new", "newarray", "anewarray",
                    "multianewarray", "__exception"}
@@ -1975,6 +1976,13 @@ if _HAVE_BN:
                         self.plan_ternary(body, k, hi, run_at, plan)
                     except Exception:
                         pass
+            if RETURN_VALUES and block.as_ast:
+                for k in range(lo, hi + 1):
+                    try:
+                        if self.plan_return_value(body, k, hi, run_at, sync_at, plan):
+                            break
+                    except Exception:
+                        pass
             if LOOP_CONDITIONS and block.as_ast:
                 # loop shapes are decided before anything is printed: they may hide a declaration further up
                 shapes = plan.setdefault("loop_shapes", {})
@@ -2937,6 +2945,118 @@ if _HAVE_BN:
             self.hidden_vars.add(x)
             self.inline.update(news)
 
+        # --- one return for if/return chains (jvm-67) --------------------------------------------------
+        def plan_return_value(self, body, k, hi, run_at, sync_at, plan):
+            """body[k..hi] is `if (c) { <returns> } <returns>` (or with else), every path ending in one `return v`:
+            print it as a single return (plan["ret_value"][k]; the rest of the range is done). Only one
+            conditional expression on any path; booleans fold into the condition"""
+            s = body[k]
+            if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_IF or self.returns_void or \
+                    any(k <= j <= hi for j in list(run_at) + list(sync_at)):
+                return False
+            value = self.return_value(body[k:hi + 1])
+            if not isinstance(value, tuple) or self.ternary_depth(value) > 1:
+                return False
+            plan.setdefault("ret_value", {})[k] = value
+            plan.setdefault("done", set()).update(range(k + 1, hi + 1))
+            return True
+
+        def return_value(self, items):
+            """the value a statement list returns when it is only `return v;`, or `if (c) { L1 } L2` /
+            `if (c) { L1 } else { L2 }` with L1, L2 such lists: v, or ('cond', c, value of L1, value of L2)"""
+            real = [x for x in items if not self.hidden_item(x)]
+            if not real or any(isinstance(x, _ExcBranch) for x in real):
+                return None
+            s = real[0]
+            if s.operation == Op.HLIL_RET:
+                return s.src[0] if len(real) == 1 and len(s.src) == 1 and not self.mentions_exc(s.src[0]) else None
+            if s.operation != Op.HLIL_IF or not s.as_ast or s.expr_index in self.consumed or \
+                    self.exc_if_parts(s) is not None or self.mentions_exc(s.condition):
+                return None
+            a = self.return_value(self.flatten(self.stmts_of(s.true)))
+            if a is None:
+                return None
+            if s.false is None or s.false.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
+                rest = real[1:]
+            elif len(real) == 1:
+                rest = self.flatten(self.stmts_of(s.false))
+            else:
+                return None
+            b = self.return_value(rest)
+            return None if b is None else ('cond', s.condition, a, b)
+
+        def bool_const(self, v):
+            """True / False when v is a boolean constant of this boolean method, else None"""
+            if self.return_code == 'Z' and not isinstance(v, tuple) and \
+                    v.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR) and v.constant in (0, 1):
+                return bool(v.constant)
+            return None
+
+        def ternary_depth(self, v):
+            """conditional expressions nested on the deepest path when v is printed (booleans fold away)"""
+            if not isinstance(v, tuple):
+                return 0
+            _, c, a, b = v
+            inner = max(self.ternary_depth(a), self.ternary_depth(b))
+            if self.bool_const(a) is not None or self.bool_const(b) is not None:
+                return inner  # c / !c / c || x / !c && x ...
+            return inner + 1
+
+        def emit_return_value(self, v, tokens, settings, precedence):
+            if not isinstance(v, tuple):
+                self.emit_typed(v, self.return_code, tokens, settings, precedence)
+                return
+            _, c, a, b = v
+            ba, bb = self.bool_const(a), self.bool_const(b)
+            if ba is not None and bb is not None and ba != bb:
+                self.emit_cond(c, not ba, tokens, settings, precedence)  # c ? true : false -> c
+                return
+            if ba is not None or bb is not None:
+                # c ? true : x -> c || x, c ? false : x -> !c && x, c ? x : true -> !c || x, c ? x : false -> c && x
+                const, other, negate = (ba, b, not ba) if ba is not None else (bb, a, bb)
+                text, prec = (" || ", P.LogicalOrOperatorPrecedence) if const else (" && ", P.LogicalAndOperatorPrecedence)
+                parens = precedence > prec
+                if parens:
+                    tokens.append_open_paren()
+                self.emit_cond(c, negate, tokens, settings, prec)
+                self.op(tokens, text)
+                self.emit_return_value(other, tokens, settings, prec)
+                if parens:
+                    tokens.append_close_paren()
+                return
+            if self.negative_test(c):
+                a, b = b, a
+            parens = precedence > P.TernaryOperatorPrecedence
+            if parens:
+                tokens.append_open_paren()
+            self.emit_cond(c, self.negative_test(c), tokens, settings, P.LogicalOrOperatorPrecedence)
+            self.op(tokens, " ? ")
+            self.emit_return_value(a, tokens, settings, P.LogicalOrOperatorPrecedence)
+            self.op(tokens, " : ")
+            self.emit_return_value(b, tokens, settings, P.TernaryOperatorPrecedence)
+            if parens:
+                tokens.append_close_paren()
+
+        def emit_cond(self, c, negate, tokens, settings, precedence):
+            if not negate:
+                self.perform_get_expr_text(c, tokens, settings, precedence)
+                return
+            # De Morgan turns !(a || b) into an &&, !(a && b) into an ||
+            demorgan = c.operation in (Op.HLIL_OR, Op.HLIL_AND) and c.size == 0
+            parens = demorgan and precedence > (P.LogicalAndOperatorPrecedence if c.operation == Op.HLIL_OR
+                                                else P.LogicalOrOperatorPrecedence)
+            if parens:
+                tokens.append_open_paren()
+            self.emit_negated(c, tokens, settings)
+            if parens:
+                tokens.append_close_paren()
+
+        def negative_test(self, c):
+            """`!x` / `x == null` / `b == 0` for a boolean or reference: reads better turned round"""
+            return c.operation == Op.HLIL_NOT or (
+                c.operation == Op.HLIL_CMP_E and c.right.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR) and
+                c.right.constant == 0 and bool(self.code_of(c.left)) and (self.code_of(c.left) or "") in "L[Z")
+
         def ternary_value(self, v):
             """a value a conditional expression may hold: free of side effects, or a single call of such values"""
             if self.pure(v):
@@ -3172,6 +3292,14 @@ if _HAVE_BN:
                 return need_separator  # leaving the synchronized block
             if s.operation == Op.HLIL_VAR_DECLARE and (s.var in self.hidden_vars or s.var in self.lock_only_vars()):
                 return need_separator
+            if idx in plan.get("ret_value", {}):
+                if need_separator:
+                    tokens.scope_separator()
+                self.kw(tokens, "return ")
+                self.emit_return_value(plan["ret_value"][idx], tokens, settings, P.AssignmentOperatorPrecedence)
+                tokens.append_semicolon()
+                tokens.new_line()
+                return False
             if idx in plan.get("ternary", {}):
                 x, value = plan["ternary"][idx]
                 if need_separator:

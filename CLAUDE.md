@@ -9,13 +9,9 @@ stack as registers (jvm-33), typed signatures + names (jvm-35), compare fusion (
 edges inside methods (jvm-42), a Pseudo Java language representation (jvm-43/44) and a class view
 (jvm-41). The plugin is **installed** again (symlink + `files.container.excludedTransforms = ["Universal"]`).
 
-**▶ Handoff (2026-10-08 01:10).** jvm-58…63 and jvm-65 are resolved (Vineflower comparison: statements 2217 → 2109,
-VF 1916; class view declarations match Vineflower). Open, in this order:
-1. **jvm-64** committed (`32b4db1`) but not resolved: compare_all did not finish twice under heavy machine load
-   (40-min script timeout, then the bnrun clients' socket timeout at ~41 min) -- rerun it on an idle machine
-   (dev load of main first) and resolve on 251/251.
-2. **jvm-67** (boolean returns) coded on branch **`wip/jvm-67`**, untested -- next steps in the ticket.
-3. jvm-66 (anonymous classes at their `new`), jvm-68 (split `shared/` for `../binary-cpp`).
+**▶ Handoff (2026-10-08 08:06).** jvm-58…67 are resolved (Vineflower comparison: statements 2217 → 2017,
+VF 1916; jvm-67 removed the bool_return excess). Open, in this order:
+1. jvm-66 (anonymous classes at their `new`), jvm-68 (split `shared/` for `../binary-cpp`).
 The installed plugin is still at `7e2336b`: a BN restart (user's OK) would load main's state. Run BN gates one at a
 time; under heavy machine load compare_all needs > 40 min and times out.
 
@@ -87,7 +83,7 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
    **Pseudo Java gates** (after any `pseudo_java.py` change; wiki `vineflower-comparison.md`):
    `python3 tests/vineflower_compare.py --decompile` (once: Vineflower, the decompiler Recaf uses, local fork),
  `bnrun --timeout 900 tests/bn_pseudo_java_dump.py` (~7-12 min; prepend `DEV_PKG = "jvm_devN"` for a dev load), then
- `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=1 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0 ref_zero=0 double_casts=0 type_mismatch=0 if_else_assign=0 stmts=2109`
+ `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=1 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0 ref_zero=0 double_casts=0 type_mismatch=0 if_else_assign=0 stmts=2017`
  (exit 1 on a regression; `stmts` is the statement count, lower it as tickets land; `--excess N` lists where the
  extra statements against Vineflower come from); and `tests/bn_pseudo_java_compare_all.sh [jvm_devN]` (~18-25 min):
  every mdg method with an exception table against HLIL -- must stay 251/251. Run these one at a time: the
