@@ -20,4 +20,6 @@ assert paths == [
 ]
 assert open(paths[0], "rb").read() == b"\xca\xfe\xba\xbeA"
 assert not os.path.exists(os.path.join(tmp, "escape.class"))
+listed = jarload.classes_in(jarload.jar_dest(jar_path))
+assert [name for name, _path in listed] == ["com/example/A", "com/example/B"]
 print("ok")

@@ -107,9 +107,10 @@ arguments/results are typed as int32/int64 at call sites (`jvm_call` has no floa
 
 ### 3. JAR support — one class per view; **Whole JAR** opens all of them (jvm-13)
 A `.class` is still one view. **File > Load whole jar...** (also an open-dialog mode, "Whole JAR...")
-unpacks `foo.jar` to `foo/` next to it and opens every `.class` with the existing JVM Class view.
-Inner classes and supertypes keep resolving from that directory. One combined view for every class
-in the JAR is not the model: method addresses are per view. Nested JARs and the manifest are jvm-15.
+unpacks `foo.jar` to `foo/` next to it and asks which class to open. The decompiler reads other
+classes from that folder when it needs them (inner classes, supertypes, varargs); **JVM > Open class
+from this JAR...** opens one of those as a tab. One combined view for every class is not the model:
+method addresses are per view. Nested JARs and the manifest are jvm-15.
 
 ### 4. Patching — **NOT a goal** ✅ (removed)
 Per project decision, interactive patching is out of scope; the ported

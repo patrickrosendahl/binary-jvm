@@ -1,6 +1,6 @@
-"""Whole JAR loading (jvm-13): unpack a .jar next to itself and open every class with the existing
-JVM Class view. One class is still one view; this is only another way to get those files open.
-Sibling lookup (inner classes, supertypes) keeps reading .class files from that directory."""
+"""Whole JAR loading (jvm-13): unpack a .jar next to itself. The decompiler reads another class from
+that directory when it needs one (inner classes, supertypes, varargs). A tab opens only for a class
+the user picks from the list. One class is still one view."""
 import os
 import zipfile
 
@@ -48,8 +48,50 @@ def extract_classes(jar_path, dest=None):
     return sorted(written)
 
 
+def classes_in(dest):
+    """(binary name, absolute path) of every .class under an unpacked jar directory"""
+    dest = os.path.abspath(dest)
+    found = []
+    for dirpath, _dirs, files in os.walk(dest):
+        for name in files:
+            if not name.endswith(".class"):
+                continue
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, dest)[:-len(".class")].replace(os.sep, "/")
+            found.append((rel, full))
+    return sorted(found)
+
+
+def choose_class(found, title):
+    """filterable list of binary names. Returns the chosen path, or None if cancelled."""
+    from binaryninja import get_large_choice_input
+    if not found:
+        return None
+    index = get_large_choice_input("Open", title, [name for name, _path in found])
+    if index is None:
+        return None
+    return found[index][1]
+
+
+def open_class_tab(path):
+    """open one .class as a JVM Class tab. Returns True if a window accepted it."""
+    from binaryninja import log_error
+    from binaryninjaui import UIContext, FileContext
+    ctxs = UIContext.allContexts()
+    ctx = UIContext.activeContext() or (ctxs[0] if ctxs else None)
+    if ctx is None:
+        log_error("Whole JAR: no window to open %s in" % path)
+        return False
+    frame = FileContext.openFilename(path)
+    if frame is None:
+        log_error("Whole JAR: could not open %s" % path)
+        return False
+    ctx.openFileContext(frame)
+    return True
+
+
 def load_whole_jar(path=None):
-    """ask for a .jar if path is omitted, unpack it, and open every class in the UI"""
+    """ask for a .jar if path is omitted, unpack it, then open the one class the user picks"""
     from binaryninja import get_open_filename_input, log_error, log_info
     if not path:
         path = get_open_filename_input("Open whole JAR", "*.jar")
@@ -57,27 +99,47 @@ def load_whole_jar(path=None):
             return
     path = os.path.abspath(path)
     try:
-        classes = extract_classes(path)
+        extract_classes(path)
     except (zipfile.BadZipFile, OSError) as e:
         log_error("Whole JAR: %s" % e)
         return
-    if not classes:
+    dest = jar_dest(path)
+    found = classes_in(dest)
+    if not found:
         log_error("Whole JAR: no .class entries in %s" % path)
         return
-    from binaryninjaui import UIContext, FileContext
-    ctx = UIContext.activeContext()
-    if ctx is None:
-        log_error("Whole JAR: no window to open classes in")
+    chosen = choose_class(found, "Whole JAR (%d classes)" % len(found))
+    if chosen is None:
+        log_info("Whole JAR: unpacked %d classes to %s" % (len(found), dest))
         return
-    opened = 0
-    for filename in classes:
-        frame = FileContext.openFilename(filename)
-        if frame is None:
-            log_error("Whole JAR: could not open %s" % filename)
-            continue
-        ctx.openFileContext(frame)
-        opened += 1
-    log_info("Whole JAR: opened %d classes from %s" % (opened, path))
+    if open_class_tab(chosen):
+        log_info("Whole JAR: opened %s (%d classes unpacked)" % (os.path.basename(chosen), len(found)))
+
+
+def open_class_in_same_tree(bv):
+    """chooser of the other classes in this class's unpacked directory (the decompiler reads those
+    files itself; this only opens a tab)"""
+    from binaryninja import log_error
+    from .classui import class_dir, class_info
+    info = class_info(bv)
+    root = class_dir(bv, info) if info else None
+    if not root or not os.path.isdir(root):
+        log_error("Open class: this file is not inside an unpacked JAR directory")
+        return
+    found = classes_in(root)
+    chosen = choose_class(found, "Classes in %s" % os.path.basename(root.rstrip(os.sep)))
+    if chosen:
+        open_class_tab(chosen)
+
+
+def _has_tree(bv):
+    try:
+        from .classui import class_dir, class_info
+        info = class_info(bv)
+        root = class_dir(bv, info) if info else None
+        return bool(root and os.path.isdir(root))
+    except Exception:
+        return False
 
 
 def register():
@@ -96,7 +158,11 @@ def register():
     Menu.mainMenu("File").addAction(name, "Open")
     UIContext.registerFileOpenMode(
         "Whole JAR...",
-        "Unpack a JAR next to itself and open every class with the JVM Class view.",
+        "Unpack a JAR next to itself. Pick a class to open; the decompiler reads the others from that folder when it needs them.",
         name)
-    PluginCommand.register(name, "Unpack a JAR and open every .class in its own view",
+    PluginCommand.register(name, "Unpack a JAR, then choose which class to open",
                            lambda bv: load_whole_jar(), lambda bv: True)
+    pick = "JVM\\Open class from this JAR..."
+    PluginCommand.register(pick, "Choose another class in the same unpacked JAR and open it",
+                           open_class_in_same_tree,
+                           lambda bv: _has_tree(bv))
