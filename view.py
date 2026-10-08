@@ -354,9 +354,8 @@ class ClassView(BinaryView):
             print(traceback.format_exc())
             return False
         
-    def define_methods(self, classStruct, define=True):
-        # each method with code gets its own segment, function and symbol.
-        # define=False only records the entry point (a reopened database already has the functions).
+    def define_methods(self, classStruct):
+        # each method with code gets its own segment, function and symbol
         names = set()
         self.entry_address = 0  # the class-file header, unless some method qualifies (see below)
         entry_rank = 3
@@ -371,13 +370,12 @@ class ClassView(BinaryView):
                 posfix += 1
             names.add(name)
             base = method_address(method.index)
-            if define:
-                length = code.end_address-code.start_address
-                self.add_auto_segment(base, length, code.start_address, length, SegmentFlag.SegmentReadable | SegmentFlag.SegmentExecutable)
-                self.add_function(base)
-                # a user symbol, so a rename survives re-analysis (an auto symbol would be replaced).
-                # on reopen, leave a symbol the user already owns alone (jvm-18)
-                self._define_unless_user(Symbol(SymbolType.FunctionSymbol, base, name))
+            length = code.end_address-code.start_address
+            self.add_auto_segment(base, length, code.start_address, length, SegmentFlag.SegmentReadable | SegmentFlag.SegmentExecutable)
+            self.add_function(base)
+            # a user symbol, so a rename survives re-analysis (an auto symbol would be replaced).
+            # on reopen, leave a symbol the user already owns alone (jvm-18)
+            self._define_unless_user(Symbol(SymbolType.FunctionSymbol, base, name))
             # entry point: public static void main(String[]), else <clinit>, else the first method
             if method.name == "main" and method.descriptor == "([Ljava/lang/String;)V" and method.access_flags & ACC_STATIC:
                 rank = 0
@@ -390,7 +388,7 @@ class ClassView(BinaryView):
             # exception handlers are part of the method (the lifter models the exception edges, jvm-42);
             # the exception table is kept for the Pseudo Java printer: [[start_pc, end_pc, handler_pc,
             # catch class ("" = any)], ...], pcs relative to the method's base
-            if define and code.exception_table:
+            if code.exception_table:
                 func = self.get_function_at(base)
                 if func is not None:
                     func.store_metadata("jvm.exception_table", [
