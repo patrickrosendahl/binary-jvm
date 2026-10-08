@@ -37,7 +37,7 @@ for rel in CLASSES:
             out.append("// render raised %r" % e)
     path = os.path.join(OUT_DIR, rel[:-len(".class")] + ".pj")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as fh:
+    with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(out) + "\n")
     print("%-60s %3d methods %.1fs" % (rel, len(v.functions), time.time() - t))
     v.file.close()

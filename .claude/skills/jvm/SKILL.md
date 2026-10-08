@@ -44,7 +44,8 @@ Universal view active — switch to "JVM Class" (GUI: view dropdown; MCP: `bn_bi
    needed only for UI tabs (`bv`/`bvs`/`--view`/`--main-thread`).
    Gates (CLAUDE.md has the `--max` lines): `tests/bn_dump_all.sh pj|cv [jvm_devN]` (dumps in 4 parallel
    batches, a few minutes), then `vineflower_compare.py` / `class_view_compare.py`; and
-   `tests/bn_pseudo_java_compare_all.sh` (~15 min, background). Run all of them before resolving a ticket
+   `tests/bn_pseudo_java_compare_all.sh` (~15 min, background). Java 8 constructs: `tests/vineflower_suite.py prep`, `bn_dump_all.sh suite`,
+   `vineflower_suite.py compare` (Vineflower's own tests, jvm-77). Run all of them before resolving a ticket
    that touches `view.py`, `classfile.py`, `classui.py` or `pseudo_java.py`, not only the ones for the file you changed.
 3. Real install (**installed**): symlink the
    repo as `plugins/binary-jvm` and set the Universal exclusion; after changing

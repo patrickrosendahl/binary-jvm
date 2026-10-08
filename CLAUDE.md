@@ -90,6 +90,9 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
  extra statements against Vineflower come from); and `tests/bn_pseudo_java_compare_all.sh [jvm_devN]` (~18-25 min):
  every mdg method with an exception table against HLIL -- must stay 251/251 (~15 min on an idle machine). Both
  scripts fill the 4 parallel bnrun slots, so run them one after the other (compare_all in the background).
+ **Vineflower's test corpus** (Java 8 constructs mdg lacks; jvm-77): `python3 tests/vineflower_suite.py prep` (once),
+ `tests/bn_dump_all.sh suite [jvm_devN]` (~12 min), `python3 tests/vineflower_suite.py compare` (gate at the current
+ totals; wiki `vineflower-comparison.md` has the per-family table).
  **Class view gate** (after a `classui.py` / class metadata change): `tests/bn_dump_all.sh cv [jvm_devN]`
  (~4 min), then `python3 tests/class_view_compare.py --max imports=2 headers=0 fields=0 override=0 head=0 throws=0 missing=0`
  (declarations against Vineflower; the 2 imports are types Vineflower names for locals we fold away), and

@@ -35,7 +35,7 @@ for rel in CLASSES:
         out = ["// render_class raised %r" % e] + ["// " + l for l in traceback.format_exc().splitlines()]
     path = os.path.join(OUT_DIR, rel[:-len(".class")] + ".java")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as fh:
+    with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(out) + "\n")
     print("%-60s %.1fs" % (rel, time.time() - t))
     v.file.close()

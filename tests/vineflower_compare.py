@@ -373,6 +373,7 @@ def main():
     ap.add_argument("--excess", type=int, default=0, help="list the N methods with the most extra statements")
     ap.add_argument("--json")
     ap.add_argument("--pj", default=os.path.join(OUT, "pj"), help="directory of the Pseudo Java dump")
+    ap.add_argument("--vf", default=os.path.join(OUT, "vf"), help="directory of the Vineflower output")
     ap.add_argument("--max", nargs="*", default=[], help="K=V: fail if total K exceeds V")
     a = ap.parse_args()
     classes = a.classes or DEFAULT_CLASSES
@@ -383,7 +384,7 @@ def main():
     for rel in classes:
         simple = os.path.basename(rel)[:-len(".class")]
         pj_path = os.path.join(a.pj, rel[:-len(".class")] + ".pj")
-        vf_path = os.path.join(OUT, "vf", os.path.dirname(rel), simple + ".java")
+        vf_path = os.path.join(a.vf, os.path.dirname(rel), simple + ".java")
         if not (os.path.exists(pj_path) and os.path.exists(vf_path)):
             print("missing", pj_path if not os.path.exists(pj_path) else vf_path)
             continue
