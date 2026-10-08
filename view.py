@@ -183,6 +183,41 @@ def define_components(view, reader):
         if var is not None:
             parent.add_data_variable(var)
 
+def same_class_call_refs(view, reader):
+    """jvm-36: an invoke* of a method in this class gets a code ref to that method, so xrefs work.
+    The call itself still goes through the pool slot (Pseudo Java keys off that). Cross-class
+    targets need the JAR model (jvm-13)."""
+    cls = reader.classStruct
+    targets = {(m.name, m.descriptor): method_address(m.index)
+               for m in cls.methods if m.code_attribute is not None}
+    for method in cls.methods:
+        if method.code_attribute is None:
+            continue
+        base = method_address(method.index)
+        func = view.get_function_at(base)
+        if func is None:
+            continue
+        code = method.code_attribute.attribute
+        data = memoryview(reader.data)[code.start_address:code.end_address]
+        off = 0
+        while off < len(data):
+            name, operand, length, value = decode_instruction(data[off:], base + off)
+            if name is None:
+                break
+            if name.startswith("invoke") and name != "invokedynamic":
+                index = value[0] if isinstance(value, tuple) else value
+                entry = reader.poolEntry(index)
+                if isinstance(entry, (JVMMethodReference, JVMInterfaceMethodReference)):
+                    owner = reader.poolEntry(entry.classReference)
+                    nat = reader.poolEntry(entry.nameAndType)
+                    mname = str(reader.poolEntry(nat.identifier)) if nat is not None else None
+                    desc = reader.memberDescriptor(index)
+                    target = targets.get((mname, desc)) if str(owner) == cls.name else None
+                    addr = base + off
+                    if target is not None and target not in view.get_code_refs_from(addr, func):
+                        func.add_user_code_ref(addr, target)
+            off += length
+
 def completeUpdateWhenDone(event):
     view = event.view
     reader = reader_for_view(view)
@@ -190,6 +225,8 @@ def completeUpdateWhenDone(event):
         analyze_tables(view, f)
         if reader is not None:
             name_locals(view, f, reader)
+    if reader is not None:
+        same_class_call_refs(view, reader)
     if reader is not None and getattr(reader, "pending_components", False):
         reader.pending_components = False
         define_components(view, reader)

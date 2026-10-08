@@ -9,9 +9,9 @@ stack as registers (jvm-33), typed signatures + names (jvm-35), compare fusion (
 edges inside methods (jvm-42), a Pseudo Java language representation (jvm-43/44) and a class view
 (jvm-41). The plugin is **installed** again (symlink + `files.container.excludedTransforms = ["Universal"]`).
 
-**▶ Handoff (2026-10-08 11:30).** Through jvm-17 (renames and comments survive a `.bndb`) the older
-roadmap is resolved, plus jvm-21/24/25. Next is **jvm-36** (same-class call edges), then the JAR decision
-jvm-13. jvm-68 still waits until binary-cpp needs a shared part.
+**▶ Handoff (2026-10-08 11:40).** Through jvm-36 the older roadmap's next concrete item is done:
+an `invoke*` of a method in the same class has a code ref to it. Next is the JAR decision **jvm-13**
+(one class / all classes / hybrid), then jvm-14/15/12. jvm-68 still waits until binary-cpp needs a shared part.
 The running Binary Ninja loaded `17a0987` at startup; a restart picks up later commits. Run BN gates one at a
 time; under heavy machine load compare_all needs > 40 min and times out.
 
