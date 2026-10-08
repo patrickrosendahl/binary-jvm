@@ -394,6 +394,8 @@ def main():
         hoisted = {m.group(1) for f in fields for m in [re.search(r"([\w$]+)\s*=", f)] if m}
         pj = pj_methods(pj_path, simple)
         for key, body in pj.items():
+            if key.startswith(("lambda$", "access$")):
+                continue  # printed inline at its invokedynamic (jvm-79) / at its calls (jvm-44)
             vbody = vf.get(key)
             if vbody is None and key.startswith(("<init>/", "<clinit>/")):
                 vbody = []  # Vineflower dropped an empty / fully hoisted initialiser

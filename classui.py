@@ -17,9 +17,9 @@ from .javatypes import (ACC_STATIC, ACC_ENUM, ACC_SYNTHETIC, ACC_BRIDGE, ACC_PRI
                         package_of, dotted, class_signature, field_signature, method_signature)
 from .constants import ARCH_NAME
 try:
-    from .pseudo_java import class_supertypes, class_method_flags
+    from .pseudo_java import class_supertypes, class_method_flags, accessor_shape
 except ImportError:
-    class_supertypes = class_method_flags = None
+    class_supertypes = class_method_flags = accessor_shape = None
 
 # methods of common JDK types a class may override (there is no class file at hand for them):
 # binary name -> (superclass, interfaces, {name + descriptor})
@@ -522,6 +522,8 @@ def render_class(bv, nested=None, refs=None, cache=None):
     for f in info["fields"]:
         if nested is not None and f["access_flags"] & ACC_SYNTHETIC:
             continue  # this$0, val$x: the outer instance and captured locals
+        if f["name"] == "$assertionsDisabled" and f["access_flags"] & ACC_SYNTHETIC:
+            continue  # javac's assert switch; asserts print as `assert` (jvm-44)
         ftype = java_type_name(f["descriptor"], short=True)
         if f["signature"]:
             try:
@@ -533,8 +535,23 @@ def render_class(bv, nested=None, refs=None, cache=None):
         init = " = " + value if value else ""
         out.append(INDENT + " ".join(words) + init + ";" +
                    ("  // synthetic" if f["access_flags"] & ACC_SYNTHETIC else ""))
+    # javac's lambda bodies print at their invokedynamic (jvm-79); kept when a lambda there could not be inlined
+    lambdas_inlined = not any("/* invokedynamic */" in l for b in bodies.values() for l in b)
+    own_data = None
+    try:
+        base = class_dir(bv, info)
+        if base and accessor_shape is not None:
+            with open(os.path.join(base, info["name"].replace(".", "/") + ".class"), "rb") as fh:
+                own_data = fh.read()
+    except OSError:
+        pass
     inherited = supertype_methods(bv, info)
     for m in info["methods"]:
+        if lambdas_inlined and m["name"].startswith("lambda$") and m["access_flags"] & ACC_SYNTHETIC:
+            continue
+        if own_data and m["name"].startswith("access$") and m["access_flags"] & ACC_SYNTHETIC and \
+                accessor_shape(own_data, m["name"], m["descriptor"]) is not None:
+            continue  # its calls print as the member access it stands for (jvm-44)
         if id(m) in hidden or (m["access_flags"] & ACC_BRIDGE and m["access_flags"] & ACC_SYNTHETIC) or \
                 (nested is not None and m["access_flags"] & ACC_SYNTHETIC):
             continue  # (a bridge method only forwards to the generic method it was made for)

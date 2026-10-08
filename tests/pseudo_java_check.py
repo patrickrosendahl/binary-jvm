@@ -210,6 +210,21 @@ check("cg three outcomes", top, ("dec", "p", 3, 2))  # not reducible: cg_verify 
 check("cg verify wrong", pj.cg_verify({0: A, 1: B, 2: ('dec', 'q', 0, 1), 3: ('dec', 'p', 2, 1)}, 3,
                                       ('dec', ('or', 'p', 'q'), 0, 1)), False)
 
+# javac's Java 8 desugaring (jvm-44): tests/synthetic/idioms (Idioms.java, compiled --release 8)
+IDIOMS = os.path.join(ROOT, "tests/synthetic/idioms/classes/jvmtest")
+idioms = open(os.path.join(IDIOMS, "Idioms.class"), "rb").read()
+shapes = {}
+for (name, desc), _ in pj.class_methods_code(idioms)[1].items():
+    if name.startswith("access$"):
+        a = pj.accessor_shape(idioms, name, desc)
+        shapes[name] = a and (a["kind"], a["static"], a["pre"], a["op"], a["member"][1])
+check("accessors", sorted(shapes.values(), key=str), sorted([
+    ("get", False, None, None, "i"), ("put", False, None, None, "i"), ("inc", False, False, "+", "i"),
+    ("inc", True, True, "-", "s"), ("compound", False, None, "|", "i"), ("call", False, None, None, "priv"),
+    ("get", True, None, None, "s")], key=str))
+check("switch map", pj.enum_switch_map(open(os.path.join(IDIOMS, "Idioms$1.class"), "rb").read(),
+                                       "$SwitchMap$java$util$concurrent$TimeUnit"), {1: "SECONDS", 2: "MINUTES"})
+
 if failures:
     print("\n".join(failures))
     print("%d failure(s)" % len(failures))

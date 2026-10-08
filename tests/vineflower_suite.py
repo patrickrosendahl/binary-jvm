@@ -21,9 +21,9 @@ VINEFLOWER = os.path.expanduser("~/dev/vineflower")
 OUT = os.path.join(REPO, ".scratch", "vfsuite")
 TESTS = os.path.join(OUT, "tests.txt")
 # the current totals: a regression gate like the mdg one (lower them as tickets land)
-MAX = ["temps=42", "gotos=16", "labels=14", "sync_comments=18", "offset_stores=0", "while_true=60", "while_true_excess=8", "plumbing=3",
+MAX = ["temps=41", "gotos=16", "labels=14", "sync_comments=18", "offset_stores=0", "while_true=60", "while_true_excess=8", "plumbing=3",
        "dead_code=0", "leaked_catch_var=0", "ref_zero=0", "double_casts=0", "type_mismatch=0", "if_else_assign=3",
-       "lost_calls=66", "lost_strings=46", "stmts=6417"]
+       "lost_calls=39", "lost_strings=40", "stmts=6139"]
 
 
 def java8_tests():

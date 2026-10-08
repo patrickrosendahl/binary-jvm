@@ -17,8 +17,9 @@ This is a **Python 3 port and lifter rewrite** of
 - **Exception handling.** Catch handlers and exception edges inside methods; Pseudo Java turns them
   into `try`/`catch`/`finally`, `synchronized` and try-with-resources blocks.
 - **Pseudo Java.** A language representation (pick *Pseudo Java* in the decompiler view) with folded
-  stack temporaries, named locals, loops instead of gotos, array literals, varargs calls and anonymous
-  classes at their `new`. Its output is measured against [Vineflower](https://github.com/Vineflower/vineflower)
+  stack temporaries, named locals, loops instead of gotos, array literals, varargs calls, anonymous
+  classes at their `new`, lambdas and method references, `assert`, switches on enums and Strings, and
+  private-member access through javac's `access$NNN` accessors. Its output is measured against [Vineflower](https://github.com/Vineflower/vineflower)
   (see `CLAUDE.md`, testing workflow).
 - **Class view.** **JVM > Show class** renders the class as Java declarations: header, fields with
   initialisers, method signatures, `throws`.

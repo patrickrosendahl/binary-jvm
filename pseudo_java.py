@@ -70,6 +70,11 @@ RETURN_VALUES = True         # if (c) { return false; } return true; -> return !
 ASSIGN_IN_CONDITIONS = True  # x = e; if (x == null) break; -> while ((x = e) != null) (jvm-82)
 CONDITION_GRAPHS = True      # an if/goto tree over shared outcomes -> if ((c ? a : b) && d) A else B (jvm-80)
 TRY_WITH_RESOURCES = True    # javac's try-with-resources desugaring (r = e; try..catch Throwable close..) -> try (R r = e) { } (jvm-78)
+ASSERTS = True               # if (!$assertionsDisabled && c) throw new AssertionError(m) -> assert !c : m (jvm-44)
+SWITCH_KEYS = True           # $SwitchMap$..[e.ordinal()] / String hashCode+equals key -> e == E.X, s.equals("x"), switch (e) (jvm-44)
+SYNTHETIC_ACCESS = True      # Outer.access$002(o, v) -> o.f = v; this.this$0 -> Outer.this in a member class (jvm-44)
+LAMBDAS = True               # invokedynamic LambdaMetafactory -> `x -> body` from the lambda$ method, `Type::m` (jvm-79)
+LAMBDA_FACTORIES = ("java/lang/invoke/LambdaMetafactory.metafactory", "java/lang/invoke/LambdaMetafactory.altMetafactory")
 # intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
 PURE_INTRINSICS = {"getfield", "arraylength", "checkcast", "instanceof", "new", "newarray", "anewarray",
                    "multianewarray", "__exception"}
@@ -102,6 +107,9 @@ STRING_BUILDERS = ("java/lang/StringBuilder", "java/lang/StringBuffer")
 ACC_PUBLIC, ACC_PRIVATE, ACC_PROTECTED, ACC_STATIC = 0x0001, 0x0002, 0x0004, 0x0008
 ACC_FINAL, ACC_SYNCHRONIZED, ACC_NATIVE, ACC_ABSTRACT, ACC_VARARGS = 0x0010, 0x0020, 0x0100, 0x0400, 0x0080
 ACC_STRICT = 0x0800
+ACC_SYNTHETIC_M = 0x1000
+# MethodHandle reference kinds (JVMS 4.4.8)
+REF_INVOKE_VIRTUAL, REF_INVOKE_STATIC, REF_INVOKE_SPECIAL, REF_NEW_INVOKE_SPECIAL, REF_INVOKE_INTERFACE = 5, 6, 7, 8, 9
 
 
 def java_class_name(internal, simple=None):
@@ -301,6 +309,195 @@ def class_method_flags(data):
         return out
     except Exception:
         return None
+
+
+def class_methods_code(data):
+    """(pool, {(name, descriptor): (access flags, code bytes or None)}) of a class file (pure; None if it does
+    not parse). pool: index -> ('utf8', text) / ('class', name index) / ('ref', class index, name-and-type
+    index) / ('nat', name index, descriptor index) / ('str', utf8 index) / ('int', value)"""
+    import struct
+    try:
+        if data[:4] != b"\xca\xfe\xba\xbe":
+            return None
+        count = struct.unpack_from(">H", data, 8)[0]
+        pool, i, idx = {}, 10, 1
+        while idx < count:
+            tag = data[i]
+            if tag == 1:
+                n = struct.unpack_from(">H", data, i + 1)[0]
+                pool[idx] = ('utf8', data[i + 3:i + 3 + n].decode("utf-8", "replace"))
+                i += 3 + n
+            else:
+                if tag == 7:
+                    pool[idx] = ('class', struct.unpack_from(">H", data, i + 1)[0])
+                elif tag == 8:
+                    pool[idx] = ('str', struct.unpack_from(">H", data, i + 1)[0])
+                elif tag == 3:
+                    pool[idx] = ('int', struct.unpack_from(">i", data, i + 1)[0])
+                elif tag in (9, 10, 11):
+                    pool[idx] = ('ref',) + struct.unpack_from(">HH", data, i + 1)
+                elif tag == 12:
+                    pool[idx] = ('nat',) + struct.unpack_from(">HH", data, i + 1)
+                i += 1 + _CP_SIZES[tag]
+            idx += 2 if tag in (5, 6) else 1
+        utf8 = lambda k: pool.get(k, (None, None))[1] if pool.get(k, ('',))[0] == 'utf8' else None
+        i += 6
+        i += 2 + 2 * struct.unpack_from(">H", data, i)[0]
+        out = {}
+        for kind in ("fields", "methods"):
+            n = struct.unpack_from(">H", data, i)[0]
+            i += 2
+            for _ in range(n):
+                flags, name, desc, attrs = struct.unpack_from(">HHHH", data, i)
+                i += 8
+                code = None
+                for _ in range(attrs):
+                    aname, alen = struct.unpack_from(">HI", data, i)
+                    if kind == "methods" and utf8(aname) == "Code":
+                        clen = struct.unpack_from(">I", data, i + 10)[0]
+                        code = bytes(data[i + 14:i + 14 + clen])
+                    i += 6 + alen
+                if kind == "methods":
+                    out[(utf8(name), utf8(desc))] = (flags, code)
+        return pool, out
+    except Exception:
+        return None
+
+
+def pool_member(pool, index):
+    """(owner, name, descriptor) of a Fieldref / Methodref / InterfaceMethodref of class_methods_code's pool"""
+    e = pool.get(index)
+    if not e or e[0] != 'ref':
+        return None
+    cls, nat = pool.get(e[1]), pool.get(e[2])
+    if not cls or cls[0] != 'class' or not nat or nat[0] != 'nat':
+        return None
+    text = lambda k: pool.get(k, (None, None))[1]
+    return text(cls[1]), text(nat[1]), text(nat[2])
+
+
+_ARITH = {"add": "+", "sub": "-", "mul": "*", "div": "/", "rem": "%", "and": "&", "or": "|", "xor": "^",
+          "shl": "<<", "shr": ">>", "ushr": ">>>"}
+# javac's accessor bodies, normalized (Ln: load of local n, ONE: the constant 1, OP: an arithmetic instruction,
+# DUPX: dup_x1/dup2_x1, DUP: dup/dup2, F: the field instruction, R: the return) -> (kind, static, pre)
+_ACCESSORS = {
+    ("L0", "getfield", "R"): ("get", False, None),
+    ("getstatic", "R"): ("get", True, None),
+    ("L0", "L1", "DUPX", "putfield", "R"): ("put", False, None),
+    ("L0", "DUP", "putstatic", "R"): ("put", True, None),
+    ("L0", "DUP", "getfield", "DUPX", "ONE", "OP", "putfield", "R"): ("inc", False, False),
+    ("L0", "DUP", "getfield", "ONE", "OP", "DUPX", "putfield", "R"): ("inc", False, True),
+    ("getstatic", "DUP", "ONE", "OP", "putstatic", "R"): ("inc", True, False),
+    ("getstatic", "ONE", "OP", "DUP", "putstatic", "R"): ("inc", True, True),
+    ("L0", "DUP", "getfield", "L1", "OP", "DUPX", "putfield", "R"): ("compound", False, None),
+    ("getstatic", "L0", "OP", "DUP", "putstatic", "R"): ("compound", True, None),
+}
+
+
+def accessor_shape(data, name, desc):
+    """what javac's synthetic accessor `static T access$NNN(...)` (private member access from a nested class
+    before Java 11) does, from its code (pure; None for anything else). A dict: kind 'get' `p0.f` / `Owner.f`,
+    'put' `p0.f = p1`, 'inc' `p0.f++` / `--Owner.f` (op '+'/'-', pre), 'compound' `p0.f |= p1` (op), 'call'
+    `p0.m(p1..)` / `Owner.m(p0..)`, 'new' `new Owner(p0..)`; static, member (owner, name, descriptor)"""
+    from .opcodes import decode_instruction
+    parsed = class_methods_code(data) if data else None
+    if parsed is None:
+        return None
+    pool, methods = parsed
+    code = methods.get((name, desc), (0, None))[1]
+    if code is None:
+        return None
+    norm, member, op, off = [], None, None, 0
+    while off < len(code):
+        d = decode_instruction(code[off:], off)
+        if d[0] is None:
+            return None
+        n = d[0]
+        if n[:5] in ("iload", "lload", "fload", "dload", "aload") and len(n) in (5, 7):
+            norm.append("L%d" % (int(n[6:]) if len(n) == 7 else d[3]))
+        elif n in ("iconst_1", "lconst_1", "fconst_1", "dconst_1"):
+            norm.append("ONE")
+        elif n[:1] in "ilfd" and n[1:] in _ARITH:
+            norm.append("OP")
+            op = _ARITH[n[1:]]
+        elif n in ("dup_x1", "dup2_x1"):
+            norm.append("DUPX")
+        elif n in ("dup", "dup2"):
+            norm.append("DUP")
+        elif n.endswith("return"):
+            norm.append("R")
+        else:
+            if n in ("getfield", "putfield", "getstatic", "putstatic", "invokevirtual", "invokespecial",
+                     "invokestatic", "invokeinterface", "new"):
+                m = pool_member(pool, d[3]) if n != "new" else None
+                if m is not None:
+                    if member is not None and member != m:
+                        return None
+                    member = m
+            norm.append(n)
+        off += d[2]
+    norm = tuple(norm)
+    slots, slot = [], 0
+    for c in descriptor_arg_codes(desc):
+        slots.append("L%d" % slot)
+        slot += 2 if c in "JD" else 1
+    shape = _ACCESSORS.get(norm)
+    if shape is not None and member is not None:
+        kind, static, pre = shape
+        if len(slots) != {"get": 1, "put": 2, "inc": 1, "compound": 2}[kind] - static:
+            return None
+        if kind == "inc" and op not in ("+", "-"):
+            return None
+        return {"kind": kind, "static": static, "pre": pre, "op": op, "member": member}
+    if member is None or len(norm) < 2 or norm[-1] != "R":
+        return None
+    if norm[:-2] == tuple(slots) and norm[-2] in ("invokevirtual", "invokespecial", "invokestatic",
+                                                    "invokeinterface"):
+        static = norm[-2] == "invokestatic"
+        if not static and not slots:
+            return None
+        return {"kind": "call", "static": static, "pre": None, "op": None, "member": member}
+    if norm[:2] == ("new", "DUP") and norm[2:-2] == tuple(slots) and norm[-2] == "invokespecial" and \
+            member[1] == "<init>":
+        return {"kind": "new", "static": True, "pre": None, "op": None, "member": member}
+    return None
+
+
+def enum_switch_map(data, field):
+    """javac's `static final int[] $SwitchMap$pkg$E` of a synthetic class (`Outer$1`): {case number: enum constant
+    name} from its <clinit> -- `getstatic field; getstatic E.X; invokevirtual ordinal; push N; iastore` (pure;
+    None if the class does not parse or has no such stores)"""
+    from .opcodes import decode_instruction
+    parsed = class_methods_code(data) if data else None
+    if parsed is None:
+        return None
+    pool, methods = parsed
+    code = methods.get(("<clinit>", "()V"), (0, None))[1]
+    if code is None:
+        return None
+    ins, off = [], 0
+    while off < len(code):
+        d = decode_instruction(code[off:], off)
+        if d[0] is None:
+            break
+        ins.append(d)
+        off += d[2]
+    out = {}
+    for k in range(len(ins) - 4):
+        a, b, c, n, st = ins[k:k + 5]
+        if a[0] != "getstatic" or b[0] != "getstatic" or c[0] != "invokevirtual" or st[0] != "iastore":
+            continue
+        fa, fb, mc = pool_member(pool, a[3]), pool_member(pool, b[3]), pool_member(pool, c[3])
+        if not fa or fa[1] != field or not fb or not mc or mc[1] != "ordinal":
+            continue
+        if n[0].startswith("iconst_") and n[0] != "iconst_m1":
+            v = int(n[0][7:])
+        elif n[0] in ("bipush", "sipush"):
+            v = n[3]
+        else:
+            continue
+        out[v] = fb[1]
+    return out or None
 
 
 def varargs_call_args(desc, n_args, elems, overloads):
@@ -1109,6 +1306,60 @@ if _HAVE_BN:
             except Exception:
                 return None
 
+        def accessor(self, owner, name, desc):
+            """accessor_shape of a synthetic access$NNN method of a class in the same jar dir (cached)"""
+            cache = self.__dict__.setdefault("_accessors", {})
+            key = (owner, name, desc)
+            if key not in cache:
+                cache[key] = None
+                try:
+                    flags = self.class_flags(owner)
+                    if flags and flags.get((name, desc), 0) & ACC_SYNTHETIC_M and flags[(name, desc)] & ACC_STATIC:
+                        cache[key] = accessor_shape(self.sibling_class(owner), name, desc)
+                except Exception:
+                    pass
+            return cache[key]
+
+        def switch_map(self, owner, field):
+            """enum_switch_map of a $SwitchMap$ field of a (synthetic) class in the same jar dir (cached)"""
+            cache = self.__dict__.setdefault("_switch_maps", {})
+            if (owner, field) not in cache:
+                try:
+                    cache[(owner, field)] = enum_switch_map(self.sibling_class(owner), field)
+                except Exception:
+                    cache[(owner, field)] = None
+            return cache[(owner, field)]
+
+        def lambda_impl(self, index):
+            """(MethodHandle kind, owner, name, descriptor) of the implementation method of an invokedynamic through
+            LambdaMetafactory (a lambda or method reference, jvm-79), else None"""
+            e = self.entry(index)
+            if type(e).__name__ != "JVMInvokeDynamic":
+                return None
+            try:
+                r = self.reader
+                tpl = r.getBootstrap(e.bootstrap)
+                if str(r.poolEntry(tpl[0])) not in LAMBDA_FACTORIES or tpl[1] < 2:
+                    return None
+                mh = r.poolEntry(tpl[2][1])
+                if type(mh).__name__ != "JVMMethodHandle":
+                    return None
+                ref = r.poolEntry(mh.index)
+                return (mh.kind, str(r.poolEntry(ref.classReference)), str(r.poolEntry(ref.nameAndType)),
+                        r.memberDescriptor(mh.index))
+            except Exception:
+                return None
+
+        def method_named(self, name, desc):
+            """(address, access flags, LocalVariableTable entries) of a method of this class, else None"""
+            try:
+                for m in self.reader.classStruct.methods:
+                    if m.name == name and m.descriptor == desc:
+                        return METHOD_BASE + METHOD_STRIDE * m.index, m.access_flags, m.local_variables()
+            except Exception:
+                pass
+            return None
+
         def method_at(self, addr):
             """(name, descriptor, access_flags) of the method whose code starts at addr"""
             if isinstance(self.meta, dict):
@@ -1216,6 +1467,9 @@ if _HAVE_BN:
             self._finally_subs = None
             self._concat = {}       # expr_index of toString / indy call -> [(expr|str, is_string)]
             self._var_counts = None
+            self._case_labels = []      # switch_key of the switches being printed (case labels, jvm-44)
+            self._switch_keys = None
+            self._hoisted_caps = set()  # lambda invokedynamics whose computed captures print as declarations (jvm-79)
             self._names = None        # auto-named variable -> printed name (jvm-55)
             self.count_discount = {}  # var -> reads that no longer print (merged split conditions, jvm-54)
             self.break_subst = {}     # expr_index of a loop break -> (items, block) printed in its place (jvm-54)
@@ -2187,7 +2441,36 @@ if _HAVE_BN:
                 self._finally_decided = {}
                 self._loop_depth = 0
                 self._loop_pending = False
+                for text in self.unreachable_tries():
+                    self.note(tokens, text)
+                    tokens.new_line()
             self.emit_list(self.flatten(list(instr.body)), tokens, settings, instr, is_root)
+
+        def unreachable_tries(self):
+            """notes for try statements none of whose handlers has code in the function: nothing in the try
+            range can throw (e.g. only an iinc; jvm-87), so the lifter gives it no exception edge and the
+            handler code is unreachable -- say so instead of dropping the clauses silently"""
+            notes = []
+            func = self.function
+            from .opcodes import decode_instruction
+            from .methodinfo import THROWERS, IMPLICIT_THROWERS
+            for lo, hi, handlers in self.try_groups:
+                if any(func.get_basic_block_at(func.start + h) is not None for h, _ in handlers):
+                    continue
+                data, off, throws = func.view.read(func.start + lo, hi - lo + 8), 0, False
+                while off < hi - lo:
+                    d = decode_instruction(data[off:], func.start + lo + off)
+                    if d[0] is None or d[0] in THROWERS or d[0] in IMPLICIT_THROWERS or d[0] == "wide":
+                        throws = True  # (unreachable for another reason, e.g. only through another handler)
+                        break
+                    off += d[2]
+                if throws:
+                    continue
+                clauses = ", ".join("%s at pc %#x" % ("catch (%s)" % java_class_name(t) if t else "finally", h)
+                                    for h, t in handlers)
+                notes.append("// unreachable: %s -- nothing in the try range pc %#x..%#x can throw"
+                             % (clauses, lo, hi))
+            return notes
 
         def emit_list(self, body, tokens, settings, block, is_root=False, own=False):
             """emit a flattened statement list (see flatten); own: the statements are a handler body that is
@@ -2379,9 +2662,30 @@ if _HAVE_BN:
                 return var, ('arr', s.src, self.array_lits[var][1]), all(self.pure(x) for x in self.array_lits[var][1])
             if self.var_count(var) != 1 or self.def_count(var) != 1 or self.is_exc_var(var) or \
                     var == self.this_var or var in self.hoisted or self.is_exc_value(s.src) or \
-                    self.mentions_exc(s.src):
+                    self.mentions_exc(s.src) or var in self.lambda_captured():
                 return None
             return var, s.src, self.pure(s.src)
+
+        def lambda_captured(self):
+            """variables a lambda captures (arguments of an invokedynamic whose body is printed inline): the lambda
+            body prints them by name, so their value must not fold into it (it would be evaluated per call)"""
+            if getattr(self, "_captured", None) is None:
+                out = set()
+                if LAMBDAS:
+                    try:
+                        for i in _walk(self.hlil.root):
+                            if i.operation != Op.HLIL_CALL:
+                                continue
+                            shape = self.call_shape(i)
+                            if shape is None or shape[1] is not None:
+                                continue
+                            impl = self.info.lambda_impl(shape[0])
+                            if impl is not None and impl[2].startswith("lambda$"):
+                                out.update(a.var for a in shape[5] if a.operation == Op.HLIL_VAR)
+                    except Exception:
+                        pass
+                self._captured = out
+            return self._captured
 
         def pure(self, e):
             """no side effects (calls, stores, allocation with a constructor) when evaluated"""
@@ -3784,6 +4088,19 @@ if _HAVE_BN:
                 return need_separator
             if self.is_implicit_super(s) or s.operation == Op.HLIL_NORET:
                 return need_separator
+            if LAMBDAS and self.is_mref_null_check(body, idx):
+                return need_separator
+            if ASSERTS and self.is_assert_init(s):
+                return need_separator
+            if SWITCH_KEYS and s.expr_index in self.switch_keys()[1]:
+                return need_separator  # the key computation of a switch on an enum / String
+            if ASSERTS and s.operation == Op.HLIL_IF and s.as_ast and not isinstance(s, _ExcBranch):
+                shape = self.assert_shape(body, idx)
+                if shape is not None:
+                    if need_separator or (shape[1] and need_separator is not None):
+                        tokens.scope_separator()
+                    self.emit_assert(shape, body, idx, plan, tokens, settings, block)
+                    return bool(shape[1]) and shape[0] == 'throw'
             lock = self.monitor_var(s, "monitorexit")
             if lock is not None and lock in self.active_syncs:
                 return need_separator  # leaving the synchronized block
@@ -3891,6 +4208,8 @@ if _HAVE_BN:
             has_blocks = s.operation in COMPOUND
             if need_separator or (need_separator is not None and has_blocks):
                 tokens.scope_separator()
+            if LAMBDAS and not has_blocks:
+                self.hoist_lambda_captures(s, tokens, settings)
             if idx in plan["new_at"]:
                 self.emit_new(plan["new_at"][idx], tokens, settings)
                 tokens.append_semicolon()
@@ -5508,34 +5827,33 @@ if _HAVE_BN:
                     tokens.finalize_scope()
             elif o == Op.HLIL_SWITCH:
                 self.kw(tokens, "switch ")
-                self._cond(instr.condition, tokens, settings)
-                if instr.as_ast:
-                    if self.function.is_instruction_collapsed(instr):
-                        tokens.append(_tok(TT.CollapsedInformationToken, " ..."))
-                        return
-                    tokens.begin_scope(ScopeType.SwitchScopeType)
-                    for case in instr.cases:
-                        self.perform_get_expr_text(case, tokens, settings, P.TopLevelOperatorPrecedence, True)
-                        tokens.new_line()
-                    if instr.default is not None and instr.default.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
-                        tokens.prepend_instr_collapse_indicator(self.function, instr, 1)
-                        self.kw(tokens, "default")
-                        self.txt(tokens, ":")
-                        if self.function.is_instruction_collapsed(instr, 1):
-                            tokens.append(_tok(TT.CollapsedInformationToken, " ..."))
-                        else:
-                            tokens.begin_scope(ScopeType.CaseScopeType)
-                            self.emit_body(instr.default, tokens, settings, newline=False)
-                            tokens.end_scope(ScopeType.CaseScopeType)
-                    tokens.end_scope(ScopeType.SwitchScopeType)
-                    tokens.finalize_scope()
+                key = self.switch_key(instr.condition) if SWITCH_KEYS else None
+                if key is not None:
+                    tokens.append_open_paren()
+                    self.expr(key[1], tokens, settings)
+                    tokens.append_close_paren()
+                else:
+                    self._cond(instr.condition, tokens, settings)
+                self._case_labels.append(key)
+                try:
+                    self.emit_switch_body(instr, tokens, settings)
+                finally:
+                    self._case_labels.pop()
             elif o == Op.HLIL_CASE:
+                key = self._case_labels[-1] if self._case_labels else None
                 for i, value in enumerate(instr.values):
                     if i:
                         self.txt(tokens, ":")
                         tokens.new_line()
                     self.kw(tokens, "case ")
-                    self.expr(value, tokens, settings)
+                    if key is not None and value.operation == Op.HLIL_CONST and value.constant in key[2]:
+                        label = key[2][value.constant]
+                        if key[0] == 'enum':
+                            tokens.append(_tok(TT.FieldNameToken, label, value=0))
+                        else:
+                            tokens.append(_tok(TT.StringToken, java_string_literal(label)))
+                    else:
+                        self.expr(value, tokens, settings)
                 self.txt(tokens, ":")
                 if self.function.is_instruction_collapsed(instr):
                     tokens.append(_tok(TT.CollapsedInformationToken, " ..."))
@@ -5550,6 +5868,8 @@ if _HAVE_BN:
             elif o in (Op.HLIL_CALL, Op.HLIL_TAILCALL):
                 if o == Op.HLIL_TAILCALL:
                     self.kw(tokens, "return ")
+                elif statement:
+                    self.unused_lambda_decl(instr, tokens)
                 self.emit_call(instr, tokens, settings, precedence)
             elif o == Op.HLIL_INTRINSIC:
                 self.emit_intrinsic(instr, tokens, settings, precedence)
@@ -5565,6 +5885,8 @@ if _HAVE_BN:
                 tokens.append_close_bracket()
             elif o == Op.HLIL_VAR_INIT and statement and self.var_count(instr.dest) == 0 and \
                     instr.src.operation in (Op.HLIL_CALL, Op.HLIL_INTRINSIC):
+                if instr.src.operation == Op.HLIL_CALL:
+                    self.unused_lambda_decl(instr.src, tokens)
                 self.perform_get_expr_text(instr.src, tokens, settings, P.TopLevelOperatorPrecedence)
             elif o == Op.HLIL_VAR_INIT and instr.dest in self.array_lits and instr.dest not in self.hoisted:
                 self.emit_var_decl(instr.dest, instr, tokens, instr.src)
@@ -5712,6 +6034,28 @@ if _HAVE_BN:
                 self.note(tokens, "/* %s */" % instr.operation.name)
 
         # --- expression pieces --------------------------------------------------------------------
+        def emit_switch_body(self, instr, tokens, settings):
+            if instr.as_ast:
+                if self.function.is_instruction_collapsed(instr):
+                    tokens.append(_tok(TT.CollapsedInformationToken, " ..."))
+                    return
+                tokens.begin_scope(ScopeType.SwitchScopeType)
+                for case in instr.cases:
+                    self.perform_get_expr_text(case, tokens, settings, P.TopLevelOperatorPrecedence, True)
+                    tokens.new_line()
+                if instr.default is not None and instr.default.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
+                    tokens.prepend_instr_collapse_indicator(self.function, instr, 1)
+                    self.kw(tokens, "default")
+                    self.txt(tokens, ":")
+                    if self.function.is_instruction_collapsed(instr, 1):
+                        tokens.append(_tok(TT.CollapsedInformationToken, " ..."))
+                    else:
+                        tokens.begin_scope(ScopeType.CaseScopeType)
+                        self.emit_body(instr.default, tokens, settings, newline=False)
+                        tokens.end_scope(ScopeType.CaseScopeType)
+                tokens.end_scope(ScopeType.SwitchScopeType)
+                tokens.finalize_scope()
+
         def emit_label(self, instr, tokens):
             # same trick as pseudo_python: drop one indentation level for the label line
             tokens.init_line()
@@ -5802,6 +6146,11 @@ if _HAVE_BN:
             return None
 
         def emit_var(self, var, instr, tokens):
+            captures = getattr(self, "captures", None)
+            if captures and var in captures:  # a lambda$ parameter holding a captured value (jvm-79)
+                outer, value, settings = captures[var]
+                outer.perform_get_expr_text(value, tokens, settings, P.MemberAndFunctionOperatorPrecedence)
+                return
             if self.this_var is not None and var == self.this_var:
                 tokens.append(_tok(TT.KeywordToken, "this"))
                 return
@@ -5991,6 +6340,9 @@ if _HAVE_BN:
                 obj.operation == Op.HLIL_VAR and o2.operation == Op.HLIL_VAR and obj.var == o2.var
 
         def emit_binary(self, text, prec, instr, tokens, settings, precedence):
+            if SWITCH_KEYS and text in ("==", "!=") and not isinstance(instr, _Pair) and \
+                    self.emit_switch_key_cmp(text, instr, tokens, settings, precedence):
+                return
             if text in ("==", "!=") and instr.right.operation == Op.HLIL_CONST and instr.right.constant in (0, 1) \
                     and not isinstance(instr, _Pair) and self.code_of(instr.left) == 'Z':
                 # boolean b: b != 0 -> b, b == 0 -> !b
@@ -6194,9 +6546,14 @@ if _HAVE_BN:
                            for p in parts if p[1] is not None]
                     self.emit_concat(ops, tokens, settings, precedence)
                     return
+                if LAMBDAS and self.emit_lambda(instr, idx, args, tokens, settings, precedence):
+                    return
                 tokens.append(_tok(TT.CodeSymbolToken, name, value=slot))
                 self.annotation(tokens, " /* invokedynamic */")
                 self.args(tokens, settings, args)
+                return
+            if SYNTHETIC_ACCESS and recv is None and desc and name.startswith("access$") and \
+                    self.emit_accessor(owner, name, desc, list(args), tokens, settings, precedence):
                 return
             if HIDE_BOXING and owner in BOXES and desc:
                 if recv is None and name == "valueOf" and len(args) == 1 and desc[1] == BOXES[owner][1]:
@@ -6229,6 +6586,620 @@ if _HAVE_BN:
                 self.op(tokens, ".")
             tokens.append(_tok(TT.CodeSymbolToken, name, value=slot))
             self.typed_args(tokens, settings, args, desc, (owner, name))
+
+        # --- switch on an enum / a String (jvm-44) ------------------------------------------------------
+        # javac's `switch (e)` reads the case number from `Outer$1.$SwitchMap$pkg$E[e.ordinal()]`, its `switch (s)`
+        # first maps s to a case number (n = -1; switch (s.hashCode()) { case h: if (s.equals("x")) n = 0; ... })
+        # and switches on that. BN prints small switches as if-chains, so the key is replaced where it is used:
+        # `n == 1` -> `e == E.X` / `s.equals("x")`, `switch (n)` -> `switch (e)` with `case X:` / `case "x":`.
+        def enum_lookup(self, src):
+            """`$SwitchMap$..[e.ordinal()]` -> ('enum', e, {case number: constant name}, enum class), else None"""
+            field, ordinal, calls = None, None, 0
+            for i in _walk(src):
+                o = i.operation
+                if o in (Op.HLIL_CONST_PTR, Op.HLIL_IMPORT, Op.HLIL_CONST):
+                    idx = _pool_index(_const_target(i))
+                    m = self.info.member(idx) if idx is not None else None
+                    if m and m[1] and m[1].startswith("$SwitchMap$"):
+                        field = m
+                elif o == Op.HLIL_CALL or (o == Op.HLIL_INTRINSIC and i.intrinsic.name.startswith("invoke")):
+                    calls += 1
+                    sh = self.call_shape(i)
+                    if sh is not None and sh[2] == "ordinal" and sh[3] == "()I" and sh[4] is not None:
+                        ordinal = sh
+            if field is None or ordinal is None or calls != 1:
+                return None
+            labels = self.info.switch_map(field[0], field[1])
+            return ('enum', ordinal[4], labels, ordinal[1]) if labels else None
+
+        def equals_literal(self, c):
+            """`s.equals("x")` (or `!= 0` of it) -> (s, "x"), else None"""
+            if c.operation == Op.HLIL_CMP_NE and c.right.operation == Op.HLIL_CONST and c.right.constant == 0:
+                c = c.left
+            if c.operation not in (Op.HLIL_CALL, Op.HLIL_INTRINSIC):
+                return None
+            sh = self.call_shape(c)
+            if sh is None or sh[2] != "equals" or sh[4] is None or sh[4].operation != Op.HLIL_VAR or len(sh[5]) != 1:
+                return None
+            idx = _pool_index(_const_target(sh[5][0]))
+            lit = self.info.string(idx) if idx is not None else None
+            return (sh[4], lit) if lit is not None else None
+
+        @staticmethod
+        def top_statement(x):
+            """the statement of a block that contains x"""
+            while x.parent is not None and x.parent.operation != Op.HLIL_BLOCK:
+                x = x.parent
+            return x
+
+        def string_key(self, var, defs):
+            """('string', s, {case number: literal}, None) and the statements to hide, when var is javac's case
+            number of a switch on the String s"""
+            init = [d for d in defs if d.src.operation == Op.HLIL_CONST and d.src.constant in (-1, 0xffffffff)]
+            ks = [d for d in defs if d not in init]
+            if len(init) != 1 or not ks or init[0].operation != Op.HLIL_VAR_INIT:
+                return None
+            labels, subject, top = {}, None, None
+            for d in ks:
+                if d.src.operation != Op.HLIL_CONST or d.src.constant < 0:
+                    return None
+                x, found = d, None
+                while x.parent is not None:
+                    p = x.parent
+                    if p.operation == Op.HLIL_IF:
+                        if p.true.expr_index != x.expr_index:
+                            return None
+                        found = self.equals_literal(self.logical_chain(p.condition, Op.HLIL_AND)[-1])
+                        break
+                    x = p
+                if found is None or (subject is not None and found[0].var != subject.var):
+                    return None
+                subject = found[0]
+                if labels.get(d.src.constant, found[1]) != found[1]:
+                    return None
+                labels[d.src.constant] = found[1]
+                t = self.top_statement(d)
+                if top is not None and t.expr_index != top.expr_index:
+                    return None
+                top = t
+            # the hash dispatch: only the key, s, its hashCode and equals calls
+            hidden = [init[0], top]
+            hashes = set()
+            for st in self.stmts_of(top.parent) if top.parent is not None else []:
+                if st.operation == Op.HLIL_VAR_INIT and st.src.operation in (Op.HLIL_CALL, Op.HLIL_INTRINSIC):
+                    sh = self.call_shape(st.src)
+                    if sh is not None and sh[2] == "hashCode" and sh[4] is not None and \
+                            sh[4].operation == Op.HLIL_VAR and sh[4].var == subject.var:
+                        hashes.add(st.dest)
+                        hidden.append(st)
+            for i in _walk(top):
+                if i.operation == Op.HLIL_VAR and i.var not in (var, subject.var) and i.var not in hashes:
+                    return None
+                if i.operation == Op.HLIL_CALL or (i.operation == Op.HLIL_INTRINSIC and i.intrinsic.name.startswith("invoke")):
+                    sh = self.call_shape(i)
+                    if sh is None or sh[2] not in ("equals", "hashCode"):
+                        return None
+            if any(self.var_count(h) != sum(1 for i in _walk(top) if i.operation == Op.HLIL_VAR and i.var == h)
+                   for h in hashes):
+                return None  # the hash is read outside the dispatch
+            return ('string', subject, labels, None), hidden
+
+        def switch_keys(self):
+            """({key variable: switch_key}, expr_index of the statements that compute keys -- not printed)"""
+            if self._switch_keys is not None:
+                return self._switch_keys
+            keys, hidden = {}, set()
+            self._switch_keys = (keys, hidden)
+            if not SWITCH_KEYS or not self.hlil:
+                return self._switch_keys
+            try:
+                defs = {}
+                for i in _walk(self.hlil.root):
+                    if i.operation == Op.HLIL_VAR_INIT:
+                        defs.setdefault(i.dest, []).append(i)
+                    elif i.operation == Op.HLIL_ASSIGN and i.dest.operation == Op.HLIL_VAR:
+                        defs.setdefault(i.dest.var, []).append(i)
+                for var, ds in defs.items():
+                    if self.def_count(var) > len([d for d in ds if d.operation == Op.HLIL_VAR_INIT]):
+                        continue  # declared apart
+                    found = None
+                    if len(ds) == 1 and ds[0].operation == Op.HLIL_VAR_INIT:
+                        key = self.enum_lookup(ds[0].src)
+                        if key is not None:
+                            found = key, [ds[0]]
+                    elif len(ds) >= 2:
+                        found = self.string_key(var, ds)
+                    if found is None:
+                        continue
+                    key, stmts = found
+                    inside = {x.expr_index for st in stmts for x in _walk(st)}
+                    uses = [i for i in _walk(self.hlil.root) if i.operation == Op.HLIL_VAR and i.var == var
+                            and i.expr_index not in inside]
+                    if not uses or not all(self.key_use_ok(u, key) for u in uses):
+                        continue
+                    if key[1].operation != Op.HLIL_VAR:
+                        continue  # the subject would be evaluated at every use instead of once, at the key
+                    keys[var] = key
+                    hidden.update(st.expr_index for st in stmts)
+            except Exception:
+                keys.clear()
+                hidden.clear()
+            return self._switch_keys
+
+        def key_use_ok(self, u, key):
+            p = u.parent
+            if p is None:
+                return False
+            if p.operation in (Op.HLIL_CMP_E, Op.HLIL_CMP_NE) and p.left.expr_index == u.expr_index:
+                return p.right.operation == Op.HLIL_CONST and p.right.constant in key[2]
+            if p.operation == Op.HLIL_SWITCH and p.condition.expr_index == u.expr_index:
+                return all(v.operation == Op.HLIL_CONST and v.constant in key[2] for c in p.cases for v in c.values)
+            return False
+
+        def switch_key(self, e):
+            """the switch_key e stands for (a key variable or an inline $SwitchMap$ lookup), else None"""
+            if e.operation == Op.HLIL_VAR:
+                return self.switch_keys()[0].get(e.var)
+            if e.operation == Op.HLIL_DEREF or e.operation == Op.HLIL_ARRAY_INDEX:
+                key = self.enum_lookup(e)
+                return key if key is not None and key[1].operation == Op.HLIL_VAR else None
+            return None
+
+        def emit_switch_key_cmp(self, text, instr, tokens, settings, precedence):
+            """`n == 1` -> `e == E.X` / `s.equals("x")` (`!=`: `e != E.X` / `!s.equals("x")`)"""
+            key = self.switch_key(instr.left)
+            if key is None or instr.right.operation != Op.HLIL_CONST or instr.right.constant not in key[2]:
+                return False
+            label = key[2][instr.right.constant]
+            if key[0] == 'enum':
+                prec = BINARY[Op.HLIL_CMP_E][1]
+                parens = precedence > prec
+                if parens:
+                    tokens.append_open_paren()
+                self.perform_get_expr_text(key[1], tokens, settings, prec)
+                self.op(tokens, " %s " % text)
+                self.type_tok(tokens, java_class_name(key[3]))
+                self.op(tokens, ".")
+                tokens.append(_tok(TT.FieldNameToken, label, value=0))
+                if parens:
+                    tokens.append_close_paren()
+                return True
+            if text == "!=":
+                self.op(tokens, "!")
+            self.emit_receiver(key[1], tokens, settings)
+            self.op(tokens, ".")
+            tokens.append(_tok(TT.CodeSymbolToken, "equals", value=0))
+            tokens.append_open_paren()
+            tokens.append(_tok(TT.StringToken, java_string_literal(label)))
+            tokens.append_close_paren()
+            return True
+
+        # --- assert (jvm-44) -------------------------------------------------------------------------
+        def assert_flag(self, e):
+            """True for a read of the class's `$assertionsDisabled`, False for its negation, else None"""
+            neg = False
+            while True:
+                if e.operation == Op.HLIL_NOT:
+                    e, neg = e.src, not neg
+                elif e.operation in (Op.HLIL_CMP_E, Op.HLIL_CMP_NE) and e.right.operation == Op.HLIL_CONST and \
+                        e.right.constant == 0:
+                    neg ^= e.operation == Op.HLIL_CMP_E
+                    e = e.left
+                elif e.operation in (Op.HLIL_ZX, Op.HLIL_SX, Op.HLIL_LOW_PART):
+                    e = e.src
+                else:
+                    break
+            if e.operation != Op.HLIL_DEREF:
+                return None
+            idx = _pool_index(_const_target(e.src))
+            m = self.info.member(idx) if idx is not None else None
+            return (not neg) if m is not None and m[1] == "$assertionsDisabled" else None
+
+        def is_assert_init(self, s):
+            """`$assertionsDisabled = !X.class.desiredAssertionStatus()` in <clinit>"""
+            if s.operation != Op.HLIL_ASSIGN or s.dest.operation != Op.HLIL_DEREF:
+                return False
+            return self.assert_flag(s.dest) is True
+
+        @staticmethod
+        def logical_chain(e, op):
+            """a && b && c (op HLIL_AND) / a || b || c (HLIL_OR) -> [a, b, c] in evaluation order"""
+            if e.operation == op and e.size == 0:
+                return PseudoJavaFunction.logical_chain(e.left, op) + PseudoJavaFunction.logical_chain(e.right, op)
+            return [e]
+
+        def assertion_error(self, items):
+            """statements constructing and throwing a new AssertionError -> (message args,), else None"""
+            items = [x for x in items if not isinstance(x, _ExcBranch) and x.operation != Op.HLIL_NORET and
+                     not self.is_exc_plumbing(x)]
+            if not items:
+                return None
+            last = items[-1]
+            if last.operation != Op.HLIL_INTRINSIC or last.intrinsic.name != "__propagate" or len(last.params) != 1:
+                return None
+            v = last.params[0]
+            if len(items) == 1:
+                call = v  # new folded into its constructor call
+                recv_ok = lambda r: r.operation == Op.HLIL_INTRINSIC and r.intrinsic.name == "new"
+            elif len(items) == 3 and v.operation == Op.HLIL_VAR:
+                nv = self.new_assignment(items[0])
+                if nv is None or nv[0] != v.var or self.info.class_ref(nv[1]) != "java/lang/AssertionError":
+                    return None
+                call = self.stmt_call(items[1])
+                recv_ok = lambda r: r.operation == Op.HLIL_VAR and r.var == v.var
+            else:
+                return None
+            if call.operation not in (Op.HLIL_CALL, Op.HLIL_INTRINSIC):
+                return None
+            shape = self.call_shape(call)
+            if shape is None or shape[1] != "java/lang/AssertionError" or shape[2] != "<init>" or \
+                    shape[4] is None or not recv_ok(shape[4]) or len(shape[5]) > 1:
+                return None
+            return (list(shape[5]), shape[3])
+
+        def assert_shape(self, body, idx):
+            """javac's assert: `if (p && !$assertionsDisabled && c) { throw new AssertionError(m); }` -> ('throw', [p],
+            [c], message); `if (p || $assertionsDisabled || c) { B } throw new AssertionError(m);` with B ending the
+            flow -> ('pass', [p], [c], message, B), the throw being the rest of the list. p (a guard the assert sits
+            under) and c are optional; no c is `assert false`"""
+            s = body[idx]
+            if s.false is not None and s.false.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
+                return None
+            conj = self.logical_chain(s.condition, Op.HLIL_AND)
+            k = next((k for k, c in enumerate(conj) if self.assert_flag(c) is False), None)
+            if k is not None:
+                err = self.assertion_error(self.flatten(self.stmts_of(s.true)))
+                if err is None:
+                    return None
+                return ('throw', conj[:k], conj[k + 1:], err)
+            disj = self.logical_chain(s.condition, Op.HLIL_OR)
+            k = next((k for k, c in enumerate(disj) if self.assert_flag(c) is True), None)
+            if k is not None and idx + 1 < len(body):
+                rest = body[idx + 1:]
+                if any(isinstance(x, _ExcBranch) for x in rest):
+                    return None
+                err = self.assertion_error(rest)
+                items = self.flatten(self.stmts_of(s.true))
+                if err is None or not self.ends_flow(items):
+                    return None
+                return ('pass', disj[:k], disj[k + 1:], err, items)
+            return None
+
+        def emit_assert(self, shape, body, idx, plan, tokens, settings, block):
+            kind, guard, conds, (args, desc) = shape[:4]
+            if guard:  # if (p) { assert ...; } -- the guard holds when the assert is reached
+                self.kw(tokens, "if ")
+                tokens.append_open_paren()
+                for k, g in enumerate(guard):
+                    if k:
+                        self.op(tokens, " && " if kind == 'throw' else " || ")
+                    if kind == 'throw':
+                        self.expr(g, tokens, settings, P.LogicalAndOperatorPrecedence)
+                    else:  # p1 || p2 skips the assert: it runs under !p1 && !p2
+                        self.emit_negated(g, tokens, settings, P.LogicalAndOperatorPrecedence)
+                tokens.append_close_paren()
+                tokens.begin_scope(ScopeType.BlockScopeType)
+            self.kw(tokens, "assert ")
+            if not conds:
+                self.kw(tokens, "false")
+            elif kind == 'throw':  # thrown when c1 && c2 ...: assert !(c1 && c2)
+                if len(conds) == 1:
+                    self.emit_negated(conds[0], tokens, settings)
+                else:
+                    self.op(tokens, "!(")
+                    for k, c in enumerate(conds):
+                        if k:
+                            self.op(tokens, " && ")
+                        self.expr(c, tokens, settings, P.LogicalAndOperatorPrecedence)
+                    self.op(tokens, ")")
+            else:  # passes when c1 || c2 ...
+                for k, c in enumerate(conds):
+                    if k:
+                        self.op(tokens, " || ")
+                    self.expr(c, tokens, settings, P.LogicalOrOperatorPrecedence)
+            if args:
+                self.op(tokens, " : ")
+                self.emit_typed(args[0], descriptor_arg_codes(desc)[0] if desc else None, tokens, settings,
+                                P.TernaryOperatorPrecedence)
+            tokens.append_semicolon()
+            tokens.new_line()
+            if guard:
+                tokens.end_scope(ScopeType.BlockScopeType)
+                tokens.new_line()
+            if kind == 'pass':
+                plan["skip"].update(range(idx + 1, len(body)))
+                items = shape[4]
+                if plan.get("root") and self.returns_void and items and items[-1].operation == Op.HLIL_RET and \
+                        len(items[-1].src) == 0:
+                    items = items[:-1]  # the method's implicit return
+                self.emit_list(items, tokens, settings, body[idx].true)
+
+        # --- synthetic accessors (jvm-44) ------------------------------------------------------------
+        def emit_accessor(self, owner, name, desc, args, tokens, settings, precedence):
+            """`Outer.access$002(o, v)` -> `o.f = v` etc.: the member access javac's accessor stands for"""
+            a = self.info.accessor(owner, name, desc)
+            if a is None:
+                return False
+            kind, (mowner, mname, mdesc) = a["kind"], a["member"]
+            if kind == "new":
+                self.kw(tokens, "new ")
+                self.type_tok(tokens, java_class_name(mowner))
+                self.typed_args(tokens, settings, args, mdesc)
+                return True
+            if kind == "call":
+                if a["static"]:
+                    self.type_tok(tokens, java_class_name(mowner))
+                else:
+                    self.emit_receiver(args[0], tokens, settings)
+                    args = args[1:]
+                self.op(tokens, ".")
+                tokens.append(_tok(TT.CodeSymbolToken, mname, value=0))
+                self.typed_args(tokens, settings, args, mdesc)
+                return True
+            value = None if kind in ("get", "inc") else args[-1]
+            paren = kind != "get" and precedence is not None and precedence > P.AssignmentOperatorPrecedence
+            if paren:
+                tokens.append_open_paren()
+            if kind == "inc" and a["pre"]:
+                self.op(tokens, a["op"] * 2)
+            if a["static"]:
+                self.type_tok(tokens, java_class_name(mowner))
+            else:
+                self.emit_receiver(args[0], tokens, settings)
+            self.op(tokens, ".")
+            tokens.append(_tok(TT.FieldNameToken, mname, value=0))
+            if kind == "inc" and not a["pre"]:
+                self.op(tokens, a["op"] * 2)
+            elif kind in ("put", "compound"):
+                self.op(tokens, " = " if kind == "put" else " %s= " % a["op"])
+                self.emit_typed(value, mdesc[0], tokens, settings, P.AssignmentOperatorPrecedence)
+            if paren:
+                tokens.append_close_paren()
+            return True
+
+        # --- lambdas and method references (jvm-79) ---------------------------------------------------
+        def emit_lambda(self, call, idx, args, tokens, settings, precedence):
+            """an invokedynamic through LambdaMetafactory as `(a, b) -> body` (from the synthetic lambda$ method of
+            this class, its captured parameters replaced by the call's arguments) or as a method reference
+            `Type::m` / `x::m` / `Type::new`; False when it doesn't fit (printed as the invokedynamic call)"""
+            impl = self.info.lambda_impl(idx)
+            if impl is None:
+                return False
+            kind, owner, name, mdesc = impl
+            args = list(args)
+            if owner == self.info.class_name and name.startswith("lambda$"):
+                return self.emit_lambda_body(call, name, mdesc, args, tokens, settings, precedence)
+            if kind == REF_NEW_INVOKE_SPECIAL and not args:
+                self.type_tok(tokens, java_class_name(owner))
+                self.op(tokens, "::")
+                self.kw(tokens, "new")
+                return True
+            if len(args) == 1 and kind in (REF_INVOKE_VIRTUAL, REF_INVOKE_INTERFACE, REF_INVOKE_SPECIAL):
+                self.perform_get_expr_text(args[0], tokens, settings, P.MemberAndFunctionOperatorPrecedence)  # x::m
+            elif not args and kind in (REF_INVOKE_STATIC, REF_INVOKE_VIRTUAL, REF_INVOKE_INTERFACE):
+                self.type_tok(tokens, java_class_name(owner))  # Type::m (unbound receiver for an instance method)
+            else:
+                return False
+            self.op(tokens, "::")
+            tokens.append(_tok(TT.CodeSymbolToken, name, value=PSEUDOMEMORY_TABLE + idx * POOL_STRIDE))
+            return True
+
+        def unused_lambda_decl(self, call, tokens):
+            """`Runnable r = ` in front of a lambda / method reference whose value is never used (BN dropped the
+            store; a lambda is not a Java statement): the name from the LocalVariableTable of the store's slot"""
+            if not LAMBDAS:
+                return
+            shape = self.call_shape(call)
+            if shape is None or shape[1] is not None or not shape[3] or self.info.lambda_impl(shape[0]) is None:
+                return
+            desc = shape[3]
+            type_name = field_type_name(desc[desc.index(")") + 1:])
+            name = None
+            try:
+                after = call.address + 5  # invokedynamic is 5 bytes
+                data = self.function.view.read(after, 2)
+                op = data[0]
+                slot = op - 0x4b if 0x4b <= op <= 0x4e else data[1] if op == 0x3a else None  # astore_<n> / astore
+                m = self.info.method_named(self.method[0], self.method[1]) if self.method else None
+                if slot is not None and m is not None:
+                    pc = after + (2 if op == 0x3a else 1) - self.function.start
+                    for start, length, n, _, sl in m[2]:
+                        if sl == slot and start <= pc <= start + length:
+                            name = n
+            except Exception:
+                pass
+            self.type_tok(tokens, type_name)
+            self.txt(tokens, " ")
+            tokens.append(_tok(TT.LocalVariableToken, java_var_name(name) if name else name_from_type(type_name) or "f"))
+            self.op(tokens, " = ")
+
+        def lambda_calls(self, e, out):
+            """invokedynamic calls of inline lambda bodies in e (also inside folded temporaries), in print order"""
+            for i in _walk(e):
+                if i.operation == Op.HLIL_VAR and isinstance(self.inline.get(i.var), HighLevelILInstruction):
+                    self.lambda_calls(self.inline[i.var], out)
+                elif i.operation == Op.HLIL_CALL:
+                    shape = self.call_shape(i)
+                    if shape is not None and shape[1] is None:
+                        impl = self.info.lambda_impl(shape[0])
+                        if impl is not None and impl[1] == self.info.class_name and impl[2].startswith("lambda$"):
+                            out.append((i, impl, list(shape[5])))
+            return out
+
+        def hoist_lambda_captures(self, s, tokens, settings):
+            """`int bottom = list.size() * 2;` before a statement whose lambda captures a value BN propagated into
+            the invokedynamic: javac loaded it from a local (captured variables are effectively final), and the
+            lambda body prints that local by its name (the lambda$ parameter's)"""
+            for call, (_, _, name, mdesc), args in self.lambda_calls(s, []):
+                m = self.info.method_named(name, mdesc)
+                if m is None:
+                    continue
+                static = bool(m[1] & ACC_STATIC)
+                caps = args if static else args[1:]
+                if all(self.simple_capture(c) for c in caps) or any(self.mentions_exc(c) for c in caps):
+                    continue
+                lvt_names = {slot: n for start, _, n, _, slot in m[2] if start == 0}
+                types = descriptor_types(mdesc)[0]
+                for slot, (i, _) in sorted(arg_slots(mdesc, static).items()):
+                    if i < len(caps) and not self.simple_capture(caps[i]):
+                        self.type_tok(tokens, types[i])
+                        self.txt(tokens, " ")
+                        tokens.append(_tok(TT.LocalVariableToken, java_var_name(lvt_names.get(slot) or "p%d" % (i + 1))))
+                        self.op(tokens, " = ")
+                        self.emit_typed(caps[i], descriptor_arg_codes(mdesc)[i][0], tokens, settings,
+                                        P.AssignmentOperatorPrecedence)
+                        tokens.append_semicolon()
+                        tokens.new_line()
+                self._hoisted_caps.add(call.expr_index)
+
+        def is_mref_null_check(self, body, idx):
+            """javac's `Objects.requireNonNull(x)` (Java 9+) / `x.getClass()` (8) right before a statement that
+            creates the bound method reference `x::m`: part of the `x::m` expression"""
+            s = self.stmt_call(body[idx])
+            if s.operation != Op.HLIL_CALL or idx + 1 >= len(body) or isinstance(body[idx + 1], _ExcBranch):
+                return False
+            shape = self.call_shape(s)
+            if shape is None:
+                return False
+            if (shape[1], shape[2]) == ("java/util/Objects", "requireNonNull") and len(shape[5]) == 1:
+                x = shape[5][0]
+            elif (shape[1], shape[2]) == ("java/lang/Object", "getClass") and shape[4] is not None and not shape[5]:
+                x = shape[4]
+            else:
+                return False
+            for call in _walk(body[idx + 1]):
+                if call.operation != Op.HLIL_CALL:
+                    continue
+                c = self.call_shape(call)
+                if c is None or c[1] is not None or len(c[5]) != 1 or str(c[5][0]) != str(x):
+                    continue
+                impl = self.info.lambda_impl(c[0])
+                if impl is not None and impl[0] in (REF_INVOKE_VIRTUAL, REF_INVOKE_INTERFACE) and \
+                        not impl[2].startswith("lambda$"):
+                    return True
+            return False
+
+        def simple_capture(self, e):
+            """a captured value that can print in the lambda body in place of its parameter"""
+            o = e.operation
+            if o == Op.HLIL_VAR:
+                return e.var not in self.inline
+            return o in (Op.HLIL_CONST, Op.HLIL_CONST_PTR, Op.HLIL_FLOAT_CONST, Op.HLIL_IMPORT)
+
+        def emit_lambda_body(self, call, name, mdesc, args, tokens, settings, precedence):
+            m = self.info.method_named(name, mdesc)
+            if m is None:
+                return False
+            addr, flags, lvt = m
+            view = self.function.view
+            lf = view.get_function_at(addr)
+            if lf is None or addr in _lambda_active:
+                return False
+            hlil = lf.hlil_if_available
+            if hlil is None or hlil.root is None:
+                return False
+            static = bool(flags & ACC_STATIC)
+            caps = args if static else args[1:]  # an instance lambda$ gets `this` as its receiver
+            slots = arg_slots(mdesc, static)
+            by_slot = param_vars_by_slot(lf)
+            lvt_names = {slot: n for start, _, n, _, slot in lvt if start == 0}
+            names, captures = [], {}
+            for slot, (i, _) in sorted(slots.items()):
+                v = by_slot.get(slot)
+                if i < len(caps):
+                    if not self.simple_capture(caps[i]):
+                        if call.expr_index in self._hoisted_caps:
+                            continue  # declared before the statement under the parameter's name
+                        return False  # a captured value is computed once, at the invokedynamic, not per call
+                    if v is not None:
+                        captures[v] = (self, caps[i], settings)
+                    continue
+                n = lvt_names.get(slot) or (java_var_name(v.name) if v is not None else "p%d" % (i + 1))
+                names.append(n)
+            lam = PseudoJavaFunction(register(), lf.arch, lf, hlil)
+            lam.captures = captures
+            _lambda_active.add(addr)
+            try:
+                lines = linear_line_tokens(lam, hlil.root, settings)
+            finally:
+                _lambda_active.discard(addr)
+            body = []
+            for line in lines:
+                toks = [t for t in line if t.type != TT.AddressSeparatorToken]
+                if toks:
+                    body.append(toks)
+            if body and len(body[0]) == 1 and body[0][0].text == "{":
+                body = body[1:]
+            if body and len(body[-1]) == 1 and body[-1][0].text == "}":
+                body = body[:-1]
+            # strip the body's own indentation level
+            depth = min((len(toks[0].text) for toks in body if toks[0].type == TT.IndentationToken), default=0)
+            out = []
+            for toks in body:
+                if toks and toks[0].type == TT.IndentationToken:
+                    rest = toks[0].text[depth:]
+                    toks = ([_tok(TT.IndentationToken, rest)] if rest else []) + toks[1:]
+                out.append(toks)
+            body = out
+            expr = self.lambda_expression(body)
+            if expr is not None and len(names) == 1 and re.match(r"x\$\d+$", names[0]):
+                # javac's lambda for an array constructor reference: x$0 -> new T[x$0] is T[]::new
+                m = re.match(r"new (\S+?)\[([^\]]+)\]((?:\[\])*)$", "".join(t.text for t in expr))
+                if m and m.group(2) == names[0]:
+                    self.type_tok(tokens, m.group(1) + "[]" + m.group(3))
+                    self.op(tokens, "::")
+                    self.kw(tokens, "new")
+                    return True
+            if precedence is not None and precedence > P.AssignmentOperatorPrecedence:
+                tokens.append_open_paren()
+            if len(names) == 1:
+                tokens.append(_tok(TT.LocalVariableToken, names[0]))
+            else:
+                tokens.append_open_paren()
+                for k, n in enumerate(names):
+                    if k:
+                        self.txt(tokens, ", ")
+                    tokens.append(_tok(TT.LocalVariableToken, n))
+                tokens.append_close_paren()
+            self.op(tokens, " -> ")
+            if expr is not None:
+                tokens.append(expr)
+            elif not body:
+                self.txt(tokens, "{}")
+            else:
+                tokens.append_open_brace()
+                tokens.increase_indent()
+                for toks in body:
+                    tokens.new_line()
+                    tokens.append(toks)
+                tokens.decrease_indent()
+                tokens.new_line()
+                tokens.append_close_brace()
+            if precedence is not None and precedence > P.AssignmentOperatorPrecedence:
+                tokens.append_close_paren()
+            return True
+
+        @staticmethod
+        def lambda_expression(body):
+            """the tokens of an expression lambda's body (`return e;` or one expression statement), else None"""
+            if len(body) != 1:
+                return None
+            toks = list(body[0])
+            if not toks or toks[-1].text != ";" or toks[0].type == TT.IndentationToken:
+                return None
+            toks = toks[:-1]
+            if toks[0].type == TT.KeywordToken and toks[0].text.strip() == "return":
+                toks = toks[1:]
+                while toks and toks[0].type == TT.TextToken and not toks[0].text.strip():
+                    toks = toks[1:]
+                return toks or None
+            if toks[0].type == TT.KeywordToken or toks[0].type == TT.CommentToken:
+                return None  # throw, if, ...
+            if any(t.text in ("{", "}") for t in toks):
+                return None
+            if len(toks) > 1 and toks[0].type == TT.TypeNameToken and toks[1].text == " ":
+                return None  # a declaration
+            return toks
 
         def typed_args(self, tokens, settings, args, desc, callee=None):
             codes = descriptor_arg_codes(desc) if desc else []
@@ -6408,6 +7379,15 @@ if _HAVE_BN:
                     return
             if name == "getfield" and len(p) == 2:
                 m = self.info.member(_pool_index(_const_target(p[1])) or 0)
+                if SYNTHETIC_ACCESS and m and m[2] and m[1].startswith("this$") and m[2].startswith("L") and \
+                        self.this_var is not None and p[0].operation == Op.HLIL_VAR and p[0].var == self.this_var \
+                        and not re.search(r"\$\d+$", self.info.class_name or ""):
+                    # the enclosing instance of a member class. (An anonymous class keeps this.this$0 / val$x: the
+                    # class view replaces them with what its `new` passes, jvm-69)
+                    self.type_tok(tokens, java_class_name(m[2][1:-1]))
+                    self.op(tokens, ".")
+                    self.kw(tokens, "this")
+                    return
                 self.emit_receiver(p[0], tokens, settings)
                 self.op(tokens, ".")
                 tokens.append(_tok(TT.FieldNameToken, m[1] if m else "?", value=_const_target(p[1]) or 0))
@@ -6645,6 +7625,25 @@ if _HAVE_BN:
                 "strictfp", "void", "int", "long", "short", "byte", "char", "boolean", "float", "double"}
 
     _registered = None
+
+    def linear_line_tokens(lr, instr, settings=None):
+        """the token lists of LanguageRepresentationFunction.get_linear_lines, without its IL-instruction lookup:
+        a lambda body's lines carry instructions of the method it is printed into (its captured values, jvm-79),
+        whose indices the lambda$ method's HLIL does not have"""
+        import ctypes
+        from binaryninja import _binaryninjacore as core
+        from binaryninja.function import InstructionTextToken
+        count = ctypes.c_ulonglong()
+        lines = core.BNGetLanguageRepresentationFunctionLinearLines(
+            lr.handle, instr.function.handle, instr.expr_index, settings.handle if settings is not None else None,
+            instr.as_ast, count)
+        out = []
+        if lines is not None:
+            for i in range(count.value):
+                out.append(InstructionTextToken._from_core_struct(lines[i].tokens, lines[i].count))
+            core.BNFreeDisassemblyTextLines(lines, count.value)
+        return out
+    _lambda_active = set()  # addresses of lambda$ methods being rendered into their call site (recursion guard)
 
     def register():
         global _registered
