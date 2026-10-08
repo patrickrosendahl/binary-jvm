@@ -831,6 +831,8 @@ if _HAVE_BN:
                 yield from _stmts_preorder(b)
 
     _EXC_BRANCH = "EXC_BRANCH"
+    _JUMPS_OUT = ("goto", "goto_w", "ret", "return", "ireturn", "lreturn", "freturn", "dreturn", "areturn",
+                  "athrow")
 
     class _ConstLock:
         """a monitorenter / monitorexit operand that is a constant: equal when the constant is (jvm-82)"""
@@ -1218,6 +1220,14 @@ if _HAVE_BN:
             self.count_discount = {}  # var -> reads that no longer print (merged split conditions, jvm-54)
             self.break_subst = {}     # expr_index of a loop break -> (items, block) printed in its place (jvm-54)
             self.break_used = set()
+            self._finally_bodies = None  # handler pc -> (items, caught var), see finally_bodies()
+            self._finally_decided = {}   # handler pc -> prints as a finally clause
+            self._loop_depth = 0         # >0 while a loop's body is being printed (jvm-85)
+            self._loop_pending = False   # the next emit_list is that loop's body list
+            self._finally_exit = {}      # catch-all handler pc -> 'continue' / 'return' after its try
+            self._try_in_loop = {}       # catch-all handler pc -> its try statement is inside a printed loop
+            self._finally_clause = False  # printing a `finally { }` body: its rethrow is implicit
+            self._inline_handlers = set()  # catch-all handlers whose code prints in place
             self._exc_storage = None
             try:
                 self._exc_storage = func.arch.regs["exc"].index if "exc" in func.arch.regs else None
@@ -1454,9 +1464,12 @@ if _HAVE_BN:
                 if right.operation not in (Op.HLIL_CONST, Op.HLIL_CONST_PTR) or right.constant != 0:
                     return None
                 ne = c.operation == Op.HLIL_CMP_NE
-                if self.is_exc_value(left) and self.mentions_exc(left):
-                    kind, exc_true = 'exc', ne
-                elif self.is_type_test(left):
+                if self.is_exc_value(left) and (self.mentions_exc(left) or
+                                                (left.operation == Op.HLIL_INTRINSIC and
+                                                 left.intrinsic.name == "__exception")):
+                    kind, exc_true = 'exc', ne  # `__exception() != 0` directly in the condition
+                elif self.is_type_test(left) or (left.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and
+                                                 left.var in self.type_temps()):
                     kind, exc_true = 'type', not ne  # instanceof(...) == 0: true branch = other types
                 else:
                     return None
@@ -1617,7 +1630,11 @@ if _HAVE_BN:
                     continue
                 if s.operation == Op.HLIL_LABEL:
                     rank = 0
-                elif self.exc_if_parts(s) is not None or self.exc_copy_of(s) is not None:
+                elif s.operation in (Op.HLIL_VAR_DECLARE, Op.HLIL_BLOCK) or s.operation in COMPOUND and \
+                        s.operation != Op.HLIL_IF:
+                    rank = 3  # a declaration / loop that only carries the pc (jvm-85)
+                elif self.exc_if_parts(s) is not None or self.exc_copy_of(s) is not None or \
+                        (s.operation in (Op.HLIL_ASSIGN, Op.HLIL_VAR_INIT) and self.is_exc_plumbing(s)):
                     rank = 1
                 else:
                     rank = 2
@@ -1625,7 +1642,107 @@ if _HAVE_BN:
             for h, cands in found.items():
                 rank, _, blk, idx = min(cands, key=lambda c: (c[0], c[1]))
                 self._sites[h] = (blk, idx, blk.expr_index in exc_branches)
+            for h in sorted(wanted - set(found)):
+                # the handler's entry store (`T e = exc`) can be folded away by SSA, leaving no
+                # statement at the handler pc: fall back to the code after it
+                if h in self.monitor_handlers:
+                    continue
+                site = self._site_after_store(h, exc_branches)
+                if site is not None:
+                    self._sites[h] = site
             return self._sites
+
+        def _handler_body_start(self, h):
+            """pc of the first instruction of handler h's own code -- a handler begins by storing the
+            caught exception (astore), its body follows; None when the code at h is something else or the
+            body is empty (the store is followed by a jump: `catch (E e) { }`)"""
+            try:
+                from .opcodes import decode_instruction
+                data = self.function.view.read(self.function.start + h, 8)
+                name, _, length, _ = decode_instruction(data, 0)
+                if name is None or not name.startswith("astore"):
+                    return None
+                nxt, _, _, _ = decode_instruction(data[length:], 0)
+                if nxt in _JUMPS_OUT:
+                    return None
+                return h + length
+            except Exception:
+                return None
+
+        def empty_handler(self, h):
+            """the handler only stores the caught exception and jumps away: `catch (E e) { }`"""
+            try:
+                from .opcodes import decode_instruction
+                data = self.function.view.read(self.function.start + h, 8)
+                name, _, length, _ = decode_instruction(data, 0)
+                if name is None or not name.startswith("astore"):
+                    return False
+                nxt, _, _, _ = decode_instruction(data[length:], 0)
+                return nxt in ("goto", "goto_w", "ret")
+            except Exception:
+                return False
+
+        def _join_between(self, h, pc):
+            """a basic block starting in (h, pc] is also entered from outside the handler: the handler
+            body is empty and falls into code the try statement reaches too"""
+            start = self.function.start
+            try:
+                for bb in self.function.basic_blocks:
+                    b0 = bb.start - start
+                    if not h < b0 <= pc:
+                        continue
+                    for e in bb.incoming_edges:
+                        src = e.source.start - start
+                        if not h <= src < b0:
+                            return True
+            except Exception:
+                return True
+            return False
+
+        def _no_jump_between(self, a, b):
+            """no instruction in [a, b) leaves the straight-line code (goto, ret, return, athrow)"""
+            try:
+                from .opcodes import decode_instruction
+                data = self.function.view.read(self.function.start + a, b - a + 8)
+                off = 0
+                while a + off < b:
+                    name, _, length, _ = decode_instruction(data[off:], 0)
+                    if name is None or not length:
+                        return False
+                    if name in _JUMPS_OUT:
+                        return False
+                    off += length
+                return True
+            except Exception:
+                return False
+
+        def _site_after_store(self, h, exc_branches):
+            """site of a handler whose astore was folded away: the first statement at or just after the
+            handler's own code. HLIL folds an expression's leading loads (getstatic/lddc/aload before an
+            invokevirtual) into the statement at the call, so a little slack past the astore is allowed;
+            a block that is wholly an exceptional branch is taken from wherever its statements start
+            (its pcs sit inside the handler whatever led them)"""
+            h0 = self._handler_body_start(h)
+            if h0 is None:
+                return None
+            start = self.function.start
+            best = None  # (pc, order, blk, idx, whole)
+            n = 0
+            for blk, idx, s in _stmts_preorder(self.hlil.root):
+                n += 1
+                if s.operation in (Op.HLIL_NOP, Op.HLIL_LABEL):
+                    continue
+                pc = s.address - start
+                if pc < h0:
+                    continue
+                whole = blk.expr_index in exc_branches
+                if not whole and (pc - h0 > 12 or not self._no_jump_between(h0, pc) or self._join_between(h, pc)):
+                    continue
+                if best is None or (pc, n) < (best[0], best[1]):
+                    best = (pc, n, blk, idx, whole)
+            if best is None:
+                return None
+            return best[2], best[3], best[4]
 
         def handler_region(self, h):
             """raw HLIL statements of handler h's body (from its site to the end of the block or the next
@@ -2064,6 +2181,12 @@ if _HAVE_BN:
                 self.count_discount = {}
                 self.break_subst = {}
                 self.break_used = set()
+                self._inline_handlers = set()
+                self._finally_exit = {}
+                self._try_in_loop = {}
+                self._finally_decided = {}
+                self._loop_depth = 0
+                self._loop_pending = False
             self.emit_list(self.flatten(list(instr.body)), tokens, settings, instr, is_root)
 
         def emit_list(self, body, tokens, settings, block, is_root=False, own=False):
@@ -2075,6 +2198,12 @@ if _HAVE_BN:
             plan["root"] = is_root
             plan["own"] = {s.expr_index for s in body} if own else ()
             plan["follow"] = self._follow[-1] if self._follow else None
+            # a copy of a finally ending this list is javac's duplication before an implicit
+            # continue (this list is a loop body) or return (the root) -- never inside a try body
+            # or a handler, and not a list that merely falls through to following statements
+            plan["copy_end_ok"] = not own and (is_root or self._loop_pending)
+            plan["list_kind"] = None if own else 'root' if is_root else 'loop' if self._loop_pending else None
+            self._loop_pending = False
             self.emit_range(body, 0, len(body) - 1, plan, tokens, settings, block)
 
         def emit_range(self, body, lo, hi, plan, tokens, settings, block):
@@ -2167,6 +2296,11 @@ if _HAVE_BN:
             need_separator = None  # None: nothing emitted yet in this range
             idx = lo
             while idx <= hi:
+                if idx in sync_at and self.finally_bodies() and not isinstance(body[idx], _ExcBranch):
+                    run = self.finally_copy_len(body, idx, plan)
+                    if run is not None and idx + run - 1 >= sync_at[idx][0]:
+                        idx += run  # javac's copy of a printed finally (here a synchronized block)
+                        continue
                 if idx in sync_at:
                     end, lock, value = sync_at[idx]
                     if need_separator is not None:
@@ -2881,6 +3015,10 @@ if _HAVE_BN:
             lifter's `for (exc = __exception(); exc == 0; exc = __exception())` (left by an exception only)"""
             cond = w.condition
             true = (cond.operation == Op.HLIL_CONST and cond.constant != 0) or self.normal_value(cond) is True
+            if w.operation == Op.HLIL_DO_WHILE:
+                test = self.exc_test(cond)
+                if test is not None and test[0] == 'type':
+                    return True  # repeats through a catch clause, other exceptions propagate (jvm-85)
             if w.operation == Op.HLIL_FOR:
                 return true and all(x.operation == Op.HLIL_NOP or self.is_exc_plumbing(x) for x in (w.init, w.update))
             return true
@@ -3206,7 +3344,12 @@ if _HAVE_BN:
                 self.emit_negated(iff.condition, tokens, settings)
             tokens.append_close_paren()
             tokens.begin_scope(ScopeType.BlockScopeType)
-            self.emit_list(rest, tokens, settings, w.body)
+            self._loop_depth += 1  # a copy ending this body is the loop's implicit continue
+            self._loop_pending = True
+            try:
+                self.emit_list(rest, tokens, settings, w.body)
+            finally:
+                self._loop_depth -= 1
             if moved and len(moved) > 2:  # do-while: the loop test, leaving to the moved code
                 items, blk = self.break_subst[moved[1]]
                 self.break_used.add(moved[1])
@@ -3592,6 +3735,12 @@ if _HAVE_BN:
             if (s.operation == Op.HLIL_VAR_INIT and s.dest in self.inline) or \
                     (idx in plan["new_at"] and plan["new_at"][idx][1] in self.inline):
                 return need_separator  # folded into its use (jvm-46)
+            if self.finally_bodies() and not isinstance(s, _ExcBranch):
+                run = self.finally_copy_len(body, idx, plan)
+                if run is not None:
+                    # javac's inline copy of a finally body, printed by its `finally` clause
+                    plan["skip"].update(range(idx + 1, idx + run))
+                    return need_separator
             if self.is_exc_plumbing(s) or self.in_monitor_code(s):
                 return need_separator
             if s.operation == Op.HLIL_GOTO:
@@ -3603,6 +3752,8 @@ if _HAVE_BN:
                                     s.dest.operation == Op.HLIL_VAR else None):
                 value = self.throw_value(s)
                 if value is not None:  # athrow inside a try range: exc = v; goto handler
+                    if self._finally_clause and self.is_exc_value(value):
+                        return need_separator  # the finally clause's own rethrow of the caught exception
                     if need_separator:
                         tokens.scope_separator()
                     self.kw(tokens, "throw ")
@@ -3673,9 +3824,10 @@ if _HAVE_BN:
                 tokens.append_semicolon()
                 tokens.new_line()
                 return False
-            if not self.exc_names and self.is_rethrow(s) and s.params[0].operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) \
-                    and self.is_exc_var(s.params[0].var):
-                return need_separator  # an uncaught exception propagates: no Java statement
+            if self.is_rethrow(s) and s.params[0].operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and \
+                    (not self.exc_names or self._finally_clause) and self.is_exc_value(s.params[0]):
+                return need_separator  # an uncaught exception propagates: no Java statement (and the
+                # finally clause's own rethrow of the caught exception never prints)
             if self.jsr_target(s) in self.finally_subs():
                 if self._in_finally:
                     if need_separator:
@@ -3745,9 +3897,15 @@ if _HAVE_BN:
             else:
                 loop = s.operation in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE, Op.HLIL_FOR, Op.HLIL_SWITCH)
                 self._follow.append(None if loop else self.label_after(body, idx, plan))
+                real_loop = s.operation in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE, Op.HLIL_FOR)
+                if real_loop:
+                    self._loop_depth += 1     # a copy ending the body is the loop's implicit continue
+                    self._loop_pending = True
                 try:
                     self.perform_get_expr_text(s, tokens, settings, P.TopLevelOperatorPrecedence, True)
                 finally:
+                    if real_loop:
+                        self._loop_depth -= 1
                     self._follow.pop()
                 if self.needs_semicolon(s):
                     tokens.append_semicolon()
@@ -4560,6 +4718,7 @@ if _HAVE_BN:
                 self.emit_twr(body, first, last, group, plan, twr, tokens, settings, block)
                 return
             self.active_tries.append(group)
+            self.plan_finally_exit(body, last, group, plan)
             # variables declared in the try block but used after it are declared before it
             for k in range(first, last + 1):
                 s = body[k]
@@ -4583,13 +4742,18 @@ if _HAVE_BN:
                         tokens.new_line()
             self.kw(tokens, "try")
             tokens.begin_scope(ScopeType.BlockScopeType)
+            saved_end_ok = plan.get("copy_end_ok")
+            plan["copy_end_ok"] = False  # the try body's end falls to the join, not an exit
             try:
                 self.emit_range(body, first, last, plan, tokens, settings, block)
             finally:
                 tokens.end_scope(ScopeType.BlockScopeType)
                 self.active_tries.pop()
-            for hpc, ctype in handlers:
+                plan["copy_end_ok"] = saved_end_ok
+            clauses = [(h, t) for h, t in handlers if t or not self.empty_finally(h)]
+            for hpc, _ in handlers:
                 self.printed_handlers.add(hpc)
+            for hpc, ctype in clauses or handlers:  # an empty finally next to a catch prints nothing
                 tokens.scope_continuation(False)
                 try:
                     if ctype:
@@ -4656,8 +4820,9 @@ if _HAVE_BN:
             name = self.catch_header("catch", ctype, var, tokens)
             tokens.begin_scope(ScopeType.BlockScopeType)
             if items is None:
-                self.note(tokens, "// handler at pc %#x%s" % (hpc, self.handler_hint(hpc)))
-                tokens.new_line()
+                if not self.empty_handler(hpc):  # an empty catch has no code to point at
+                    self.note(tokens, "// handler at pc %#x%s" % (hpc, self.handler_hint(hpc)))
+                    tokens.new_line()
             else:
                 self.emit_handler_body(items, name, blk, tokens, settings)
             tokens.end_scope(ScopeType.BlockScopeType)
@@ -4672,22 +4837,47 @@ if _HAVE_BN:
             finally:
                 self._in_finally = saved
 
+        def empty_finally(self, hpc):
+            """javac's code of an empty `finally { }`: astore t; aload t; athrow"""
+            try:
+                from .opcodes import decode_instruction
+                data = self.function.view.read(self.function.start + hpc, 8)
+                names = []
+                off = 0
+                for _ in range(3):
+                    name, _, length, _ = decode_instruction(data[off:], 0)
+                    if name is None:
+                        return False
+                    names.append(name)
+                    off += length
+                return names[0].startswith("astore") and names[1].startswith("aload") and names[2] == "athrow" \
+                    and names[0][len("astore"):] == names[1][len("aload"):]
+            except Exception:
+                return False
+
         def emit_finally_body(self, hpc, tokens, settings):
-            items, var, blk = self.region_items(hpc)
+            if self.empty_finally(hpc):
+                self.region_items(hpc)  # store + rethrow: nothing to print
+                self.kw(tokens, "finally")
+                tokens.begin_scope(ScopeType.BlockScopeType)
+                tokens.end_scope(ScopeType.BlockScopeType)
+                return
+            if hpc in self._inline_handlers:
+                items = None  # printed in place (see plan_finally_exit)
+            else:
+                items, var, blk = self.region_items(hpc)
             if items is not None:
-                real = [k for k, s in enumerate(items) if isinstance(s, _ExcBranch) or not (
-                    self.is_exc_plumbing(s) or s.operation in (Op.HLIL_NOP, Op.HLIL_NORET, Op.HLIL_UNREACHABLE)
-                    or (s.operation == Op.HLIL_GOTO and self.handler_of_label(s.target) is not None))]
-                last = items[real[-1]] if real else None
-                rethrow = last is not None and not isinstance(last, _ExcBranch) and (
-                    self.is_rethrow(last) or
-                    (last.operation in (Op.HLIL_ASSIGN, Op.HLIL_VAR_INIT) and self.throw_value(last) is not None and
-                     self.is_exc_value(self.throw_value(last))))
-                if rethrow:
+                if self.handler_is_finally(hpc, items):
                     self.kw(tokens, "finally")
                     tokens.begin_scope(ScopeType.BlockScopeType)
-                    self.emit_handler_body(items[:real[-1]], self.display_name(var) if var else "t", blk,
-                                           tokens, settings)
+                    self.exc_names.append(self.display_name(var) if var else "t")
+                    saved = self._finally_clause
+                    self._finally_clause = True
+                    try:
+                        self.emit_finally_items(items, blk, self._finally_exit.get(hpc), tokens, settings)
+                    finally:
+                        self._finally_clause = saved
+                        self.exc_names.pop()
                 else:
                     name = self.catch_header("catch", "java/lang/Throwable", var, tokens)
                     tokens.begin_scope(ScopeType.BlockScopeType)
@@ -4706,6 +4896,417 @@ if _HAVE_BN:
                 self.note(tokens, "// handler at pc %#x%s" % (hpc, self.handler_hint(hpc)))
                 tokens.new_line()
             tokens.end_scope(ScopeType.BlockScopeType)
+
+        def handler_is_finally(self, hpc, items):
+            """a catch-all handler prints as `finally { }` when the exception never propagates out of it
+            unseen: every exit either rethrows the caught exception or completes abruptly (a finally that
+            returns/breaks/continues discards it -- javac emits no rethrow on those paths), or when the
+            body is javac's duplication of code that also runs inline (a finally without a rethrow path
+            at all, e.g. one ending in `continue`)"""
+            if hpc in self._finally_decided:
+                return self._finally_decided[hpc]
+            decided = False
+            exits = self.exit_kinds(items)
+            if hpc in self._inline_handlers or \
+                    (self.loose_jumps(items) and (not self._try_in_loop.get(hpc) or self.has_labels(items))):
+                exits = []  # not printed from its own code (see emit_finally_body)
+            if self.needs_finally_exit(items) and self._finally_exit.get(hpc) is None:
+                exits = []  # its fall-through path can't be written as a finally: catch (Throwable)
+            if exits:
+                if all(k == 'rethrow' for k in exits):
+                    decided = True
+                elif not any(k not in ('rethrow', 'abrupt', 'fall') for k in exits):
+                    decided = self.has_finally_duplicate(hpc, items)
+            self._finally_decided[hpc] = decided
+            return decided
+
+        def exit_kinds(self, items):
+            """how control can leave a flattened statement list: 'rethrow' (the caught exception),
+            'abrupt' (return / break / continue / goto / a throw of anything else), 'fall' (runs off
+            the end)"""
+            out = []
+            for s in items:
+                if isinstance(s, _ExcBranch):
+                    cls = self.branch_class(s.branch, s.address - self.function.start)
+                    out.append('rethrow' if cls[0] == 'rethrow' else 'abrupt')
+                    continue
+                if s.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE, Op.HLIL_LABEL) or \
+                        self.is_exc_plumbing(s) or self.in_monitor_code(s) or \
+                        (s.operation == Op.HLIL_GOTO and self.handler_of_label(s.target) is not None):
+                    continue
+                if self.rethrow_stmt(s):
+                    out.append('rethrow')
+                    return out
+                if s.operation in (Op.HLIL_RET, Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_GOTO, Op.HLIL_NORET,
+                                   Op.HLIL_TAILCALL):
+                    out.append('abrupt')
+                    return out
+                if s.operation == Op.HLIL_INTRINSIC and s.intrinsic.name in ("athrow", "__propagate"):
+                    out.append('abrupt')
+                    return out
+                if s.operation == Op.HLIL_IF:
+                    branches = [self.exit_kinds(self.flatten(self.stmts_of(s.true)))]
+                    if s.false is not None and s.false.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
+                        branches.append(self.exit_kinds(self.flatten(self.stmts_of(s.false))))
+                    else:
+                        branches.append(['fall'])
+                    falls = False
+                    for b in branches:
+                        out += [k for k in b if k != 'fall']
+                        falls = falls or 'fall' in b
+                    if not falls:
+                        return out
+                    continue  # the statements after the if run on its fall-through paths
+                if s.operation in (Op.HLIL_WHILE, Op.HLIL_FOR, Op.HLIL_DO_WHILE) and \
+                        self.infinite_loop(s):
+                    out.append('abrupt')
+                    return out
+            out.append('fall')
+            return out
+
+        def split_rethrow_if(self, items):
+            """index of the first else-less `if` in a finally body whose then-branch ends only through
+            the (dropped) rethrow and is followed by more statements: javac's `if (c) { A } else { B }`
+            finally, compiled as `if (c) { A; rethrow } B` on the exceptional path"""
+            real = [k for k, s in enumerate(items) if not isinstance(s, _ExcBranch) and s.operation not in
+                    (Op.HLIL_NOP, Op.HLIL_UNREACHABLE, Op.HLIL_LABEL, Op.HLIL_NORET) and
+                    not self.is_exc_plumbing(s)]
+            for n, k in enumerate(real):
+                s = items[k]
+                if s.operation == Op.HLIL_IF and s.as_ast and n + 1 < len(real) and \
+                        (s.false is None or s.false.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE)) and \
+                        self._then_terminal(s.true, True) and not self._then_terminal(s.true, False):
+                    return k
+            return None
+
+        def loose_jumps(self, items):
+            """a break / continue in items that leaves a loop outside them, or a label / goto (code that
+            can't move: the label would print twice)"""
+            stack = list(items)
+            while stack:
+                s = stack.pop()
+                if isinstance(s, _ExcBranch):
+                    stack.extend(self.stmts_of(s.branch))
+                    continue
+                if s.operation in (Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_LABEL):
+                    return True
+                if s.operation == Op.HLIL_GOTO and self.handler_of_label(s.target) is None:
+                    return True
+                if s.operation in (Op.HLIL_WHILE, Op.HLIL_FOR, Op.HLIL_DO_WHILE, Op.HLIL_SWITCH):
+                    continue  # its own jumps
+                stack.extend(_children(s))
+            return False
+
+        def has_labels(self, items):
+            for s in items:
+                for i in ([s] if isinstance(s, _ExcBranch) else _walk(s)):
+                    if isinstance(i, _ExcBranch):
+                        if self.has_labels(self.stmts_of(i.branch)):
+                            return True
+                    elif i.operation == Op.HLIL_LABEL or \
+                            (i.operation == Op.HLIL_GOTO and self.handler_of_label(i.target) is None):
+                        return True
+            return False
+
+        def needs_finally_exit(self, items):
+            """printing this finally body needs an explicit jump after its else part (see emit_finally_items)"""
+            k = self.split_rethrow_if(items)
+            return k is not None and 'fall' in self.exit_kinds(items[k + 1:])
+
+        def plan_finally_exit(self, body, last, group, plan):
+            """the jump that leaves a try statement that ends its list: `continue` in a loop body,
+            `return` at the root of a void method; None when other code follows (a finally body that
+            needs such a jump then prints as catch (Throwable))"""
+            kind = plan.get("list_kind")
+            exit_kw = 'continue' if kind == 'loop' else 'return' if kind == 'root' and self.returns_void else None
+            for hpc, ctype in group[2]:
+                if ctype:
+                    continue
+                fb = self.finally_bodies().get(hpc)
+                ok = exit_kw is not None and fb is not None
+                if ok:
+                    j = last + 1
+                    while j < len(body):
+                        s = body[j]
+                        if isinstance(s, _ExcBranch) or s.operation in \
+                                (Op.HLIL_NOP, Op.HLIL_UNREACHABLE, Op.HLIL_LABEL, Op.HLIL_NORET) or \
+                                self.is_exc_plumbing(s) or s.expr_index in self.consumed:
+                            j += 1
+                            continue
+                        m = self.copy_window(body, j, fb[2], True) if fb[2] else None
+                        if m is not None and j + m >= len(body):
+                            j += m
+                            continue
+                        if s.operation == Op.HLIL_RET and kind == 'root' and self.returns_void and not s.src:
+                            j += 1
+                            continue
+                        ok = False
+                        break
+                old = (self._finally_exit.get(hpc), self._try_in_loop.get(hpc))
+                self._finally_exit[hpc] = exit_kw if ok else None
+                self._try_in_loop[hpc] = self._loop_depth > 0
+                if fb is not None and self.loose_jumps(fb[0]) and \
+                        (not self._try_in_loop[hpc] or self.has_labels(fb[0])):
+                    # its break / continue leaves a loop this try statement encloses: the handler code
+                    # stays where it is (an `on exception` block inside the loop), the clause is a stub
+                    self._inline_handlers.add(hpc)
+                    self.placed_handlers.discard(hpc)
+                if old != (self._finally_exit[hpc], self._try_in_loop[hpc]):
+                    self._finally_decided.pop(hpc, None)
+
+        def emit_finally_items(self, items, blk, exit_kw, tokens, settings):
+            """a finally body; `if (c) { A; rethrow } B` becomes `if (c) { A } else { B; exit; }` -- the
+            rethrow is the finally's own end, B's fall-through leaves the try without rethrowing"""
+            k = self.split_rethrow_if(items)
+            if k is None:
+                self.emit_list(items, tokens, settings, blk, own=True)
+                return
+            s = items[k]
+            if k:
+                self.emit_list(items[:k], tokens, settings, blk, own=True)
+                tokens.scope_separator()
+            rest = items[k + 1:]
+            self.consumed.add(s.expr_index)
+            self.kw(tokens, "if ")
+            self._cond(s.condition, tokens, settings)
+            tokens.begin_scope(ScopeType.BlockScopeType)
+            self.emit_list(self.flatten(self.stmts_of(s.true)), tokens, settings, s.true, own=True)
+            tokens.end_scope(ScopeType.BlockScopeType)
+            tokens.scope_continuation(False)
+            self.kw(tokens, "else")
+            tokens.begin_scope(ScopeType.BlockScopeType)
+            self.emit_finally_items(rest, blk, exit_kw, tokens, settings)
+            if exit_kw is not None and 'fall' in self.exit_kinds(rest) and self.split_rethrow_if(rest) is None:
+                self.kw(tokens, exit_kw)
+                tokens.append_semicolon()
+                tokens.new_line()
+            tokens.end_scope(ScopeType.BlockScopeType)
+            tokens.finalize_scope()
+            tokens.new_line()
+
+        def finally_bodies(self):
+            """handler pc -> (flattened body items without the entry store, caught-exception variable)
+            of every catch-all try-group handler, cached: the non-destructive twin of what
+            emit_finally_body prints (region_items consumes, this only reads)"""
+            if getattr(self, "_finally_bodies", None) is not None:
+                return self._finally_bodies
+            out = {}
+            for g in self.try_groups:
+                for h, t in g[2]:
+                    if t:
+                        continue
+                    region = self.handler_region(h)
+                    if not region:
+                        continue
+                    items = self.flatten(region)
+                    var = None
+                    trimmed = []
+                    entry = True
+                    for s in items:
+                        if entry and s.operation == Op.HLIL_LABEL:
+                            continue
+                        if entry and var is None and not isinstance(s, _ExcBranch):
+                            v = self.exc_copy_of(s)
+                            if v is not None:
+                                var = v
+                                continue
+                        if not isinstance(s, _ExcBranch) and not self.is_exc_plumbing(s):
+                            entry = False
+                        trimmed.append(s)
+                    while trimmed and not isinstance(trimmed[-1], _ExcBranch) and (
+                            trimmed[-1].operation in (Op.HLIL_NOP, Op.HLIL_NORET, Op.HLIL_UNREACHABLE) or
+                            self.is_exc_plumbing(trimmed[-1]) or
+                            (trimmed[-1].operation == Op.HLIL_INTRINSIC and
+                             trimmed[-1].intrinsic.name in ("athrow", "__propagate"))):
+                        trimmed.pop()  # the rethrow path: the finally clause never prints it
+                    out[h] = (trimmed, var, self.norm_keys(trimmed, True))
+            self._finally_bodies = out
+            return out
+
+        def var_role(self, v):
+            if v == self.this_var or v in self.param_codes:
+                return 'param'
+            if self.is_exc_var(v) or v in self.exc_copies():
+                return 'exc'
+            if v in self.type_temps():
+                return 'type'
+            if self.def_count(v) >= 2 and self.var_count(v) <= self.def_count(v) + 1:
+                return 'temp'  # defined once per copy, read within it
+            return ('local', v.identifier)
+
+        def expr_key(self, e):
+            """structural key of an expression for comparing a finally body with its copies:
+            operations, constants and call targets; variables by role (per-copy temporaries and the
+            caught exception equal any of their kind)"""
+            if e is None:
+                return None
+            if isinstance(e, _CgIf):
+                return ('cg', self.expr_key(e.cond))
+            if isinstance(e, _ConstLock):
+                return ('lock', e.key)
+            o = e.operation
+            if o in (Op.HLIL_VAR, Op.HLIL_VAR_SSA):
+                return ('var', self.var_role(e.var))
+            if o in (Op.HLIL_CONST, Op.HLIL_CONST_PTR):
+                return ('const', e.constant)
+            parts = [o.name]
+            for x in e.operands:
+                if isinstance(x, list):
+                    parts.append(tuple(self.expr_key(u) for u in x))
+                elif isinstance(x, HighLevelILInstruction):
+                    parts.append(self.expr_key(x))
+                else:
+                    parts.append(repr(x))
+            if hasattr(e, "constant"):
+                parts.append(e.constant)
+            return tuple(parts)
+
+        def rethrow_stmt(self, s):
+            """a statement whose whole purpose is rethrowing the caught exception"""
+            if isinstance(s, _ExcBranch):
+                return False
+            if s.operation == Op.HLIL_INTRINSIC and s.intrinsic.name in ("athrow", "__propagate"):
+                return not s.params or self.is_exc_value(s.params[0])
+            if s.operation in (Op.HLIL_ASSIGN, Op.HLIL_VAR_INIT):
+                dest = s.dest if s.operation == Op.HLIL_VAR_INIT else \
+                    (s.dest.var if s.dest.operation == Op.HLIL_VAR else None)
+                v = self.throw_value(s)
+                return dest is not None and self.is_exc_var(dest) and v is not None and self.is_exc_value(v)
+            return False
+
+        def norm_keys(self, items, drop_rethrow):
+            """normalized statement keys of a flattened list: rethrow paths dropped (they never print),
+            declarations ignored, and an else-less `if` whose then-branch cannot fall through absorbs
+            the statements after it -- `if (c) { A; throw e; } B` and `if (c) A else B` compare equal,
+            the two shapes javac builds for the same finally"""
+            pairs = []  # (key, the key is an else-less IF with a terminal then-branch)
+            for s in items:
+                if isinstance(s, _ExcBranch):
+                    cls = self.branch_class(s.branch, s.address - self.function.start)
+                    if cls[0] == 'hide':
+                        continue
+                    if cls[0] == 'rethrow':
+                        continue
+                    pairs.append((('excbranch', s.kind), False))
+                    continue
+                o = s.operation
+                if o in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE, Op.HLIL_LABEL, Op.HLIL_VAR_DECLARE) or \
+                        self.is_exc_plumbing(s):
+                    continue
+                if o == Op.HLIL_NORET or (drop_rethrow and self.rethrow_stmt(s)):
+                    continue
+                if o == Op.HLIL_IF and s.as_ast:
+                    tk = self.norm_keys(self.flatten(self.stmts_of(s.true)), drop_rethrow) \
+                        if s.true is not None else ()
+                    fk = self.norm_keys(self.flatten(self.stmts_of(s.false)), drop_rethrow) \
+                        if s.false is not None else ()
+                    pairs.append((('if', self.expr_key(s.condition), tk, fk),
+                                  self._then_terminal(s.true, drop_rethrow)))
+                    continue
+                if o == Op.HLIL_RET:
+                    pairs.append((('ret', tuple(self.expr_key(x) for x in s.src)), False))
+                    continue
+                if o in (Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_GOTO):
+                    pairs.append(((o.name[5:].lower(),), False))
+                    continue
+                if o == Op.HLIL_INTRINSIC and s.intrinsic.name in ("athrow", "__propagate"):
+                    pairs.append((('throw', self.expr_key(s.params[0]) if s.params else None), False))
+                    continue
+                if o in (Op.HLIL_WHILE, Op.HLIL_FOR, Op.HLIL_DO_WHILE):
+                    bk = self.norm_keys(self.flatten(self.stmts_of(s.body)), drop_rethrow)
+                    pairs.append((('loop', self.expr_key(getattr(s, "condition", None)), bk), False))
+                    continue
+                pairs.append((('stmt', self.expr_key(s)), False))
+            return self.fold_keys(pairs)
+
+        def fold_keys(self, pairs):
+            """the leftmost else-less `if` with a terminal then-branch owns the statements after it"""
+            pairs = list(pairs)
+            for i in range(len(pairs) - 1):
+                k, then_terminal = pairs[i]
+                if k[0] == 'if' and not k[3] and then_terminal:
+                    tail = self.fold_keys(pairs[i + 1:])
+                    pairs = pairs[:i] + [(('if', k[1], k[2], tail), False)]
+                    return self.fold_keys(pairs)
+            return tuple(p[0] for p in pairs)
+
+        def _then_terminal(self, branch, drop_rethrow):
+            """branch's statements cannot fall through their end (an exit, or the rethrow a finally
+            clause never prints)"""
+            if branch is None:
+                return False
+            items = self.flatten(self.stmts_of(branch))
+            real = [s for s in items if not isinstance(s, _ExcBranch) and
+                    s.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE, Op.HLIL_LABEL, Op.HLIL_VAR_DECLARE)]
+            if not real:
+                return False
+            for s in real:  # the first statement that cannot fall through decides
+                if s.operation == Op.HLIL_IF and s.as_ast:
+                    if self._then_terminal(s.true, drop_rethrow) and self._then_terminal(s.false, drop_rethrow):
+                        return True
+                    continue
+                if self.rethrow_stmt(s):
+                    return drop_rethrow
+                if s.operation in (Op.HLIL_RET, Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_GOTO):
+                    return True
+                if s.operation == Op.HLIL_INTRINSIC and s.intrinsic.name in ("athrow", "__propagate"):
+                    return True
+            return False
+
+        def finally_copy_len(self, body, idx, plan):
+            """length of the inline copy of a printed finally starting at body[idx]: the statements
+            match one of the catch-all handler bodies (javac duplicates the body before every exit of
+            the try) and an abrupt completion -- or the end of a loop body / the root -- follows"""
+            if body[idx].expr_index in plan.get("own", ()):
+                return None
+            for h, (items, _, keys) in self.finally_bodies().items():
+                if not keys or not self.handler_is_finally(h, items):
+                    continue
+                m = self.copy_window(body, idx, keys, plan.get("copy_end_ok"))
+                if m is not None:
+                    return m
+            return None
+
+        def copy_window(self, body, idx, keys, end_ok):
+            """length m of body[idx:idx+m] whose normalized keys equal a finally body's, followed by an
+            abrupt exit (or by the end of the list when end_ok) -- the shapes of the copy and the
+            handler can differ in statement count (`if (c) {A; throw} B` against `if (c) A else B`)"""
+            for m in range(1, min(len(body) - idx, len(keys) + 3) + 1):
+                window = body[idx:idx + m]
+                if any(isinstance(x, _ExcBranch) for x in window):
+                    return None
+                after = body[idx + m] if idx + m < len(body) else None
+                if after is None:
+                    if not end_ok:
+                        continue
+                elif isinstance(after, _ExcBranch) or after.operation not in \
+                        (Op.HLIL_RET, Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_GOTO, Op.HLIL_NORET):
+                    continue
+                if self.norm_keys(window, False) == keys:
+                    return m
+            return None
+
+        def has_finally_duplicate(self, hpc, items):
+            """the handler's body also runs inline somewhere (javac's finally duplication): a run of
+            statements elsewhere matching it, followed by an abrupt exit or the end of its block"""
+            fb = self.finally_bodies().get(hpc)
+            if fb is None or not fb[2]:
+                return False
+            keys = fb[2]
+            own = {s.expr_index for s in items}
+            region = {s.expr_index for s in (self.handler_region(hpc) or [])}
+            seen = set()
+            for blk, _, _ in _stmts_preorder(self.hlil.root):
+                if blk.expr_index in seen:
+                    continue
+                seen.add(blk.expr_index)
+                body = self.flatten(self.stmts_of(blk))
+                for idx, s in enumerate(body):
+                    if isinstance(s, _ExcBranch) or s.expr_index in own or s.expr_index in region:
+                        continue
+                    if self.copy_window(body, idx, keys, True) is not None:
+                        return True
+            return False
 
         def emit_body(self, instr, tokens, settings, newline=True):
             """a block, or a single statement terminated like one"""
@@ -4794,6 +5395,11 @@ if _HAVE_BN:
             """loop condition; an exception test (`while (exc == 0)`: the loop is left by an exception, which
             goes to a handler) prints as the value it has on the normal path"""
             test = self.exc_test(instr)
+            if test is not None and test[0] == 'type':
+                tokens.append_open_paren()  # repeats through a catch clause (see infinite_loop)
+                self.kw(tokens, "true")
+                tokens.append_close_paren()
+                return
             if test is not None and test[0] == 'exc':
                 tokens.append_open_paren()
                 self.kw(tokens, "false" if test[1] else "true")
