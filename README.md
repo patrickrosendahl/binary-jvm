@@ -1,42 +1,40 @@
 # binary-jvm — Java `.class` plugin for Binary Ninja (Python 3)
 
-A Binary Ninja **Architecture + BinaryView** plugin for Java bytecode. It loads `.class`
-files (magic `0xCAFEBABE`), parses the full class-file structure (constant pool, fields,
-methods, attributes) into Binary Ninja types, registers each method as a function, and
-disassembles / partially lifts JVM bytecode to LLIL.
+A Binary Ninja **Architecture + BinaryView** plugin for Java bytecode. It loads `.class` files
+(magic `0xCAFEBABE`) and whole JARs, parses the class-file structure (constant pool, fields, methods,
+attributes) into Binary Ninja types, makes each method a function, and lifts every JVM opcode to LLIL.
+On top of HLIL it adds a **Pseudo Java** language view and a Java-like **class view**.
 
-This is a **Python 3 port** of [`Pusty/BinaryNinjaPlugins` → `binary-jvm`](https://github.com/Pusty/BinaryNinjaPlugins)
-(original © 2021 Pusty, 0BSD — see `LICENSE`). The upstream plugin targeted the Binary Ninja
-**Python 2** API and no longer loads on current versions.
+This is a **Python 3 port and lifter rewrite** of
+[`Pusty/BinaryNinjaPlugins` → `binary-jvm`](https://github.com/Pusty/BinaryNinjaPlugins)
+(original © 2021 Pusty, 0BSD — see `LICENSE`), which targeted the Python 2 API and no longer loads.
 
-## Status
+## Features
 
-> **▶ Resumed (2026-10-06).** The pause (jvm-28) was lifted to build Java-level output: operand
-> stack as registers (jvm-33), typed signatures + names (jvm-35), compare fusion (jvm-32), exception
-> edges inside methods (jvm-42), a Pseudo Java language representation (jvm-43/44) and a class view
-> (jvm-41). The plugin is **installed** again (symlink + `files.container.excludedTransforms = ["Universal"]`).
+- **Disassembly and LLIL for all 202 opcodes.** Locals are registers `l<n>`, the operand stack is
+  lifted to registers, and invokes are real calls through typed pool slots, so HLIL reads
+  `ValueGetter.getProperty(arg2, "CODEBASE", arg2)`. Methods get typed signatures and names.
+- **Exception handling.** Catch handlers and exception edges inside methods; Pseudo Java turns them
+  into `try`/`catch`/`finally`, `synchronized` and try-with-resources blocks.
+- **Pseudo Java.** A language representation (pick *Pseudo Java* in the decompiler view) with folded
+  stack temporaries, named locals, loops instead of gotos, array literals, varargs calls and anonymous
+  classes at their `new`. Its output is measured against [Vineflower](https://github.com/Vineflower/vineflower)
+  (see `CLAUDE.md`, testing workflow).
+- **Class view.** **JVM > Show class** renders the class as Java declarations: header, fields with
+  initialisers, method signatures, `throws`.
+- **JARs.** **File > Load Whole JAR...** (also an open-dialog mode) unpacks `foo.jar` to `foo/` next
+  to it, preselects the manifest's `Main-Class`, and lets you pick classes to open; nested `.jar`
+  entries can be unpacked the same way. Each class is its own view; the decompiler reads the other
+  classes from the folder when it needs them, and **JVM > Open class from this JAR...** opens one.
+- Static fields, `ldc` constants, switches (`tableswitch`/`lookupswitch` become `switch`), `jsr`/`ret`
+  and Java 7+ constant-pool tags and attributes (`StackMapTable`, `Record`, nest host, ...).
 
-**Python 3 port done; lifter rewritten — every JVM opcode lifts to LLIL.** Tested live in
-Binary Ninja 6.1 (via the script bridge, dev-registered names) against ActiveTrader classes:
-methods decompile to Java-like HLIL (calls, string constants, static fields, switches,
-try/catch handlers). Offline, the decoder + lifter pass over the whole sample (≈47k classes,
-11.6M instructions) with no decode failures, no `unimplemented`, and per-instruction stack
-effects matching an independent table. All 341 `mdg.jar` classes analyse live in the installed
-plugin; invokes decompile as `Class.method(args)` calls (jvm-40).
-
-**Pseudo Java vs Vineflower** (jvm-45…57, 2026-10-07): per-method comparison with Recaf's decompiler on 20
-mdg classes -- unnamed stack temporaries 491 → 0 (folded, the rest named from their value), gotos 6 → 0,
-`synchronized` blocks instead of comments (14 → 0), `while (true)` loops 9 → 2 (search loops, split
-short-circuit conditions, do-while exits), array literals and varargs calls, jsr/ret finally inline, no
-exception plumbing outside catch blocks, field initialisers in the class view; lines 2790 → 2360 (Vineflower
-1974). Gates in `CLAUDE.md` (testing workflow), details in the wiki page `vineflower-comparison.md`.
-
-See the roadmap below. **This README is the source of truth for the TODO list.**
+Tested on Binary Ninja 6.1. Offline, the decoder and lifter run over ≈47k real-world classes
+(11.6M instructions) with no decode failures and stack effects matching an independent table.
 
 ## Install
 
-Symlink (or copy) this repo's plugin files into the Binary Ninja user plugin directory as a
-folder named `binary-jvm`:
+Symlink (or copy) the repo into the Binary Ninja user plugin directory as `binary-jvm`:
 
 ```bash
 # macOS
@@ -45,123 +43,36 @@ ln -s "$(pwd)" ~/Library/Application\ Support/Binary\ Ninja/plugins/binary-jvm
 # Windows: %APPDATA%\Binary Ninja\plugins\binary-jvm
 ```
 
-The repo root is the plugin package (`__init__.py`, `constants.py`, `opcodes.py`,
-`classfile.py`, `lifter.py`, `arch.py`, `view.py`, `plugin.json`). Restart Binary Ninja (or
-reload plugins). Open a `.class` file → it should be recognized as **JVM Class Format**.
-
----
+Set `files.container.excludedTransforms = ["Universal"]` in the settings (otherwise BN's container
+handling grabs `.class` files, whose magic matches a Mach-O universal binary), then restart Binary
+Ninja. A `.class` file opens as **JVM Class Format**.
 
 ## Roadmap / TODO
 
-### 1. Finish the Python 3 port ✅ verified in BN 6.1 (jvm-1)
-- [x] `bytes`/`str` fixes in `convert_to_nop`, `invert_branch`, `always_branch`,
-      `is_never_branch_patch_available` (data is `bytes`; `data[0]` is an `int`).
-- [x] `assemble()` returns `bytes` (BN 6.1 `Architecture._assemble` does
-      `memmove(buf, data, len(data))`); build with `bytes([opcode])` / `b"".join(...)`;
-      `None` still signals an assemble error.
-- [x] `Type.float(w, False)` → `Type.float(w)` (2nd arg is `alternate_name: str`, not a sign).
-- [x] `py_compile` clean; no `print`-statement / `iteritems` / `xrange` left.
-- [x] **Loaded in BN 6.1 against real `.class` files** (2026-10-08, `ErrorHandler` and
-      `Login`): the JVM Class view is selected, every method with code is a named function,
-      disassembly renders, and the constant-pool (`pool_N`) and primitive (`primitive_N`)
-      symbols are present. The entry point is a real method (jvm-31).
+Tickets are tracked in minitick project `jvm` (`jvm-N`). Done: Python 3 port, full opcode coverage,
+invokes as calls, JAR loading, Pseudo Java, class view. Patching (nop, invert branch, assemble) is
+**not a goal** and was removed.
 
-### 2. Opcode / IL coverage ✅ (lifter rewrite done — tickets jvm-2…jvm-11)
-All 202 opcodes decode, render and lift; nothing falls through to `unimplemented`.
-Design (see `lifter.py` / `arch.py`):
-- **Locals are registers** `l<n>` (8 bytes) / `l<n>_lo` (low 4 bytes) for slots 0–63 (covers
-  >99.9% of methods; higher `wide` slots fall back to pseudo memory at `0x8000`). The calling
-  convention passes arguments in `l0_lo…`, so methods get real parameter lists; returns go in
-  `r` (`rh:r` for long/double).
-- **Operand stack** is the real stack (`s`), 4-byte slots, long/double take two; operands are
-  popped into LLIL temps first (correct operand order; pops inside `if` conditions are avoided
-  because BN's stack analysis doesn't see them).
-- **Invokes are real calls** (jvm-40): each Methodref/InterfaceMethodref/InvokeDynamic pool entry is
-  a data var at its pool pseudo-address typed as a function pointer built from the descriptor
-  (receiver first unless only `invokestatic`/`invokedynamic` use it), like an import-table slot; the
-  invoke pops its arguments into `a0…` (calling convention `jvm_call`, separate from the locals) and
-  lifts as `call([slot])`, the result comes back in `r` / `rh:r`. HLIL reads
-  `ValueGetter.getProperty(arg2, "CODEBASE", arg2)` (symbol short name `Class.method`, full JVM name
-  as full/raw name). Costs ~2–3× analysis time on call-heavy classes; `INVOKES_AS_CALLS = False` in
-  `constants.py` restores the intrinsic form. More than 32 arguments fall back to the intrinsic.
-- **Intrinsics** for `getfield/putfield`, `new`, `*newarray`, `arraylength`, `checkcast`,
-  `instanceof`, `monitor*`, `athrow`, `fmod` (`frem/drem`).
-- **Static fields** are loads/stores of typed data vars at the pool pseudo-address
-  `0xF0000000 + idx*8`; `ldc` of int/float/long/double pushes the actual constant, strings/classes
-  push a pointer to the pool symbol (renders as `&"text"`).
-- **Branches** use labels / `jump(const)`; `tableswitch`/`lookupswitch` lift as compare chains
-  (BN recovers `switch` statements). `jsr` is a call that pops its pushed return address,
-  `ret` returns through the local. **Catch handlers** become their own functions
-  (`<method>$catch_<pc>`); tail-call translation is disabled per view so shared code isn't
-  turned into bogus tail calls.
-- Decoder fixes: switch padding (relative to the 4-byte-aligned method base) and signed
-  keys, `wide iinc` length, MethodHandle `reference_kind` u1, pool tags 17/19/20.
-- The raw class file (typed as its structure) is mapped at `0x800000`, not 0 — at 0, every null
-  (`const 0`) was typed as a pointer to the class header.
+### Analysis DB (`.bndb`) must persist renames + notes ⬜
+Renaming a function/symbol/variable and adding comments must survive save → close → reopen.
+- Method symbols are `define_auto_symbol`; re-analysis may overwrite user renames — switch to user
+  symbols or make sure the loader doesn't clobber them on reopen.
+- `init()` re-runs on DB load; guard it so it doesn't re-`define_*` over user edits.
+- Acceptance test: function/variable renames and `set_comment_at` notes round-trip through a saved `.bndb`.
 
-Known cosmetic gaps: `lcmp`/`fcmp*`/`dcmp*` render as bool arithmetic
-(`(a > b ? 1 : 0) - (a < b ? 1 : 0) <= 0`); a stack slot reused for a ref and then a long gives
-`var.q` accessors; `jsr` subroutines show as `sub_…` calls with the return address argument; a
-long/double call result is shown re-assembled as `(retvar:4.d):(retvar.d)`; float/double call
-arguments/results are typed as int32/int64 at call sites (`jvm_call` has no float registers).
+### Open questions
+- How should constant-pool references render inline — `pool_N` pseudo-pointers, or resolved names?
 
-### 3. JAR support — one class per view; **Whole JAR** opens all of them (jvm-13)
-A `.class` is still one view. **File > Load whole jar...** (also an open-dialog mode, "Whole JAR...")
-unpacks `foo.jar` to `foo/` next to it and asks which class to open. The decompiler reads other
-classes from that folder when it needs them (inner classes, supertypes, varargs); **JVM > Open class
-from this JAR...** opens one of those as a tab. One combined view for every class is not the model:
-method addresses are per view. **Load whole jar** reads `META-INF/MANIFEST.MF` and preselects
-`Main-Class`. Nested `.jar` entries are listed and can be unpacked the same way (`foo.jar` entry
-`lib/bar.jar` → `foo/lib/bar/`); other non-class entries are skipped and logged (jvm-15). Opening one
-`.class` directly is unchanged.
+Decided: one opcode table for all JVM versions (the set is frozen since `invokedynamic` in Java 7;
+only header, pool tags and attributes changed); one class per view, not one view per JAR (method
+addresses are per view).
 
-### 4. Patching — **NOT a goal** ✅ (removed)
-Per project decision, interactive patching is out of scope; the ported
-`convert_to_nop`/`invert_branch`/`always_branch`/`assemble` paths have been deleted.
+## Development
 
-### 5. Analysis DB (`.bndb`) must persist renames + notes ⬜
-Requirement: a user renaming a function/symbol/variable and adding **comments/notes** must
-survive save → close → reopen.
-- Symbols are currently created with `define_user_symbol` (constant pool / primitives) and
-  `define_auto_symbol` (methods). **Auto symbols are overwritten by re-analysis and user
-  renames of them may not stick** — switch method symbols to user symbols (or ensure the
-  loader doesn't clobber user edits on DB reopen).
-- `init()` re-runs on DB load; guard it so it does not re-`define_*` over user edits.
-- Confirm function/variable renames and `set_comment_at` notes round-trip through a saved
-  `.bndb`. This is the acceptance test for this item.
-
----
-
-## Open questions (decide, then record the answer here)
-
-- **Should we support several JVM versions / opcode sets?** **No — one opcode table (jvm-26).**
-  The opcode set has been frozen since `invokedynamic` (`0xba`) in Java 7 (class major 51).
-  What still changes is the `major_version` header (shown on the class, jvm-25), constant-pool
-  tags (`Dynamic`, `Module`, `Package` — jvm-22), and attributes (`StackMapTable`, nest host,
-  `Record`, `PermittedSubclasses` — jvm-24).
-
-- Should the view show decompiled/source-like output, or is annotated LLIL enough?
-- How should constant-pool references render in-line (currently `Pool@N` pseudo-pointers into
-  `PSEUDOMEMORY_TABLE`)? Good enough, or resolve to names?
-
----
-
-## Samples
-
-`sample/` (git-ignored, ~331 MB) holds the **Consorsbank ActiveTrader** macOS app as test
-material: **341 `.class` files and 112 `.jar` files** under
-`sample/ActiveTraderDE_app/Contents/WorkingDir/current/lib/…`. Use these to exercise the
-loader, opcode coverage, and JAR handling against real-world (non-toy) bytecode. It is
-git-ignored, so it is **not** pushed — regenerate locally with
-`cp -R <ActiveTrader.app> sample/ActiveTraderDE_app` if needed.
-
-## Testing notes (important)
-
-This machine runs **Binary Ninja 6.1 Personal**. The **Personal license has no headless
-API** — you cannot `import binaryninja` from a standalone interpreter. Test by loading the
-plugin in the running GUI and driving it through the **Binary Ninja MCP** tools / the `bnrun`
-script bridge (the `binaryninja-mcp` skill is installed globally). See `CLAUDE.md` for the
-exact environment details a fresh session needs.
+The repo root is the plugin package (`arch.py`, `view.py`, `lifter.py`, `opcodes.py`, `classfile.py`,
+`pseudo_java.py`, `classui.py`, `jarload.py`, ...). `tests/offline_lift_check.py` runs without Binary
+Ninja; everything else runs inside the GUI through a script bridge. `CLAUDE.md` has the environment,
+the test gates and the code layout. Test classes live in `sample/` (git-ignored, not distributed).
 
 ## Attribution
 

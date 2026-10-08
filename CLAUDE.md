@@ -156,7 +156,7 @@ has the full plan; the same rules apply here:
   rather than assuming — the port already relies on several APIs being unchanged from the py2
   era; verify before adding new calls.
 - Keep the single-`.class` load path working as you add JAR support.
-- **Patching is explicitly out of scope** (README TODO #4) — the nop/branch-invert/assemble
+- **Patching is explicitly out of scope** (README roadmap) — the nop/branch-invert/assemble
   paths have been removed; don't re-add them.
 
 ## Git / remote
