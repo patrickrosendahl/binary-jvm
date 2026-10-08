@@ -9,9 +9,9 @@ stack as registers (jvm-33), typed signatures + names (jvm-35), compare fusion (
 edges inside methods (jvm-42), a Pseudo Java language representation (jvm-43/44) and a class view
 (jvm-41). The plugin is **installed** again (symlink + `files.container.excludedTransforms = ["Universal"]`).
 
-**▶ Handoff (2026-10-08 11:40).** Through jvm-36 the older roadmap's next concrete item is done:
-an `invoke*` of a method in the same class has a code ref to it. Next is the JAR decision **jvm-13**
-(one class / all classes / hybrid), then jvm-14/15/12. jvm-68 still waits until binary-cpp needs a shared part.
+**▶ Handoff (2026-10-08 11:45).** jvm-13 is decided: one class per view, and **File > Load whole jar...**
+unpacks `foo.jar` to `foo/` and opens every class (needs a BN restart to appear in the menu). Next
+concrete tickets: jvm-15 (manifest and nested JARs), jvm-44 leftovers, jvm-37. jvm-68 still waits on binary-cpp.
 The running Binary Ninja loaded `17a0987` at startup; a restart picks up later commits. Run BN gates one at a
 time; under heavy machine load compare_all needs > 40 min and times out.
 
@@ -66,8 +66,8 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
 - ⚠️ A view type registered after startup (dev loads) is **not** picked by `bn.load()` or MCP
   `bn_open_item_open` (Raw / a GUI dialog instead) — create it explicitly with
   `BinaryViewType[name].create(BinaryView.open(path))`. Such views are not UI tabs.
-- BN's file opener does **not** treat `.jar` as a ZIP container (asked Vector35/Jordan whether
-  `.jar` can be registered as a container) — extract classes for testing; see ticket jvm-13.
+- **File > Load whole jar...** unpacks `foo.jar` to `foo/` beside it and opens every `.class`
+  in its own JVM Class view (jvm-13). Opening one `.class` is unchanged. Nested JARs are jvm-15.
 
 ## Testing workflow (fast → slow)
 

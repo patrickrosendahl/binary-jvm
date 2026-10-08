@@ -105,17 +105,11 @@ Known cosmetic gaps: `lcmp`/`fcmp*`/`dcmp*` render as bool arithmetic
 long/double call result is shown re-assembled as `(retvar:4.d):(retvar.d)`; float/double call
 arguments/results are typed as int32/int64 at call sites (`jvm_call` has no float registers).
 
-### 3. JAR support ⬜ (design + implement)
-`.jar` = a ZIP of `.class` entries. A `.class`-only loader can't open them directly.
-Decide and build a good story — options to weigh:
-- **Load one class:** on opening a `.jar`, present a class picker (`get_choice_input`) and
-  load the selected entry as the current view.
-- **Load all classes:** map every `.class` into one view at distinct base addresses (the
-  method-base scheme `0x1000000 + 0x100000*index` already segments per method — extend it
-  per class), so cross-class references can resolve.
-- A hybrid: index the JAR, default to the main class (from the manifest `Main-Class`), let the
-  user add more.
-Also handle nested resources and the manifest. Keep the single-`.class` path working.
+### 3. JAR support — one class per view; **Whole JAR** opens all of them (jvm-13)
+A `.class` is still one view. **File > Load whole jar...** (also an open-dialog mode, "Whole JAR...")
+unpacks `foo.jar` to `foo/` next to it and opens every `.class` with the existing JVM Class view.
+Inner classes and supertypes keep resolving from that directory. One combined view for every class
+in the JAR is not the model: method addresses are per view. Nested JARs and the manifest are jvm-15.
 
 ### 4. Patching — **NOT a goal** ✅ (removed)
 Per project decision, interactive patching is out of scope; the ported
