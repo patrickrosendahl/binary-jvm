@@ -67,6 +67,7 @@ SPLIT_CONDITIONS = True      # T x; if (a) { x = e; } if (!a || p(x)) -> if (!a 
 TERNARIES = True             # T x; if (c) { x = a; } else { x = b; } -> T x = c ? a : b (jvm-59)
 INCREMENT_VALUES = True      # int t = f; f = t + 1; use(t) -> use(f++); int t = f + 1; f = t; use(t) -> use(++f) (jvm-60)
 RETURN_VALUES = True         # if (c) { return false; } return true; -> return !c; if (a) { return x; } return y; -> return a ? x : y (jvm-67)
+ASSIGN_IN_CONDITIONS = True  # x = e; if (x == null) break; -> while ((x = e) != null) (jvm-82)
 CONDITION_GRAPHS = True      # an if/goto tree over shared outcomes -> if ((c ? a : b) && d) A else B (jvm-80)
 TRY_WITH_RESOURCES = True    # javac's try-with-resources desugaring (r = e; try..catch Throwable close..) -> try (R r = e) { } (jvm-78)
 # intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
@@ -831,6 +832,12 @@ if _HAVE_BN:
 
     _EXC_BRANCH = "EXC_BRANCH"
 
+    class _CgIf:
+        """a loop's exit test that is a reduced condition graph (jvm-80): only its condition is used"""
+        def __init__(self, cond):
+            self.cond = cond
+            self.expr_index = None
+
     class _ExcBranch:
         """the exceptional branch of an `if (exc ...)` test, as an item of a flattened statement list"""
         operation = _EXC_BRANCH
@@ -1184,6 +1191,7 @@ if _HAVE_BN:
             self.hidden_vars = set()  # lock variables whose definition moved into a synchronized header
             self.twr_labels = set()  # labels of folded try-with-resources tails (jvm-78)
             self.twr_open = []       # resources whose try-with-resources body is being printed
+            self.loop_decls = {}     # loop expr_index -> [(var, def)] declared before it (assignment in its condition)
             self._def_counts = None
             self.deferred = set()           # expr_index of handler code met in a try body, printed by its catch
             self.printed_handlers = set()   # handler pcs whose catch/finally clause was printed
@@ -2025,6 +2033,7 @@ if _HAVE_BN:
                 self.hidden_vars = set()
                 self.twr_labels = set()
                 self.twr_open = []
+                self.loop_decls = {}
                 if TRY_WITH_RESOURCES:
                     # javac's `try { r.close(); } catch (Throwable x) { e.addSuppressed(x); }` inside a close
                     # handler is never printed; the root would place it before a nested level plans the fold
@@ -2437,6 +2446,21 @@ if _HAVE_BN:
             return "+" if (c == 1) == (e.operation == Op.HLIL_ADD) else "-"
 
         def emit_inlined(self, value, tokens, settings, precedence):
+            if isinstance(value, tuple) and value[0] == 'assignx':
+                # `(x = e)` where the condition reads x first; x prints as itself after that (jvm-82)
+                _, target, src, d = value
+                for v, val in list(self.inline.items()):
+                    if val is value:
+                        del self.inline[v]
+                parens = precedence is None or precedence > P.AssignmentOperatorPrecedence
+                if parens:
+                    tokens.append_open_paren()
+                self.emit_var(target, d, tokens)
+                self.op(tokens, " = ")
+                self.emit_typed(src, self.var_code(target), tokens, settings, P.AssignmentOperatorPrecedence)
+                if parens:
+                    tokens.append_close_paren()
+                return
             if isinstance(value, tuple) and value[0] == 'incdec':
                 _, load, step, pre, _, _ = value
                 if pre:
@@ -2476,6 +2500,20 @@ if _HAVE_BN:
                         n += 1
             return n
 
+        def block_exits(self, lock, enter):
+            """monitorexit(lock) statements of the synchronized block that monitorenter statement `enter`
+            opens: javac lays a block out in one piece, so they lie between it and the next monitorenter of the
+            same lock (several blocks often lock through one copy of `this`, jvm-82)"""
+            addr = enter.address
+            nxt = min((i.address for i in _walk(self.hlil.root)
+                       if self.monitor_var(i, "monitorenter") == lock and i.address > addr), default=None)
+            n = 0
+            for i in _walk(self.hlil.root):
+                if self.monitor_var(i, "monitorexit") == lock and not self.in_monitor_code(i) and \
+                        i.address > addr and (nxt is None or i.address < nxt):
+                    n += 1
+            return n
+
         def never_falls(self, s):
             """control never continues after statement s (every path returns, throws, breaks, ...)"""
             if isinstance(s, _ExcBranch):
@@ -2500,7 +2538,10 @@ if _HAVE_BN:
                     k += 1
                     continue
                 end = None
-                for b in range(hi, k, -1):
+                # the block ends before the next block on the same lock (jvm-82)
+                top = next((m - 1 for m in range(k + 1, hi + 1)
+                            if self.monitor_var(body[m], "monitorenter") == lock and not self.in_monitor_code(body[m])), hi)
+                for b in range(top, k, -1):
                     if self.monitor_var(body[b], "monitorexit") == lock:
                         end = b
                         break
@@ -2511,7 +2552,7 @@ if _HAVE_BN:
                         k = self.plan_sync_split(body, k, hi, lock, run_at, plan, out)
                         continue
                 inner = body[k + 1:(end if end is not None else hi) + 1]
-                total = self.monitor_exits([self.hlil.root], lock)
+                total = self.block_exits(lock, body[k])
                 if not self.exits_leave(body, k, end if end is not None else hi + 1, lock) or \
                         self.monitor_exits(inner, lock) != total or \
                         any(self.monitor_var(i, "monitorenter") == lock for x in inner
@@ -2552,7 +2593,7 @@ if _HAVE_BN:
                 return None
             s = body[j]
             if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_IF or \
-                    self.monitor_exits([self.hlil.root], lock) != self.monitor_exits([s], lock) or \
+                    self.block_exits(lock, body[k]) != self.monitor_exits([s], lock) or \
                     any(a <= j and b >= k for a, b, _ in run_at.values()) or \
                     any(self.monitor_var(i, "monitorenter") == lock for x in body[k + 1:j + 1]
                         for i in _walk(x.instr if isinstance(x, _ExcBranch) else x)):
@@ -2812,13 +2853,20 @@ if _HAVE_BN:
             k = 0
             defs = []
             while k < len(items) and (self.hidden_item(items[k]) or
-                                      (not isinstance(items[k], _ExcBranch) and items[k].operation == Op.HLIL_VAR_INIT)):
+                                      (not isinstance(items[k], _ExcBranch) and
+                                       (items[k].operation == Op.HLIL_VAR_INIT or
+                                        (ASSIGN_IN_CONDITIONS and items[k].operation == Op.HLIL_ASSIGN and
+                                         items[k].dest.operation == Op.HLIL_VAR)))):
                 if not self.hidden_item(items[k]):
                     defs.append(items[k])
                 k += 1
             if k >= len(items) or isinstance(items[k], _ExcBranch) or items[k].operation != Op.HLIL_IF:
                 return None
             iff = items[k]
+            if CONDITION_GRAPHS and not defs and do_cond is None:
+                cg = self.loop_cg_exit(items, k)
+                if cg is not None:  # `while (true) { if (<graph>) break; rest }` (jvm-80/82)
+                    return [], cg[0], [], cg[1], None
             if self.exc_if_parts(iff) is not None or \
                     not (iff.false is None or iff.false.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE)):
                 return None
@@ -2857,11 +2905,20 @@ if _HAVE_BN:
                     return None
             if not self.labels_internal(tail):
                 return None  # (rest stays in the loop body: its labels keep their place)
-            # every def is read once, in the condition, where it can be evaluated
+            # every def is read once, in the condition, where it can be evaluated; a def whose value is also
+            # needed later becomes an assignment in the condition (`while ((line = r.readLine()) != null)`, jvm-82)
             saved = dict(self.inline)
+            decls = []
+            assigned = self.assign_defs(defs, iff.condition)
+            if assigned is None:
+                self.inline = saved
+                return None
             for d in reversed(defs):
+                if d.expr_index in assigned:
+                    continue
                 var = d.dest
-                if self.var_count(var) != 1 or self.def_count(var) != 1 or self.mentions_exc(d.src):
+                if d.operation != Op.HLIL_VAR_INIT or self.var_count(var) != 1 or self.def_count(var) != 1 or \
+                        self.mentions_exc(d.src):
                     self.inline = saved
                     return None
                 before, found = self.eval_nodes(iff.condition, var)
@@ -2870,6 +2927,15 @@ if _HAVE_BN:
                     self.inline = saved
                     return None
                 self.inline[var] = d.src
+            for d in defs:
+                if d.expr_index in assigned:
+                    target, value, declare = assigned[d.expr_index]
+                    if value is not None:
+                        self.inline[d.dest if d.operation == Op.HLIL_VAR_INIT else d.dest.var] = \
+                            ('assignx', target, value, d)
+                    if declare:
+                        decls.append((target, d))
+            self.loop_decls[w.expr_index] = decls
             if do_cond is not None:
                 # `x = v; } while (x)`: the test moves to the end of the body as `if (!v) { <code after> }`
                 self.inline[x] = asg.src
@@ -2880,6 +2946,63 @@ if _HAVE_BN:
             if moved:
                 self.break_subst[rest_breaks[0].expr_index] = ([x for _, x in after], block)
             return defs, iff, tail, rest, ([j for j, _ in after], rest_breaks[0].expr_index) if moved else None
+
+        def loop_cg_exit(self, items, k):
+            """(_CgIf, rest) when items[k..] starts with a condition region whose outcomes are `break` and
+            falling through to the rest of the loop body"""
+            end = self.cg_region(items, k, len(items) - 1)
+            if end is None:
+                return None
+            found = self.cg_try(items, k, end, len(items) - 1, {}, {}, {"skip": set(), "new_at": {}})
+            if found is None:
+                return None
+            top, nodes, end = found
+            a, b = nodes[top[2]][2], nodes[top[3]][2]
+            cond = top[1]
+            if b and len(b) == 1 and b[0].operation == Op.HLIL_BREAK and not a:
+                a, b, cond = b, a, ('not', cond)
+            if not (len(a) == 1 and a[0].operation == Op.HLIL_BREAK and not b):
+                return None
+            return _CgIf(cond), items[end + 1:]
+
+        def assign_defs(self, defs, cond):
+            """{expr_index of a def: (variable assigned, value or None if folded into another def, declare it
+            before the loop)} for the defs before a loop's exit test that become `(x = e)` in its condition:
+            `T x = e;` / `x = e;` whose x the condition reads once and the body reads again, and javac's
+            `T t = e; x = t;` with t read only by that store and the condition (-> `(x = e)` where t was).
+            Plain single-use defs are left to the caller. None when a def can't move into the condition."""
+            out = {}
+            if not ASSIGN_IN_CONDITIONS:
+                return out
+            for n, d in enumerate(defs):
+                var = d.dest if d.operation == Op.HLIL_VAR_INIT else d.dest.var
+                if d.operation == Op.HLIL_VAR_INIT and self.var_count(var) == 1:
+                    continue  # read only by the condition: inlined as it is
+                nxt = defs[n + 1] if n + 1 < len(defs) else None
+                if d.operation == Op.HLIL_VAR_INIT and nxt is not None and nxt.operation == Op.HLIL_ASSIGN and \
+                        nxt.src.operation == Op.HLIL_VAR and nxt.src.var == var and self.var_count(var) == 2 and \
+                        self.refs(cond, var) == 1 and self.def_count(var) == 1:
+                    out[d.expr_index] = (nxt.dest.var, d.src, False)  # t = e; x = t; if (t ..)
+                    out[nxt.expr_index] = (nxt.dest.var, None, False)
+                    continue
+                if nxt is not None and nxt.expr_index in out:
+                    continue
+                if d.expr_index in out:
+                    continue
+                if self.refs(cond, var) != 1 or self.mentions_exc(d.src):
+                    return None
+                if d.operation == Op.HLIL_VAR_INIT and self.def_count(var) != 1:
+                    return None
+                out[d.expr_index] = (var, d.src, d.operation == Op.HLIL_VAR_INIT and var not in self.hoisted)
+            for d in defs:  # the moved value is evaluated where the condition reads it: nothing with effects first
+                if d.expr_index not in out or out[d.expr_index][1] is None:
+                    continue
+                key = d.dest if d.operation == Op.HLIL_VAR_INIT else d.dest.var
+                before, found = self.eval_nodes(cond, key)
+                if found is not True or any(self.side_effect(i) for i in before) or \
+                        (not self.pure(d.src) and any(self.reads_memory(i) for i in before)):
+                    return None
+            return out
 
         def labels_internal(self, items):
             """every label in items is only jumped to from items (they can move as a whole, e.g. out of a loop)"""
@@ -2980,9 +3103,18 @@ if _HAVE_BN:
             defs, iff, tail, rest, moved = shape
             for d in defs:
                 self.consumed.add(d.expr_index)
+            for var, d in self.loop_decls.get(w.expr_index, ()):  # assigned in the condition, read in the body
+                if var not in self.hoisted:
+                    self.hoisted.add(var)
+                    self.emit_var_decl(var, d, tokens, d.src)
+                    tokens.append_semicolon()
+                    tokens.new_line()
             self.kw(tokens, "while ")
             tokens.append_open_paren()
-            self.emit_negated(iff.condition, tokens, settings)
+            if isinstance(iff, _CgIf):
+                self.emit_bexpr(iff.cond, tokens, settings, P.TopLevelOperatorPrecedence, negate=True)
+            else:
+                self.emit_negated(iff.condition, tokens, settings)
             tokens.append_close_paren()
             tokens.begin_scope(ScopeType.BlockScopeType)
             self.emit_list(rest, tokens, settings, w.body)
