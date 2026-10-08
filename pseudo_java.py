@@ -1630,21 +1630,24 @@ if _HAVE_BN:
                 tokens.finalize_scope()
                 tokens.new_line()
 
-        def emit_negated(self, c, tokens, settings):
+        def emit_negated(self, c, tokens, settings, precedence=None):
+            """!c, printed for a context of this precedence (None: a whole condition, `if (...)`). A De Morgan
+            result is not parenthesised here: the caller knows whether its && / || needs that"""
             flip = NEGATED_CMP
             if c.operation in (Op.HLIL_OR, Op.HLIL_AND) and c.size == 0 and \
                     all(x.operation in flip or x.operation not in (Op.HLIL_OR, Op.HLIL_AND) for x in (c.left, c.right)):
-                # De Morgan: !(a || b) -> !a && !b, !(a && b) -> !a || !b
-                self.emit_negated(c.left, tokens, settings)
+                # De Morgan: !(a || b) -> !a && !b, !(a && b) -> !a || !b; the operands sit inside the new operator
+                inner = P.LogicalAndOperatorPrecedence if c.operation == Op.HLIL_OR else P.LogicalOrOperatorPrecedence
+                self.emit_negated(c.left, tokens, settings, inner)
                 self.op(tokens, " && " if c.operation == Op.HLIL_OR else " || ")
-                self.emit_negated(c.right, tokens, settings)
+                self.emit_negated(c.right, tokens, settings, inner)
                 return
             if c.operation in flip:  # (integer compares only: a float compare with NaN is not its flip)
                 text, prec = BINARY[flip[c.operation]]
                 self.emit_binary(text, prec, _Cmp(c.left, c.right, c), tokens, settings, P.TopLevelOperatorPrecedence)
                 return
-            if c.operation == Op.HLIL_NOT:
-                self.expr(c.src, tokens, settings)
+            if c.operation == Op.HLIL_NOT:  # !!x -> x, parenthesised when x binds looser than the context (jvm-72)
+                self.expr(c.src, tokens, settings, precedence)
                 return
             self.op(tokens, "!")
             self.perform_get_expr_text(c, tokens, settings, P.UnaryOperatorPrecedence)
@@ -3048,7 +3051,7 @@ if _HAVE_BN:
                                                 else P.LogicalOrOperatorPrecedence)
             if parens:
                 tokens.append_open_paren()
-            self.emit_negated(c, tokens, settings)
+            self.emit_negated(c, tokens, settings, None if demorgan else precedence)
             if parens:
                 tokens.append_close_paren()
 
