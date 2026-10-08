@@ -546,8 +546,18 @@ class JVMAttributeInfo(JVMStructure):
             self.attribute = self.readStruct(JVMMethodParametersAttribute(self.classReader),"attribute")
         elif self.attributeType == "Deprecated":
             self.attribute = self.readStruct(JVMDeprecatedAttribute(self.classReader),"attribute")
+        elif self.attributeType == "StackMapTable":
+            self.attribute = self.readStruct(JVMStackMapTableAttribute(self.classReader),"attribute")
+        elif self.attributeType == "NestHost":
+            self.attribute = self.readStruct(JVMNestHostAttribute(self.classReader),"attribute")
+        elif self.attributeType == "NestMembers":
+            self.attribute = self.readStruct(JVMNestMembersAttribute(self.classReader),"attribute")
+        elif self.attributeType == "Record":
+            self.attribute = self.readStruct(JVMRecordAttribute(self.classReader),"attribute")
+        elif self.attributeType == "PermittedSubclasses":
+            self.attribute = self.readStruct(JVMPermittedSubclassesAttribute(self.classReader),"attribute")
         else:
-            self.readArray(self.attribute_length, "attribute")
+            self.readArray(self.attribute_length, "attribute")  # unknown attributes are skipped by length
  
 class JVMMethodParametersAttribute(JVMStructure):
 
@@ -560,6 +570,100 @@ class JVMMethodParametersAttribute(JVMStructure):
         self.parameters = []
         for i in range(self.parameters_count):
             self.parameters.append((self.readShort("name_index["+str(i)+"]"), self.readShort("access_flags["+str(i)+"]")))
+
+class JVMStackMapTableAttribute(JVMStructure):
+    """JVMS stack_map_frame. Each entry is (kind, frame_type, offset_delta, extra) where extra is a
+    verification type, a list of them, or None. A verification type is (tag,) or (tag, u2)."""
+
+    def __init__(self, r):
+        JVMStructure.__init__(self, r)
+        self.read()
+
+    def _verification_type(self, name):
+        tag = self.readByte(name + ".tag")
+        if tag == 7:  # Object
+            return (tag, self.readShort(name + ".cpool"))
+        if tag == 8:  # Uninitialized
+            return (tag, self.readShort(name + ".offset"))
+        if tag > 8:
+            raise ValueError("bad verification type %d" % tag)
+        return (tag,)
+
+    def read(self):
+        self.number_of_entries = self.readShort("number_of_entries")
+        self.entries = []
+        for i in range(self.number_of_entries):
+            tag = self.readByte("frame_type[%d]" % i)
+            if tag <= 63:  # same_frame
+                self.entries.append(("same", tag, tag, None))
+            elif tag <= 127:  # same_locals_1_stack_item_frame
+                self.entries.append(("same_locals_1", tag, tag - 64, self._verification_type("stack[%d]" % i)))
+            elif tag == 247:  # same_locals_1_stack_item_frame_extended
+                delta = self.readShort("offset_delta[%d]" % i)
+                self.entries.append(("same_locals_1_ext", tag, delta, self._verification_type("stack[%d]" % i)))
+            elif 248 <= tag <= 250:  # chop_frame
+                self.entries.append(("chop", tag, self.readShort("offset_delta[%d]" % i), None))
+            elif tag == 251:  # same_frame_extended
+                self.entries.append(("same_ext", tag, self.readShort("offset_delta[%d]" % i), None))
+            elif 252 <= tag <= 254:  # append_frame
+                delta = self.readShort("offset_delta[%d]" % i)
+                locals_ = [self._verification_type("local[%d][%d]" % (i, k)) for k in range(tag - 251)]
+                self.entries.append(("append", tag, delta, locals_))
+            elif tag == 255:  # full_frame
+                delta = self.readShort("offset_delta[%d]" % i)
+                nloc = self.readShort("number_of_locals[%d]" % i)
+                locals_ = [self._verification_type("local[%d][%d]" % (i, k)) for k in range(nloc)]
+                nstk = self.readShort("number_of_stack_items[%d]" % i)
+                stack = [self._verification_type("stack[%d][%d]" % (i, k)) for k in range(nstk)]
+                self.entries.append(("full", tag, delta, (locals_, stack)))
+            else:
+                raise ValueError("reserved stack map frame type %d" % tag)
+
+class JVMNestHostAttribute(JVMStructure):
+
+    def __init__(self, r):
+        JVMStructure.__init__(self, r)
+        self.read()
+
+    def read(self):
+        self.host_class_index = self.readShort("host_class_index")
+
+class JVMNestMembersAttribute(JVMStructure):
+
+    def __init__(self, r):
+        JVMStructure.__init__(self, r)
+        self.read()
+
+    def read(self):
+        self.number_of_classes = self.readShort("number_of_classes")
+        self.classes = [self.readShort("classes[%d]" % i) for i in range(self.number_of_classes)]
+
+class JVMRecordAttribute(JVMStructure):
+
+    def __init__(self, r):
+        JVMStructure.__init__(self, r)
+        self.read()
+
+    def read(self):
+        self.components_count = self.readShort("components_count")
+        self.components = []
+        for i in range(self.components_count):
+            name = self.readShort("name_index[%d]" % i)
+            desc = self.readShort("descriptor_index[%d]" % i)
+            n = self.readShort("attributes_count[%d]" % i)
+            attrs = [self.readStruct(JVMAttributeInfo(self.classReader), "attribute[%d][%d]" % (i, j))
+                     for j in range(n)]
+            self.components.append((name, desc, attrs))
+
+class JVMPermittedSubclassesAttribute(JVMStructure):
+
+    def __init__(self, r):
+        JVMStructure.__init__(self, r)
+        self.read()
+
+    def read(self):
+        self.number_of_classes = self.readShort("number_of_classes")
+        self.classes = [self.readShort("classes[%d]" % i) for i in range(self.number_of_classes)]
 
 class JVMDeprecatedAttribute(JVMStructure):
 

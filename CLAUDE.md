@@ -9,10 +9,9 @@ stack as registers (jvm-33), typed signatures + names (jvm-35), compare fusion (
 edges inside methods (jvm-42), a Pseudo Java language representation (jvm-43/44) and a class view
 (jvm-41). The plugin is **installed** again (symlink + `files.container.excludedTransforms = ["Universal"]`).
 
-**▶ Handoff (2026-10-08 11:05).** jvm-58…67 and jvm-66 are resolved. The older roadmap is in progress,
-in this order: jvm-1, jvm-26, and jvm-31 are resolved; jvm-25 shows the class-file version on the class.
-Next is **jvm-24** (newer class-file attributes), then jvm-18/19/20 (renames surviving `.bndb`).
-jvm-68 still waits until binary-cpp needs a shared part.
+**▶ Handoff (2026-10-08 11:15).** jvm-58…67, jvm-66, jvm-1, jvm-26, jvm-31, jvm-25, jvm-24, and jvm-21
+are resolved. Next in the older-roadmap order: **jvm-18**, **jvm-19**, **jvm-20** (renames and comments
+survive `.bndb`; parent jvm-17), then jvm-36. jvm-68 still waits until binary-cpp needs a shared part.
 The running Binary Ninja loaded `17a0987` at startup; a restart picks up later commits. Run BN gates one at a
 time; under heavy machine load compare_all needs > 40 min and times out.
 

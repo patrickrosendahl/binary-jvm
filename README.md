@@ -139,8 +139,8 @@ survive save → close → reopen.
 - **Should we support several JVM versions / opcode sets?** **No — one opcode table (jvm-26).**
   The opcode set has been frozen since `invokedynamic` (`0xba`) in Java 7 (class major 51).
   What still changes is the `major_version` header (shown on the class, jvm-25), constant-pool
-  tags (`Dynamic`/`Module`/`Package` are not parsed yet), and attributes (`StackMapTable`,
-  nest host, `Record`, …) — that work is jvm-21 / jvm-24.
+  tags (`Dynamic`, `Module`, `Package` — jvm-22), and attributes (`StackMapTable`, nest host,
+  `Record`, `PermittedSubclasses` — jvm-24).
 
 - Should the view show decompiled/source-like output, or is annotated LLIL enough?
 - How should constant-pool references render in-line (currently `Pool@N` pseudo-pointers into
