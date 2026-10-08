@@ -1,0 +1,108 @@
+# Rare opcodes javac does not emit (jvm-37).
+# Version 49: from class version 51 the verifier rejects jsr / jsr_w / ret.
+# goto_w and wide are legal at any version; javac only uses them when a short
+# offset or a local index does not fit, which these methods force by hand.
+# Assemble: python3 tests/synthetic/assemble_jasm.py tests/synthetic/rare/RareOps.jasm -d tests/synthetic/classes
+.version 49 0
+.class public super jvmtest/RareOps
+.super java/lang/Object
+
+.method public static nop : ()V
+    .code stack 0 locals 0
+        nop
+        return
+    .end code
+.end method
+
+.method public static swapInts : ()I
+    .code stack 2 locals 0
+        iconst_1
+        iconst_2
+        swap
+        pop
+        ireturn
+    .end code
+.end method
+
+# both wide jumps are reachable: ifeq's false edge goes back with goto_w, its true edge forward
+.method public static gotoWide : ()V
+    .code stack 1 locals 1
+        iconst_0
+        istore_0
+    Lhead:
+        iload_0
+        ifeq Lfwd
+        goto_w Lhead
+    Lfwd:
+        goto_w Lend
+    Lend:
+        return
+    .end code
+.end method
+
+.method public static jsrWide : ()V
+    .code stack 1 locals 1
+        jsr_w Lsub
+        return
+    Lsub:
+        astore_0
+        ret 0
+    .end code
+.end method
+
+.method public static wideInts : ()I
+    .code stack 1 locals 257
+        iconst_3
+        wide istore 256
+        wide iinc 256 5
+        wide iload 256
+        ireturn
+    .end code
+.end method
+
+.method public static wideLong : ()J
+    .code stack 2 locals 258
+        lconst_1
+        wide lstore 256
+        wide lload 256
+        lreturn
+    .end code
+.end method
+
+.method public static wideFloat : ()F
+    .code stack 1 locals 257
+        fconst_1
+        wide fstore 256
+        wide fload 256
+        freturn
+    .end code
+.end method
+
+.method public static wideDouble : ()D
+    .code stack 2 locals 258
+        dconst_1
+        wide dstore 256
+        wide dload 256
+        dreturn
+    .end code
+.end method
+
+.method public static wideRef : ()Ljava/lang/Object;
+    .code stack 1 locals 257
+        aconst_null
+        wide astore 256
+        wide aload 256
+        areturn
+    .end code
+.end method
+
+.method public static wideRet : ()V
+    .code stack 1 locals 257
+        jsr_w Lsub
+        return
+    Lsub:
+        wide astore 256
+        wide ret 256
+    .end code
+.end method
+.end class

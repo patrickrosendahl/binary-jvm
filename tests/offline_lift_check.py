@@ -16,7 +16,8 @@ Checks that:
 Runs in parallel over chunks of classes.
 
 usage: python3 tests/offline_lift_check.py [--nostate] [--all | file.jar|file.class ...]
-       no arguments: quick check on sample/.../lib/mdg.jar;  --all: every .jar/.class under sample/
+       no arguments: quick check on sample/.../lib/mdg.jar plus the rare-opcode class (jvm-37);
+       --all: every .jar/.class under sample/, plus that class
 """
 import collections, importlib.util, multiprocessing, os, re, subprocess, sys, time, types, zipfile
 
@@ -54,6 +55,15 @@ sys.modules["binary_jvm"] = _pkg
 _spec.loader.exec_module(_pkg)
 from binary_jvm import opcodes, lifter, classfile, stackmap, methodinfo
 from binary_jvm.constants import NUM_STACK_REGS, METHOD_BASE, METHOD_STRIDE
+
+RARE_CLASS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "synthetic", "classes", "jvmtest", "RareOps.class")
+
+def with_rare(paths):
+    """the committed class that carries opcodes the sample never hits (jvm-37)"""
+    if os.path.isfile(RARE_CLASS) and all(os.path.abspath(p) != os.path.abspath(RARE_CLASS) for p in paths):
+        return list(paths) + [RARE_CLASS]
+    return list(paths)
 
 def sample_dir():
     sample = os.path.join(ROOT, "sample")
@@ -397,10 +407,10 @@ def main(args):
     args = [a for a in args if a != "--nostate"]
     sample = sample_dir()
     if not args:
-        args = [os.path.join(sample, "ActiveTraderDE_app/Contents/WorkingDir/current/lib/mdg.jar")]
+        args = with_rare([os.path.join(sample, "ActiveTraderDE_app/Contents/WorkingDir/current/lib/mdg.jar")])
     elif args == ["--all"]:
-        args = sorted(os.path.join(d, f) for d, _, fs in os.walk(sample) for f in fs
-                      if f.endswith((".jar", ".class")) and not unpacked_jar_dir(d))
+        args = with_rare(sorted(os.path.join(d, f) for d, _, fs in os.walk(sample) for f in fs
+                                if f.endswith((".jar", ".class")) and not unpacked_jar_dir(d)))
     t0 = time.time()
     total = new_stats()
     with multiprocessing.Pool(initializer=_init_worker, initargs=(nostate,)) as pool:

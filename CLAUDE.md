@@ -78,6 +78,7 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
    parses `mdg.jar`, decodes + lifts every instruction into a mock IL and checks decode tiling,
    no `unimplemented`, and the per-instruction stack effect against an independent table.
    `--all` runs every jar under `sample/` in parallel (≈47k classes, 11.6M instructions).
+   `python3 tests/synthetic_opcode_check.py` lifts the committed rare-opcode class (nop, swap, goto_w, jsr_w, wide).
 2. **Live in BN without restart**: `bnrun tests/bn_dev_load.py` copies the package to
    `/tmp/jvm_devN/`, renames arch/view to `JVM-devN` / `JVM Class devN` and registers them
    (BN cannot unregister types, so every reload needs fresh names; older dev views are disabled).
