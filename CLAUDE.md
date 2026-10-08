@@ -11,7 +11,7 @@ edges inside methods (jvm-42), a Pseudo Java language representation (jvm-43/44)
 
 **▶ Handoff (2026-10-08 13:00).** jvm-13 is decided: one class per view, and **File > Load Whole JAR...**
 unpacks `foo.jar` to `foo/` and opens the class you pick. The 2026-10-08 review (jvm-69..74) checked every gate on
-`ed4d40e`; jvm-70 (click through Load Whole JAR in the GUI) needs a human. Next concrete tickets: jvm-15 (manifest
+`ed4d40e` and fixed jvm-69/71/72/73/75; jvm-70 (click through Load Whole JAR in the GUI) needs a human. Next concrete tickets: jvm-15 (manifest
 and nested JARs), jvm-44 leftovers, jvm-37. jvm-68 still waits on binary-cpp. Binary Ninja was restarted at 12:03
 and runs the installed plugin at HEAD; restart again after plugin changes, or use a dev load.
 
@@ -35,7 +35,7 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
 | `classfile.py` | class-file parser (builds BN struct types), `JVMClassReader` (pool lookups), reader registry keyed by view handle |
 | `lifter.py` | LLIL lifting for every opcode (`InstructionIL`), intrinsics list |
 | `arch.py` | `JVM` Architecture (info/text/IL callbacks), registers, calling conventions `jvm` (method args in `l<n>`) and `jvm_call` (invoke call sites, args in `a<n>`) |
-| `view.py` | `ClassView` (segments/functions per method, catch handlers, pool symbols, static-field data vars, switch comments) |
+| `view.py` | `ClassView` (segments/functions per method, catch handlers, pool symbols, static-field data vars, switch targets, same-class call refs) |
 | `plugin.json` | manifest |
 
 ## Environment (this machine)
@@ -92,7 +92,8 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
  scripts fill the 4 parallel bnrun slots, so run them one after the other (compare_all in the background).
  **Class view gate** (after a `classui.py` / class metadata change): `tests/bn_dump_all.sh cv [jvm_devN]`
  (~4 min), then `python3 tests/class_view_compare.py --max imports=2 headers=0 fields=0 override=0 head=0 throws=0 missing=0`
- (declarations against Vineflower; the 2 imports are types Vineflower names for locals we fold away).
+ (declarations against Vineflower; the 2 imports are types Vineflower names for locals we fold away), and
+ `bnrun --parallel --timeout 300 tests/bn_anon_check.py` (anonymous classes at their `new`, javac 8 + 21; jvm-69).
 3. bnrun has two lanes: serialized (default; UI work and global registration like `bn_dev_load.py`)
    and `--parallel` (scripts on their own views, up to 4 at once, no lock). Always pass **`--timeout N`**; a running script can be stopped
    with `bnrun --cancel` (or Ctrl-C on the client), `bnrun --status` shows what is running.

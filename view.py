@@ -254,16 +254,10 @@ def analyze_tables(view, dispatcher):
         known = sorted({b.dest_addr for b in dispatcher.get_indirect_branches_at(addr)})
         if known == targets:
             continue  # already applied; setting again would retrigger analysis forever
+        # no "Branch Condition: N" comments on the targets (jvm-73): HLIL / Pseudo Java show the case values in
+        # their conditions, and BN printed the comments into Pseudo Java at broken indentation
         dispatcher.set_user_indirect_branches(addr, [(view.arch, t) for t in targets])
-        
-        #Do comments later as they update the binary
-        dispatcher.set_comment_at(value[0], "Default Branch")
-        for p in value[pair_array]:
-            ad = ""
-            if p[1] == value[0]:
-                ad = " [Default Branch]"
-            dispatcher.set_comment_at(p[1], "Branch Condition: "+str(p[0])+ad)
-    
+
 ACC_STATIC = 0x0008
 
 class ClassView(BinaryView):
