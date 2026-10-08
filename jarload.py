@@ -92,28 +92,36 @@ def open_class_tab(path):
 
 def load_whole_jar(path=None):
     """ask for a .jar if path is omitted, unpack it, then open the one class the user picks"""
-    from binaryninja import get_open_filename_input, log_error, log_info
-    if not path:
-        path = get_open_filename_input("Open whole JAR", "*.jar")
-        if not path:
-            return
-    path = os.path.abspath(path)
+    from binaryninja import get_open_filename_input, log_error, log_info, show_message_box
     try:
-        extract_classes(path)
-    except (zipfile.BadZipFile, OSError) as e:
+        if not path:
+            path = get_open_filename_input("Open whole JAR", "*.jar")
+            if not path:
+                return
+        path = os.path.abspath(path)
+        try:
+            extract_classes(path)
+        except (zipfile.BadZipFile, OSError) as e:
+            log_error("Whole JAR: %s" % e)
+            show_message_box("Whole JAR", "Could not read %s\n%s" % (path, e))
+            return
+        dest = jar_dest(path)
+        found = classes_in(dest)
+        if not found:
+            log_error("Whole JAR: no .class entries in %s" % path)
+            show_message_box("Whole JAR", "No .class entries in %s" % path)
+            return
+        chosen = choose_class(found, "Whole JAR (%d classes)" % len(found))
+        if chosen is None:
+            log_info("Whole JAR: unpacked %d classes to %s" % (len(found), dest))
+            return
+        if open_class_tab(chosen):
+            log_info("Whole JAR: opened %s (%d classes unpacked)" % (os.path.basename(chosen), len(found)))
+        else:
+            show_message_box("Whole JAR", "Unpacked to %s but could not open a tab." % dest)
+    except Exception as e:
         log_error("Whole JAR: %s" % e)
-        return
-    dest = jar_dest(path)
-    found = classes_in(dest)
-    if not found:
-        log_error("Whole JAR: no .class entries in %s" % path)
-        return
-    chosen = choose_class(found, "Whole JAR (%d classes)" % len(found))
-    if chosen is None:
-        log_info("Whole JAR: unpacked %d classes to %s" % (len(found), dest))
-        return
-    if open_class_tab(chosen):
-        log_info("Whole JAR: opened %s (%d classes unpacked)" % (os.path.basename(chosen), len(found)))
+        show_message_box("Whole JAR", "Failed:\n%s" % e)
 
 
 def open_class_in_same_tree(bv):
@@ -152,16 +160,17 @@ def register():
         from binaryninjaui import UIContext, UIAction, UIActionHandler, Menu
     except Exception:
         return
-    name = "JVM\\Load whole jar..."
-    UIAction.registerAction(name)
-    UIActionHandler.globalActions().bindAction(name, UIAction(lambda ctx: load_whole_jar()))
-    Menu.mainMenu("File").addAction(name, "Open")
+    # A backslash makes a plugin-menu folder, and PluginCommand.register only runs when a
+    # view is open. The open-dialog button has no view, so the action must be global and flat.
+    action = "Load Whole JAR..."
+    UIAction.registerAction(action)
+    UIActionHandler.globalActions().bindAction(action, UIAction(lambda ctx: load_whole_jar()))
+    Menu.mainMenu("File").addAction(action, "Open")
     UIContext.registerFileOpenMode(
         "Whole JAR...",
         "Unpack a JAR next to itself. Pick a class to open; the decompiler reads the others from that folder when it needs them.",
-        name)
-    PluginCommand.register(name, "Unpack a JAR, then choose which class to open",
-                           lambda bv: load_whole_jar(), lambda bv: True)
+        action)
+    PluginCommand.register_global(action, "Unpack a JAR, then choose which class to open", load_whole_jar)
     pick = "JVM\\Open class from this JAR..."
     PluginCommand.register(pick, "Choose another class in the same unpacked JAR and open it",
                            open_class_in_same_tree,
