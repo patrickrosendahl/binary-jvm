@@ -12,8 +12,9 @@ edges inside methods (jvm-42), a Pseudo Java language representation (jvm-43/44)
 **▶ Handoff (2026-10-08 evening).** Today: review of the jvm-13 JAR work (jvm-69..76), Vineflower's own Java 8 tests as
 a second gate (jvm-77, `tests/vineflower_suite.py`), try-with-resources (jvm-78), nested conditions / condition graphs
 (jvm-80), synchronized + loop-condition shapes (jvm-82, partly), finally inside loops (jvm-85). Suite 7241 -> 6417
-statements (Vineflower 5680). Open, in this order: jvm-87 + jvm-86 (finally bugs found in jvm-85), jvm-84 (multi-catch),
-jvm-82 rest (sync blocks split by exception/loop edges, TestChainedCFG), jvm-79 (lambdas), jvm-81, jvm-83, jvm-88..90
+statements (Vineflower 5680). 2026-10-09: jvm-79 (lambdas), jvm-44 rest (assert, access$, enum/String switches), jvm-87
+(unreachable handlers, not a bug) -> 6139 statements; follow-ups jvm-91..94. Open, in this order: jvm-86, jvm-84 (multi-catch),
+jvm-82 rest (sync blocks split by exception/loop edges, TestChainedCFG), jvm-81, jvm-83, jvm-88..90
 (remaining finally shapes). jvm-15 waits for Patrick's GUI
 click-through (needs a BN restart to load jarload.py). jvm-68 still waits on binary-cpp. Use a dev load for live tests.
 
