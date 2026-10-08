@@ -67,6 +67,7 @@ SPLIT_CONDITIONS = True      # T x; if (a) { x = e; } if (!a || p(x)) -> if (!a 
 TERNARIES = True             # T x; if (c) { x = a; } else { x = b; } -> T x = c ? a : b (jvm-59)
 INCREMENT_VALUES = True      # int t = f; f = t + 1; use(t) -> use(f++); int t = f + 1; f = t; use(t) -> use(++f) (jvm-60)
 RETURN_VALUES = True         # if (c) { return false; } return true; -> return !c; if (a) { return x; } return y; -> return a ? x : y (jvm-67)
+TRY_WITH_RESOURCES = True    # javac's try-with-resources desugaring (r = e; try..catch Throwable close..) -> try (R r = e) { } (jvm-78)
 # intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
 PURE_INTRINSICS = {"getfield", "arraylength", "checkcast", "instanceof", "new", "newarray", "anewarray",
                    "multianewarray", "__exception"}
@@ -1086,6 +1087,8 @@ if _HAVE_BN:
             self.active_syncs = []  # lock variables of the synchronized blocks being printed (jvm-47)
             self.array_lits = {}    # array variable -> (new instr, element values, other uses) (jvm-49)
             self.hidden_vars = set()  # lock variables whose definition moved into a synchronized header
+            self.twr_labels = set()  # labels of folded try-with-resources tails (jvm-78)
+            self.twr_open = []       # resources whose try-with-resources body is being printed
             self._def_counts = None
             self.deferred = set()           # expr_index of handler code met in a try body, printed by its catch
             self.printed_handlers = set()   # handler pcs whose catch/finally clause was printed
@@ -1925,6 +1928,18 @@ if _HAVE_BN:
                 self.active_syncs = []
                 self.array_lits = {}
                 self.hidden_vars = set()
+                self.twr_labels = set()
+                self.twr_open = []
+                if TRY_WITH_RESOURCES:
+                    # javac's `try { r.close(); } catch (Throwable x) { e.addSuppressed(x); }` inside a close
+                    # handler is never printed; the root would place it before a nested level plans the fold
+                    for g in self.try_groups:
+                        if len(g[2]) == 1 and g[2][0][1] == "java/lang/Throwable":
+                            try:
+                                if self.twr_close_var(g[2][0][0]) is not None:
+                                    self.twr_hide_suppress(g[2][0][0])
+                            except Exception:
+                                pass
                 self.deferred = set()
                 self.printed_handlers = set()
                 self.count_discount = {}
@@ -1968,6 +1983,11 @@ if _HAVE_BN:
             for r in run_at.values():
                 self.placed.add((r[2][0], r[2][1]))
                 self.placed_handlers.update(h for h, _ in r[2][2])
+            if TRY_WITH_RESOURCES and block.as_ast:
+                try:
+                    self.plan_twr(body, lo, hi, run_at, plan)
+                except Exception:
+                    pass
             if SPLIT_CONDITIONS and block.as_ast:
                 for k in range(lo, hi + 1):
                     try:
@@ -3294,7 +3314,8 @@ if _HAVE_BN:
             lock = self.monitor_var(s, "monitorexit")
             if lock is not None and lock in self.active_syncs:
                 return need_separator  # leaving the synchronized block
-            if s.operation == Op.HLIL_VAR_DECLARE and (s.var in self.hidden_vars or s.var in self.lock_only_vars()):
+            if s.operation == Op.HLIL_VAR_DECLARE and (s.var in self.hidden_vars or s.var in self.lock_only_vars()
+                                                       or s.var in self.twr_resources()):
                 return need_separator
             if idx in plan.get("ret_value", {}):
                 if need_separator:
@@ -3373,6 +3394,10 @@ if _HAVE_BN:
                         tokens.scope_separator()
                     self.emit_if_goto(s, shape, body, plan, tokens, settings, block)
                     return True
+            if self.twr_open and self.twr_hidden_close(body, idx):
+                return need_separator  # the resource's implicit close (jvm-78)
+            if s.operation == Op.HLIL_GOTO and s.target.label_id in self.twr_labels:
+                return need_separator  # into a folded try-with-resources tail: the close is implicit
             if s.operation == Op.HLIL_GOTO and self.label_after(body, idx, plan) == s.target.label_id:
                 # `goto L` right before L (also at the end of a branch whose statement is followed by L)
                 self.hidden_gotos[s.target.label_id] = self.hidden_gotos.get(s.target.label_id, 0) + 1
@@ -3521,14 +3546,364 @@ if _HAVE_BN:
             self.type_tok(tokens, cls)
             self.typed_args(tokens, settings, shape[5], shape[3])
 
+        # --- try-with-resources (jvm-78) ----------------------------------------------------------------
+        @staticmethod
+        def twr_var(e):
+            """the Variable of an HLIL_VAR expression (`dest` of an assign is the expression, not the var)"""
+            return e.var if getattr(e, "operation", None) == Op.HLIL_VAR else e
+
+        def twr_real(self, items):
+            """the statements of a list that are not exception plumbing / labels"""
+            return [x for x in items if not isinstance(x, _ExcBranch) and not self.is_exc_plumbing(x)
+                    and x.operation not in (Op.HLIL_LABEL, Op.HLIL_NOP, Op.HLIL_NORET, Op.HLIL_UNREACHABLE)]
+
+        def twr_only_rethrows(self, items, var):
+            """every statement only rethrows the caught exception var (`exc = var [; goto handler]`)"""
+            seen = False
+            for x in items:
+                if isinstance(x, _ExcBranch) or self.is_exc_plumbing(x) or \
+                        x.operation in (Op.HLIL_LABEL, Op.HLIL_NOP, Op.HLIL_NORET, Op.HLIL_UNREACHABLE):
+                    continue
+                if x.operation in (Op.HLIL_ASSIGN, Op.HLIL_VAR_INIT) and self.is_exc_var(self.twr_var(x.dest)) and \
+                        x.src.operation == Op.HLIL_VAR and x.src.var == var:
+                    seen = True
+                    continue
+                if x.operation in (Op.HLIL_GOTO, Op.HLIL_BREAK):  # to the enclosing handler
+                    continue
+                if self.is_rethrow(x):
+                    seen = True
+                    continue
+                return False
+            return seen
+
+        def twr_is_close(self, s, r):
+            """`r.close()`, a no-argument close of exactly the resource variable"""
+            shape = self.call_shape(self.stmt_call(s))
+            return bool(shape and shape[2] == "close" and not shape[5] and shape[4] is not None and
+                        shape[4].operation == Op.HLIL_VAR and shape[4].var == r)
+
+        def twr_close_var(self, h):
+            """the resource variable whose close machinery handler h's body is: `T e = exc; if (r == null)
+            throw e; r.close(); throw e;` (javac's try-with-resources; without the copy when it rethrows exc
+            itself, without the null check for a `new` resource). None if the body is anything else"""
+            region = self.handler_region(h)
+            if not region:
+                return None
+            items, var, entry = [], None, True
+            for x in self.flatten(region):
+                if entry and x.operation == Op.HLIL_LABEL:
+                    continue
+                if entry and var is None and not isinstance(x, _ExcBranch):
+                    v = self.exc_copy_of(x)
+                    if v is not None:
+                        var = v
+                        continue
+                if not isinstance(x, _ExcBranch) and not self.is_exc_plumbing(x):
+                    entry = False
+                items.append(x)
+            real = self.twr_real(items)
+            var = self.twr_var(var)  # None: the handler rethrows the exception register itself
+            if len(real) < 2:
+                return None
+            if real[0].operation != Op.HLIL_IF:
+                # `r.close(); throw e;`: a `new` resource, javac knows it is not null
+                shape = self.call_shape(self.stmt_call(real[0]))
+                if not (shape and shape[2] == "close" and not shape[5] and shape[4] is not None and
+                        shape[4].operation == Op.HLIL_VAR) or not self.twr_only_rethrows(real[1:], var):
+                    return None
+                return shape[4].var
+            if len(real) < 3:
+                return None
+            c = real[0].condition
+            if not (c.operation == Op.HLIL_CMP_E and c.right.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR)
+                    and c.right.constant == 0 and c.left.operation == Op.HLIL_VAR):
+                return None
+            r = c.left.var
+            if not self.twr_only_rethrows(self.flatten(self.stmts_of(real[0].true)), var):
+                return None
+            if not self.twr_is_close(real[1], r) or not self.twr_only_rethrows(real[2:], var):
+                return None
+            return r
+
+        def twr_resources(self):
+            """variables closed by a try-with-resources handler anywhere in the method: their declaration
+            moves into the `try (...)` header (a declaration further up is printed before the fold is planned)"""
+            if getattr(self, "_twr_resources", None) is None:
+                out = set()
+                if TRY_WITH_RESOURCES:
+                    for g in self.try_groups:
+                        if len(g[2]) == 1 and g[2][0][1] == "java/lang/Throwable":
+                            try:
+                                r = self.twr_close_var(g[2][0][0])
+                            except Exception:
+                                r = None
+                            if r is not None:
+                                out.add(r)
+                self._twr_resources = out
+            return self._twr_resources
+
+        def twr_hide_suppress(self, h):
+            """the close handler h is not printed: neither are the try regions inside it (javac's
+            `try { r.close(); } catch (Throwable x) { e.addSuppressed(x); }`)"""
+            region = self.handler_region(h)
+            if not region:
+                return
+            pcs = [x.address - self.function.start for x in self.flatten(region) if not isinstance(x, _ExcBranch)]
+            if not pcs:
+                return
+            lo_pc, hi_pc = min(pcs + [h]), max(pcs)
+            for g in self.try_groups:
+                if lo_pc <= g[0] <= hi_pc and (g[0], g[1]) != (lo_pc, hi_pc) and \
+                        all(t == "java/lang/Throwable" for _, t in g[2]):
+                    self.placed.add((g[0], g[1]))
+                    for hh, _ in g[2]:
+                        self.printed_handlers.add(hh)
+                        self.placed_handlers.add(hh)
+                        inner = self.handler_region(hh)
+                        if inner:
+                            self.consume(inner, self.flatten(inner))
+
+        def twr_hidden_close(self, body, idx):
+            """body[idx] is javac's close of a resource whose try-with-resources is open here, right before
+            the body leaves (`if (r != null) r.close();`, `r.close();`, or `if (r == null) <exit>;` ahead of
+            `r.close(); <exit>`): the header's implicit close, not printed"""
+            if not self.twr_open:
+                return False
+            s = body[idx]
+            if isinstance(s, _ExcBranch):
+                return False
+
+            def next_real(k):
+                k += 1
+                while k < len(body) and (isinstance(body[k], _ExcBranch) or self.is_exc_plumbing(body[k]) or
+                                         body[k].operation in (Op.HLIL_LABEL, Op.HLIL_NOP) or
+                                         self.twr_hidden_close(body, k)):
+                    k += 1
+                return body[k] if k < len(body) else None
+
+            def leaves(x):
+                # an explicit exit: javac closes before every return / break / continue in the body; the
+                # normal end of the body closes after the try (twr_tail)
+                return x is not None and x.operation in (Op.HLIL_RET, Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_GOTO)
+
+            if self.twr_guard_close(s) is not None:
+                return leaves(next_real(idx))
+            if s.operation == Op.HLIL_IF and (s.false is None or s.false.operation == Op.HLIL_NOP):
+                c = s.condition
+                inner = self.twr_real(self.flatten(self.stmts_of(s.true)))
+                if c.operation == Op.HLIL_CMP_E and c.left.operation == Op.HLIL_VAR and c.left.var in self.twr_open \
+                        and c.right.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR) and c.right.constant == 0 \
+                        and len(inner) == 1 and leaves(inner[0]):
+                    k = idx + 1
+                    while k < len(body) and (isinstance(body[k], _ExcBranch) or self.is_exc_plumbing(body[k]) or
+                                             body[k].operation in (Op.HLIL_LABEL, Op.HLIL_NOP)):
+                        k += 1
+                    return k < len(body) and self.twr_is_close(body[k], c.left.var)
+            return False
+
+        def twr_guard_close(self, s):
+            """the resource of `if (r != null) r.close();` / `r.close();` for an open resource, else None"""
+            if isinstance(s, _ExcBranch):
+                return None
+            for r in self.twr_open:
+                if self.twr_is_close(s, r):
+                    return r
+            if s.operation == Op.HLIL_IF and (s.false is None or s.false.operation == Op.HLIL_NOP):
+                c = s.condition
+                inner = self.twr_real(self.flatten(self.stmts_of(s.true)))
+                if c.operation == Op.HLIL_CMP_NE and c.left.operation == Op.HLIL_VAR and c.left.var in self.twr_open \
+                        and c.right.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR) and c.right.constant == 0 \
+                        and len(inner) == 1 and self.twr_is_close(inner[0], c.left.var):
+                    return c.left.var
+            return None
+
+        def twr_tail(self, body, j, hi, r):
+            """the guarded normal-path close after the try -- `if (r != null) r.close();`, or
+            `if (r == null) <exit>; r.close(); [<exit>]` -- as the indices it covers, else None"""
+            def skip_plumbing(k):
+                while k <= hi and (isinstance(body[k], _ExcBranch) or self.is_exc_plumbing(body[k]) or
+                                   body[k].operation in (Op.HLIL_LABEL, Op.HLIL_NOP)):
+                    k += 1
+                return k
+            j0 = j
+            j = skip_plumbing(j)
+            if j > hi or body[j].operation != Op.HLIL_IF:
+                return None
+            c = body[j].condition
+            eq = c.operation == Op.HLIL_CMP_E
+            if not (eq or c.operation == Op.HLIL_CMP_NE) or not (
+                    c.right.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR) and c.right.constant == 0 and
+                    c.left.operation == Op.HLIL_VAR and c.left.var == r):
+                return None
+            inner = self.twr_real(self.flatten(self.stmts_of(body[j].true)))
+            if eq:  # if (r == null) <exit>; r.close(); [<exit>]
+                if len(inner) != 1 or inner[0].operation != Op.HLIL_RET:
+                    return None
+                k = skip_plumbing(j + 1)
+                if k > hi or not self.twr_is_close(body[k], r):
+                    return None
+                end = k
+                k2 = skip_plumbing(k + 1)
+                if k2 <= hi and body[k2].operation == Op.HLIL_RET and len(body[k2].src) == len(inner[0].src):
+                    end = k2  # the close's fall-through exit mirrors the guarded one
+                return list(range(j0, end + 1))
+            if len(inner) == 1 and self.twr_is_close(inner[0], r):
+                return list(range(j0, j + 1))
+            return None
+
+        def twr_bare_tail(self, body, j, hi, r):
+            """`r.close();` right after the try of a `new` resource (no null check), with the exception branch
+            that follows it, as the indices it covers, else None"""
+            k = j
+            while k <= hi and (isinstance(body[k], _ExcBranch) or self.is_exc_plumbing(body[k]) or
+                               body[k].operation in (Op.HLIL_LABEL, Op.HLIL_NOP)):
+                k += 1
+            if k > hi or not self.twr_is_close(body[k], r):
+                return None
+            end = k
+            while end + 1 <= hi and (isinstance(body[end + 1], _ExcBranch) or self.is_exc_plumbing(body[end + 1])):
+                end += 1
+            return list(range(j, end + 1))
+
+        def _mark_twr(self, body, lo, hi, first, last, group, plan):
+            """mark one try run as try-with-resources when its shape matches; True when marked"""
+            if len(group[2]) != 1 or group[2][0][1] != "java/lang/Throwable":
+                return False
+            r = self.twr_close_var(group[2][0][0])
+            if r is None:
+                return False
+            k = first - 1  # the resource assignment is the last real statement before the try
+            while k >= lo and (isinstance(body[k], _ExcBranch) or self.is_exc_plumbing(body[k]) or
+                               body[k].operation in (Op.HLIL_LABEL, Op.HLIL_NOP)):
+                k -= 1
+            if k < lo:
+                return False
+            if k in plan["new_at"] and plan["new_at"][k][1] == r:
+                init = ('new', plan["new_at"][k])  # `r = new C(..)`: the constructor call is the statement
+            elif body[k].operation in (Op.HLIL_VAR_INIT, Op.HLIL_ASSIGN) and self.twr_var(body[k].dest) == r:
+                init = ('value', body[k])
+            else:
+                return False
+            # the normal-path close follows the try, or (every path leaving early) sits before each exit
+            # inside it, where emit_statement hides it (twr_hidden_close)
+            tail = self.twr_tail(body, last + 1, hi, r) or self.twr_bare_tail(body, last + 1, hi, r) or []
+            # `return v;` right after the close was inside the body (javac closes before it)
+            ret = None
+            if tail:
+                j = tail[-1] + 1
+                while j <= hi and (isinstance(body[j], _ExcBranch) or self.is_exc_plumbing(body[j]) or
+                                   body[j].operation in (Op.HLIL_LABEL, Op.HLIL_NOP)):
+                    j += 1
+                if j <= hi and body[j].operation == Op.HLIL_RET and self.refs(body[j], r):
+                    ret = j
+            # the group travels with the mark: two try regions can share a start pc (jvm-78)
+            plan.setdefault("twr", {})[(first, group[0], group[1])] = {"var": r, "init": init, "ret": ret}
+            done = plan.setdefault("done", set())
+            done.add(k)
+            done.update(tail)
+            if ret is not None:
+                done.add(ret)
+            region = self.handler_region(group[2][0][0])
+            if region:  # the close handler's own code is the header's implicit close
+                self.consume(region, self.flatten(region))
+            plan["skip"].add(k)
+            self.printed_handlers.add(group[2][0][0])
+            # a jump into the folded tail (a catch body continuing the normal path) just falls through;
+            # the resource's own declare is gone with the assignment (it moves into the header)
+            if tail:
+                self.twr_labels.update(x.target.label_id for x in body[tail[0]:tail[-1] + 1]
+                                       if x.operation == Op.HLIL_LABEL)
+            self.hidden_vars.add(r)
+            self.twr_hide_suppress(group[2][0][0])
+            return True
+
+        def _twr_runs_of(self, body, lo, hi, active):
+            """the try runs that fit body[lo..hi] (like emit_range computes them), given the open ranges"""
+            pcs = []
+            for x in body[lo:hi + 1]:
+                if isinstance(x, _ExcBranch) or x.operation == Op.HLIL_LABEL or self.is_exc_plumbing(x) or \
+                        x.expr_index in self.consumed:
+                    pcs.append(None)
+                else:
+                    pcs.append([x.address - self.function.start])
+            return [(r[0] + lo, r[1] + lo, r[2]) for r in try_runs(pcs, self.try_groups, active)]
+
+        def plan_twr(self, body, lo, hi, run_at, plan):
+            """fold try-with-resources (jvm-78): `r = e; try { b } catch (Throwable t) { if (r == null)
+            throw t; r.close(); throw t; } if (r == null) <exit>; r.close();` prints as `try (R r = e)
+            { b }`. Marks the assignment and the guarded close done; the Throwable handler is not printed
+            (the close is implicit). Nested runs are marked too, before any `try` prints a hoisted
+            declaration for a resource that will move into its header."""
+            active = {(g[0], g[1]) for g in self.active_tries} | self.placed
+            work = [(first, last, group, active) for first, last, group in run_at.values()]
+            seen = set()
+            while work:
+                first, last, group, open_ = work.pop()
+                if (first, group[0], group[1]) in seen:
+                    continue
+                seen.add((first, group[0], group[1]))
+                self._mark_twr(body, lo, hi, first, last, group, plan)
+                # descend also into a folded run: a resource declared in it would otherwise be
+                # hoisted above its `try` before the fold is marked there. Every range opened on the
+                # way down stays open (two regions can share a start)
+                inner = open_ | {(group[0], group[1])}
+                work.extend((a, z, g, inner) for a, z, g in self._twr_runs_of(body, first, last, inner))
+
+        def emit_twr(self, body, first, last, group, plan, twr, tokens, settings, block):
+            """`try (R r = e) { ... }`: the resource assignment moves into the header, the Throwable close
+            handler and the guarded close after the try disappear"""
+            self.active_tries.append(group)
+            for k in range(first, last + 1):  # a variable used after the try is declared before it
+                s = body[k]
+                if s.operation == Op.HLIL_VAR_INIT and k not in plan["skip"] and \
+                        self.twr_var(s.dest) not in self.hoisted and not self.is_exc_var(s.dest) and \
+                        self.twr_var(s.dest) not in self.hidden_vars:
+                    inside = sum(self.refs(body[j], self.twr_var(s.dest)) for j in range(first, last + 1))
+                    if self.var_count(self.twr_var(s.dest)) > inside:
+                        self.hoisted.add(self.twr_var(s.dest))
+                        self.emit_var_decl(self.twr_var(s.dest), s, tokens, s.src)
+                        tokens.append_semicolon()
+                        tokens.new_line()
+            try:
+                self.kw(tokens, "try")
+                self.txt(tokens, " (")
+                kind, init = twr["init"]
+                if kind == 'new':
+                    self.hoisted.discard(twr["var"])
+                    self.emit_new(init, tokens, settings)
+                else:
+                    self.emit_var_decl(twr["var"], init, tokens, init.src)
+                    self.op(tokens, " = ")
+                    self.expr(init.src, tokens, settings)
+                self.txt(tokens, ")")
+                tokens.begin_scope(ScopeType.BlockScopeType)
+                self.twr_open.append(twr["var"])
+                try:
+                    self.emit_range(body, first, last, plan, tokens, settings, block)
+                    if twr["ret"] is not None:
+                        tokens.scope_separator()
+                        self.emit_statement(body, twr["ret"], {"skip": set(), "new_at": {}}, tokens, settings,
+                                            block, None)
+                finally:
+                    self.twr_open.pop()
+                    tokens.end_scope(ScopeType.BlockScopeType)
+            finally:
+                self.active_tries.pop()
+            tokens.finalize_scope()
+            tokens.new_line()
+
         def emit_try(self, body, first, last, group, plan, tokens, settings, block):
             start, end, handlers = group
+            twr = plan.get("twr", {}).get((first, start, end))
+            if twr is not None:
+                self.emit_twr(body, first, last, group, plan, twr, tokens, settings, block)
+                return
             self.active_tries.append(group)
             # variables declared in the try block but used after it are declared before it
             for k in range(first, last + 1):
                 s = body[k]
                 if s.operation == Op.HLIL_VAR_INIT and k not in plan["skip"] and s.dest not in self.hoisted \
-                        and not self.is_exc_var(s.dest):
+                        and not self.is_exc_var(s.dest) and s.dest not in self.hidden_vars:
                     inside = sum(self.refs(body[j], s.dest) for j in range(first, last + 1))
                     if self.var_count(s.dest) > inside:
                         self.hoisted.add(s.dest)
@@ -3537,7 +3912,8 @@ if _HAVE_BN:
                         tokens.new_line()
             for k, entry in plan["new_at"].items():
                 s0, var = entry[0], entry[1]
-                if first <= k <= last and s0.operation == Op.HLIL_VAR_INIT and var not in self.hoisted:
+                if first <= k <= last and s0.operation == Op.HLIL_VAR_INIT and var not in self.hoisted and \
+                        var not in self.hidden_vars:
                     inside = sum(self.refs(body[j], var) for j in range(first, last + 1))
                     if self.var_count(var) > inside:
                         self.hoisted.add(var)
