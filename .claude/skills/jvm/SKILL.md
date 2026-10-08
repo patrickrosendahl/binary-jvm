@@ -42,6 +42,10 @@ Universal view active — switch to "JVM Class" (GUI: view dropdown; MCP: `bn_bi
    tests/bn_batch_check.py` (20 classes), `--parallel tests/bn_golden.py` or a one-class dump. These
    only use their own views: **no usage lock** (it would only block other sessions). The lock is
    needed only for UI tabs (`bv`/`bvs`/`--view`/`--main-thread`).
+   Gates (CLAUDE.md has the `--max` lines): `tests/bn_dump_all.sh pj|cv [jvm_devN]` (dumps in 4 parallel
+   batches, a few minutes), then `vineflower_compare.py` / `class_view_compare.py`; and
+   `tests/bn_pseudo_java_compare_all.sh` (~15 min, background). Run all of them before resolving a ticket
+   that touches `view.py`, `classfile.py`, `classui.py` or `pseudo_java.py`, not only the ones for the file you changed.
 3. Real install (**installed**): symlink the
    repo as `plugins/binary-jvm` and set the Universal exclusion; after changing
    the plugin, restart BN with `/Users/patrick/dev/bn-script-bridge/bnrestart` (saves modified
