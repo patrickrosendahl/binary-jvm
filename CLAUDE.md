@@ -67,9 +67,10 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
   `bn_open_item_open` (Raw / a GUI dialog instead) — create it explicitly with
   `BinaryViewType[name].create(BinaryView.open(path))`. Such views are not UI tabs.
 - **File > Load Whole JAR...** unpacks `foo.jar` to `foo/` beside it and asks which classes to open
-  (jvm-13; filter + multi-select, inner classes hidden by default, jvm-76). The decompiler reads the other classes from that folder when it needs them; **JVM > Open
-  class from this JAR...** opens one as a tab. Opening one `.class` directly is unchanged. Nested JARs
-  are jvm-15.
+  (jvm-13; filter + multi-select, inner classes hidden by default, jvm-76). `Main-Class` from the manifest
+  is preselected. Nested `.jar` entries can be unpacked the same way (`lib/bar.jar` → `foo/lib/bar/`, jvm-15);
+  other non-class entries are skipped and logged. The decompiler reads the other classes from that folder when it needs them; **JVM > Open
+  class from this JAR...** opens one as a tab. Opening one `.class` directly is unchanged.
 
 ## Testing workflow (fast → slow)
 

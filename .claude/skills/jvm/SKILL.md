@@ -23,8 +23,9 @@ Generic Binary Ninja mechanics (MCP tools, `bnrun` bridge, usage lock) are in th
   favourite target **`mdg.jar`**, unpacked to `lib/mdg/` (see "Loading classes from a JAR").
 
 ## Loading classes from a JAR
-BN can't open a `.jar` directly yet (jvm-13), so **unpack it first, next to the JAR, into a
-directory named like the JAR without `.jar`**: `foo.jar` → `foo/`.
+**File > Load Whole JAR...** unpacks `foo.jar` to `foo/` beside it, preselects `Main-Class`, and can
+unpack nested JARs (`lib/bar.jar` → `foo/lib/bar/`). Opening one `.class` is unchanged. The same layout
+by hand: `foo.jar` → `foo/`.
 ```bash
 cd <dir with the jar> && unzip -o -q mdg.jar -d mdg      # -> mdg/com/is_teledata/…/X.class
 ```

@@ -110,7 +110,10 @@ A `.class` is still one view. **File > Load whole jar...** (also an open-dialog 
 unpacks `foo.jar` to `foo/` next to it and asks which class to open. The decompiler reads other
 classes from that folder when it needs them (inner classes, supertypes, varargs); **JVM > Open class
 from this JAR...** opens one of those as a tab. One combined view for every class is not the model:
-method addresses are per view. Nested JARs and the manifest are jvm-15.
+method addresses are per view. **Load whole jar** reads `META-INF/MANIFEST.MF` and preselects
+`Main-Class`. Nested `.jar` entries are listed and can be unpacked the same way (`foo.jar` entry
+`lib/bar.jar` → `foo/lib/bar/`); other non-class entries are skipped and logged (jvm-15). Opening one
+`.class` directly is unchanged.
 
 ### 4. Patching — **NOT a goal** ✅ (removed)
 Per project decision, interactive patching is out of scope; the ported
