@@ -67,6 +67,7 @@ SPLIT_CONDITIONS = True      # T x; if (a) { x = e; } if (!a || p(x)) -> if (!a 
 TERNARIES = True             # T x; if (c) { x = a; } else { x = b; } -> T x = c ? a : b (jvm-59)
 INCREMENT_VALUES = True      # int t = f; f = t + 1; use(t) -> use(f++); int t = f + 1; f = t; use(t) -> use(++f) (jvm-60)
 RETURN_VALUES = True         # if (c) { return false; } return true; -> return !c; if (a) { return x; } return y; -> return a ? x : y (jvm-67)
+CONDITION_GRAPHS = True      # an if/goto tree over shared outcomes -> if ((c ? a : b) && d) A else B (jvm-80)
 TRY_WITH_RESOURCES = True    # javac's try-with-resources desugaring (r = e; try..catch Throwable close..) -> try (R r = e) { } (jvm-78)
 # intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
 PURE_INTRINSICS = {"getfield", "arraylength", "checkcast", "instanceof", "new", "newarray", "anewarray",
@@ -493,6 +494,100 @@ def concat_recipe_parts(recipe, args, constants=()):
     if lit:
         parts.append(('lit', "".join(lit)))
     return parts
+
+
+# ---------------------------------------------------------------------------------------------------
+# condition graphs (jvm-80): language-neutral, so they can move to shared/ (jvm-68). A graph is
+# {id: ('dec', cond, t, f) | ('leaf', key, items)}; a condition is an HLIL condition or ('not' | 'and' |
+# 'or' | 'tern', ...). Conditions are told apart by str() (the same text is the same condition: every
+# decision runs before any statement, so it sees the same state).
+# ---------------------------------------------------------------------------------------------------
+def cg_reduce(nodes, root):
+    """collapse decisions into &&, || and ?: (in place); the reduced root"""
+    def preds():
+        count = {}
+        seen, todo = set(), [root]
+        while todo:
+            n = todo.pop()
+            if n in seen:
+                continue
+            seen.add(n)
+            if nodes[n][0] == 'dec':
+                for c in nodes[n][2:4]:
+                    count[c] = count.get(c, 0) + 1
+                    todo.append(c)
+        return count, seen
+    changed = True
+    while changed:
+        changed = False
+        count, live = preds()
+        for n in sorted(live):
+            e = nodes[n]
+            if e[0] != 'dec':
+                continue
+            _, c, t, f = e
+            te, fe = nodes[t], nodes[f]
+            if te[0] == 'dec' and count.get(t) == 1:
+                if te[3] == f:
+                    nodes[n] = ('dec', ('and', c, te[1]), te[2], f)
+                elif te[2] == f:
+                    nodes[n] = ('dec', ('and', c, ('not', te[1])), te[3], f)
+                if nodes[n] is not e:
+                    changed = True
+                    break
+            if fe[0] == 'dec' and count.get(f) == 1:
+                if fe[2] == t:
+                    nodes[n] = ('dec', ('or', c, fe[1]), t, fe[3])
+                elif fe[3] == t:
+                    nodes[n] = ('dec', ('or', c, ('not', fe[1])), t, fe[2])
+                if nodes[n] is not e:
+                    changed = True
+                    break
+            if te[0] == 'dec' and fe[0] == 'dec' and count.get(t) == 1 and count.get(f) == 1:
+                if (te[2], te[3]) == (fe[2], fe[3]):
+                    nodes[n] = ('dec', ('tern', c, te[1], fe[1]), te[2], te[3])
+                elif (te[2], te[3]) == (fe[3], fe[2]):
+                    nodes[n] = ('dec', ('tern', c, te[1], ('not', fe[1])), te[2], te[3])
+                if nodes[n] is not e:
+                    changed = True
+                    break
+    return nodes[root]
+
+
+def cg_verify(nodes, root, top):
+    """the reduced condition picks the same outcome as the decision graph for every truth assignment
+    of its basic conditions (all of them up to 10 conditions, else 512 random ones)"""
+    import itertools, random
+    conds = {}
+    for e in nodes.values():
+        if e[0] == 'dec':
+            conds.setdefault(str(e[1]), len(conds))
+
+    def walk(assign):
+        n = root
+        while nodes[n][0] == 'dec':
+            n = nodes[n][2] if assign[conds[str(nodes[n][1])]] else nodes[n][3]
+        return n
+
+    def value(e, assign):
+        if isinstance(e, tuple):
+            if e[0] == 'not':
+                return not value(e[1], assign)
+            if e[0] == 'and':
+                return value(e[1], assign) and value(e[2], assign)
+            if e[0] == 'or':
+                return value(e[1], assign) or value(e[2], assign)
+            return value(e[2], assign) if value(e[1], assign) else value(e[3], assign)
+        return assign[conds[str(e)]]
+
+    n = len(conds)
+    rng = random.Random(80)
+    cases = itertools.product((False, True), repeat=n) if n <= 10 else \
+        ([rng.random() < 0.5 for _ in range(n)] for _ in range(512))
+    for assign in cases:
+        if walk(assign) != (top[2] if value(top[1], assign) else top[3]):
+            return False
+    return True
 
 
 def group_try_entries(table):
@@ -1988,6 +2083,12 @@ if _HAVE_BN:
                     self.plan_twr(body, lo, hi, run_at, plan)
                 except Exception:
                     pass
+            if CONDITION_GRAPHS and block.as_ast:
+                for k in range(lo, hi + 1):
+                    try:
+                        self.plan_cgraph(body, k, hi, run_at, sync_at, plan)
+                    except Exception:
+                        pass
             if SPLIT_CONDITIONS and block.as_ast:
                 for k in range(lo, hi + 1):
                     try:
@@ -3317,6 +3418,11 @@ if _HAVE_BN:
             if s.operation == Op.HLIL_VAR_DECLARE and (s.var in self.hidden_vars or s.var in self.lock_only_vars()
                                                        or s.var in self.twr_resources()):
                 return need_separator
+            if idx in plan.get("cgraph", {}):
+                if need_separator is not None:
+                    tokens.scope_separator()
+                self.emit_cgraph(plan["cgraph"][idx], tokens, settings, block)
+                return True
             if idx in plan.get("ret_value", {}):
                 if need_separator:
                     tokens.scope_separator()
@@ -3545,6 +3651,340 @@ if _HAVE_BN:
             self.kw(tokens, "new ")
             self.type_tok(tokens, cls)
             self.typed_args(tokens, settings, shape[5], shape[3])
+
+        # --- condition graphs (jvm-80) ------------------------------------------------------------------
+        # javac compiles `if ((c ? a : b) && d) A else B` (and boolean values built from && / || / ?:) into
+        # branches; HLIL shows an if-tree with gotos into shared subtrees and duplicated outcome code. The
+        # region is read as a graph of decisions over outcome leaves (leaves with the same statement text are
+        # the same outcome: every decision runs before any statement), then reduced like Vineflower's
+        # condition graphs: a decision whose branch is a single-entry decision sharing an exit becomes
+        # `&&` / `||`, two single-entry decisions over the same exits become `?:`. When one decision over two
+        # outcomes is left, the region prints as `if (E) A else B` (`x = E;` / `return E;` for booleans).
+        CG_MAX = 64
+
+        class _CgAbort(Exception):
+            pass
+
+        def cg_region(self, body, k, hi):
+            """the last index of the region starting at body[k]: every label a goto in it targets is inside"""
+            end, changed = k, True
+            while changed:
+                changed = False
+                targets = set()
+                for x in body[k:end + 1]:
+                    if isinstance(x, _ExcBranch):
+                        return None
+                    for i in _walk(x):
+                        if i.operation == Op.HLIL_GOTO:
+                            targets.add(i.target.label_id)
+                inside = {i.target.label_id for x in body[k:end + 1] for i in _walk(x) if i.operation == Op.HLIL_LABEL}
+                for j in range(end + 1, hi + 1):
+                    x = body[j]
+                    if isinstance(x, _ExcBranch):
+                        break
+                    if any(i.operation == Op.HLIL_LABEL and i.target.label_id in targets - inside for i in _walk(x)):
+                        end, changed = j, True
+            return end
+
+        def cg_build(self, body, k, end, at_end=False):
+            """(nodes, root): nodes[id] = ('dec', cond, t, f) | ('leaf', key, items); None if the region is
+            not a pure decision tree (loops, exception code, gotos leaving it, ...)"""
+            labels = {}
+
+            def index(items, cont):
+                for i, x in enumerate(items):
+                    if isinstance(x, _ExcBranch) or self.is_exc_plumbing(x) or x.expr_index in self.consumed:
+                        raise self._CgAbort()
+                    if x.operation == Op.HLIL_LABEL:
+                        labels[x.target.label_id] = (tuple(items[i + 1:]), cont)
+                    elif x.operation == Op.HLIL_IF and x.as_ast:
+                        rest = (tuple(items[i + 1:]), cont)
+                        index(self.flatten(self.stmts_of(x.true)), rest)
+                        if x.false is not None:
+                            index(self.flatten(self.stmts_of(x.false)), rest)
+                    elif any(i.operation == Op.HLIL_LABEL for i in _walk(x)):
+                        raise self._CgAbort()  # a label inside a loop / switch
+            index(tuple(body[k:end + 1]), None)
+            nodes, by_key, active = {}, {}, set()
+
+            def node(entry):
+                key = (entry[0], entry[1] if entry[0] == 'leaf' else self.cg_text(entry[1]), entry[2:4]
+                       if entry[0] == 'dec' else ())
+                if key not in by_key:
+                    if len(nodes) >= self.CG_MAX:
+                        raise self._CgAbort()
+                    by_key[key] = len(nodes)
+                    nodes[len(nodes)] = entry
+                return by_key[key]
+
+            def leaf_items(seq):
+                out = []
+                while seq is not None:
+                    items, seq = seq
+                    for x in items:
+                        if x.operation in (Op.HLIL_LABEL, Op.HLIL_NOP):
+                            continue
+                        for i in _walk(x):
+                            if i.operation == Op.HLIL_GOTO and i.target.label_id in labels:
+                                raise self._CgAbort()  # a jump back into the region from an outcome
+                        out.append(x)
+                        if x.operation in (Op.HLIL_RET, Op.HLIL_GOTO, Op.HLIL_BREAK, Op.HLIL_CONTINUE,
+                                           Op.HLIL_NORET, Op.HLIL_UNREACHABLE):
+                            seq = None  # nothing after a jump belongs to this outcome
+                            break
+                if at_end and out and out[-1].operation == Op.HLIL_RET and not out[-1].src:
+                    out.pop()  # `return;` as the method's last statement: the same as falling off the end
+                return out
+
+            def build(seq):
+                while seq is not None:
+                    items, cont = seq
+                    j = 0
+                    while j < len(items) and items[j].operation in (Op.HLIL_LABEL, Op.HLIL_NOP):
+                        j += 1
+                    if j < len(items):
+                        break
+                    seq = cont
+                if seq is None:
+                    return node(('leaf', (), []))
+                items, cont = seq
+                x = items[j]
+                rest = (items[j + 1:], cont)
+                if x.operation == Op.HLIL_GOTO and x.target.label_id in labels:
+                    lid = x.target.label_id
+                    if lid in active:
+                        raise self._CgAbort()  # a loop
+                    active.add(lid)
+                    try:
+                        return build(labels[lid])
+                    finally:
+                        active.discard(lid)
+                if x.operation == Op.HLIL_IF and x.as_ast and not self.side_effect(x.condition) and \
+                        not self.mentions_exc(x.condition):
+                    t = build((tuple(self.flatten(self.stmts_of(x.true))), rest))
+                    f = build((tuple(self.flatten(self.stmts_of(x.false))) if x.false is not None and
+                               x.false.operation != Op.HLIL_NOP else (), rest))
+                    if t == f:
+                        return t
+                    return node(('dec', x.condition, t, f))
+                out = leaf_items((items[j:], cont))
+                return node(('leaf', tuple(self.cg_text(y) for y in out), out))
+
+            try:
+                root = build((tuple(body[k:end + 1]), None))
+            except (self._CgAbort, RecursionError):
+                return None
+            return nodes, root
+
+        @staticmethod
+        def cg_text(x):
+            return str(x) if not isinstance(x, tuple) else repr(x)
+
+        def cg_reduce(self, nodes, root):
+            return cg_reduce(nodes, root)
+
+        def plan_cgraph(self, body, k, hi, run_at, sync_at, plan):
+            """jvm-80: plan["cgraph"][k] = (condition, outcome A, outcome B, kind) for the region body[k..end]"""
+            s = body[k]
+            if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_IF or not s.as_ast or \
+                    s.expr_index in self.consumed or k in plan.get("done", ()) or self.exc_if_parts(s) is not None:
+                return False
+            end = self.cg_region(body, k, hi)
+            if end is None:
+                return False
+            # the decisions a label leads to may follow the region: if the minimal region does not reduce,
+            # try it extended over the ifs and labels right after it (its outcomes then include them)
+            ext = end
+            while ext + 1 <= hi and not isinstance(body[ext + 1], _ExcBranch) and \
+                    body[ext + 1].operation in (Op.HLIL_IF, Op.HLIL_LABEL) and body[ext + 1].as_ast:
+                ext = max(ext + 1, self.cg_region(body, ext + 1, hi) or ext + 1)
+            for end in ([end, ext] if ext != end else [end]):
+                found = self.cg_try(body, k, end, hi, run_at, sync_at, plan)
+                if found is not None:
+                    top, nodes, end = found
+                    break
+            else:
+                return False
+            cond, a, b = top[1], nodes[top[2]][2], nodes[top[3]][2]
+            # labels inside the region may only be reached from inside it
+            gotos = {i.expr_index for x in body[k:end + 1] for i in _walk(x) if i.operation == Op.HLIL_GOTO}
+            for x in body[k:end + 1]:
+                for i in _walk(x):
+                    if i.operation == Op.HLIL_LABEL:
+                        try:
+                            uses = self.hlil.get_label_uses(i.target.label_id)
+                        except Exception:
+                            return False
+                        if any(u.expr_index not in gotos for u in uses):
+                            return False
+            kind = 'if'
+            va, vb = self.cg_bool_set(a), self.cg_bool_set(b)
+            if va and vb and va[0] == vb[0] and va[1] != vb[1]:
+                kind = ('assign', va[0], va[2])  # x = E
+                if not va[1]:
+                    cond = ('not', cond)
+            if kind == 'if':
+                sa, sb = self.cg_set(a), self.cg_set(b)
+                if sa and sb and sa[0] == sb[0]:
+                    kind = ('choose', sa[0], sa[2], sa[1], sb[1])
+            ra, rb = self.cg_bool_ret(a), self.cg_bool_ret(b)
+            if ra is not None and rb is not None and ra != rb:
+                kind = 'return'
+                if not ra:
+                    cond = ('not', cond)
+            plan.setdefault("cgraph", {})[k] = (cond, a, b, kind)
+            plan.setdefault("done", set()).update(range(k + 1, end + 1))
+            return True
+
+        def cg_try(self, body, k, end, hi, run_at, sync_at, plan):
+            """(reduced top, nodes, end) for the region body[k..end], or None"""
+            if any(k <= j <= end for j in list(run_at) + list(sync_at)) or \
+                    any(j in plan.get("done", ()) or j in plan.get("folded", ()) for j in range(k, end + 1)):
+                return None
+            at_end = bool(plan.get("root")) and self.returns_void and all(
+                isinstance(x, _ExcBranch) or self.hidden_item(x) or x.operation in (Op.HLIL_LABEL, Op.HLIL_NOP) or
+                (x.operation == Op.HLIL_RET and not x.src) for x in body[end + 1:])
+            built = self.cg_build(body, k, end, at_end)
+            if built is None:
+                return None
+            nodes, root = built
+            if sum(1 for e in nodes.values() if e[0] == 'dec') < 2:
+                return None  # a single if: nothing to collapse
+            original = dict(nodes)
+            top = self.cg_reduce(nodes, root)
+            if top[0] != 'dec' or nodes[top[2]][0] != 'leaf' or nodes[top[3]][0] != 'leaf':
+                return None
+            if not self.cg_verify(original, root, top):
+                return None
+            return top, nodes, end
+
+        @staticmethod
+        def cg_verify(nodes, root, top):
+            return cg_verify(nodes, root, top)
+
+        def cg_bool_set(self, items):
+            """(var, value, statement) for an outcome that is only `x = true / false` of a boolean"""
+            if len(items) != 1 or items[0].operation not in (Op.HLIL_ASSIGN, Op.HLIL_VAR_INIT):
+                return None
+            x = items[0]
+            var = x.dest if x.operation == Op.HLIL_VAR_INIT else (x.dest.var if x.dest.operation == Op.HLIL_VAR else None)
+            if var is None or x.src.operation not in (Op.HLIL_CONST, Op.HLIL_CONST_PTR) or x.src.constant not in (0, 1):
+                return None
+            code = self.var_code(var) or self.type_code(self.var_java_type(var))
+            if code != 'Z' and java_type_of(var.type) != "boolean":
+                return None
+            return var, bool(x.src.constant), x
+
+        def cg_set(self, items):
+            """(var, value, statement) for an outcome that only sets one local from a value without side effects"""
+            if len(items) != 1 or items[0].operation not in (Op.HLIL_ASSIGN, Op.HLIL_VAR_INIT):
+                return None
+            x = items[0]
+            var = x.dest if x.operation == Op.HLIL_VAR_INIT else (x.dest.var if x.dest.operation == Op.HLIL_VAR else None)
+            if var is None or self.side_effect(x.src) or self.mentions_exc(x.src):
+                return None
+            return var, x.src, x
+
+        def cg_bool_ret(self, items):
+            """True / False for an outcome that is only `return true / false` of a boolean method"""
+            if len(items) != 1 or items[0].operation != Op.HLIL_RET or len(items[0].src) != 1:
+                return None
+            return self.bool_const(items[0].src[0])
+
+        def emit_bexpr(self, e, tokens, settings, precedence, negate=False):
+            """a reduced condition: an HLIL condition, or ('not' | 'and' | 'or' | 'tern', ...)"""
+            if isinstance(e, tuple) and e[0] == 'not':
+                self.emit_bexpr(e[1], tokens, settings, precedence, not negate)
+                return
+            if isinstance(e, tuple) and e[0] in ('and', 'or'):
+                is_and = (e[0] == 'and') != negate  # De Morgan
+                prec = P.LogicalAndOperatorPrecedence if is_and else P.LogicalOrOperatorPrecedence
+                parens = precedence > prec
+                if parens:
+                    tokens.append_open_paren()
+                self.emit_bexpr(e[1], tokens, settings, prec, negate)
+                self.op(tokens, " && " if is_and else " || ")
+                self.emit_bexpr(e[2], tokens, settings, prec + 1, negate)
+                if parens:
+                    tokens.append_close_paren()
+                return
+            if isinstance(e, tuple) and e[0] == 'tern':
+                c, x, y = e[1], e[2], e[3]
+                if self.cg_negative(c):  # !c ? x : y -> c ? y : x
+                    c, x, y = ('not', c), y, x
+                parens = precedence > P.TernaryOperatorPrecedence
+                if parens:
+                    tokens.append_open_paren()
+                self.emit_bexpr(c, tokens, settings, P.LogicalOrOperatorPrecedence)
+                self.op(tokens, " ? ")
+                # a nested ?: in a branch is parenthesised (legal without, but hard to read)
+                self.emit_bexpr(x, tokens, settings, P.TernaryOperatorPrecedence + 1, negate)
+                self.op(tokens, " : ")
+                self.emit_bexpr(y, tokens, settings, P.TernaryOperatorPrecedence + 1, negate)
+                if parens:
+                    tokens.append_close_paren()
+                return
+            if negate:
+                self.emit_negated(e, tokens, settings, precedence)
+            else:
+                self.perform_get_expr_text(e, tokens, settings, precedence)
+
+        def cg_negative(self, e):
+            """a condition that reads better turned round: `!x`, and a not-wrapper of one that is not"""
+            if isinstance(e, tuple):
+                return e[0] == 'not' and not self.cg_negative(e[1])
+            return self.negative_test(e)  # `!x`, `x == null`, `b == 0` of a boolean
+
+        def emit_cgraph(self, entry, tokens, settings, block):
+            cond, a, b, kind = entry
+            if kind == 'return':
+                self.kw(tokens, "return ")
+                self.emit_bexpr(cond, tokens, settings, P.AssignmentOperatorPrecedence)
+                tokens.append_semicolon()
+                tokens.new_line()
+                return
+            if isinstance(kind, tuple) and kind[0] == 'assign':
+                _, var, stmt = kind
+                self.emit_var(var, stmt, tokens)
+                self.op(tokens, " = ")
+                self.emit_bexpr(cond, tokens, settings, P.AssignmentOperatorPrecedence)
+                tokens.append_semicolon()
+                tokens.new_line()
+                return
+            if isinstance(kind, tuple) and kind[0] == 'choose':
+                _, var, stmt, va, vb = kind
+                if self.cg_negative(cond):
+                    cond, va, vb = ('not', cond), vb, va
+                self.emit_var(var, stmt, tokens)
+                self.op(tokens, " = ")
+                self.emit_bexpr(cond, tokens, settings, P.LogicalOrOperatorPrecedence)
+                self.op(tokens, " ? ")
+                self.emit_typed(va, self.var_code(var), tokens, settings, P.LogicalOrOperatorPrecedence)
+                self.op(tokens, " : ")
+                self.emit_typed(vb, self.var_code(var), tokens, settings, P.TernaryOperatorPrecedence)
+                tokens.append_semicolon()
+                tokens.new_line()
+                return
+            a_real = [x for x in a if not self.hidden_item(x)]
+            b_real = [x for x in b if not self.hidden_item(x)]
+            if not a_real or (b_real and self.cg_negative(cond)):
+                a, b, cond = b, a, ('not', cond)
+                a_real, b_real = b_real, a_real
+            self.kw(tokens, "if ")
+            tokens.append_open_paren()
+            self.emit_bexpr(cond, tokens, settings, P.TopLevelOperatorPrecedence)
+            tokens.append_close_paren()
+            tokens.begin_scope(ScopeType.BlockScopeType)
+            self.emit_list(list(a), tokens, settings, block)
+            tokens.end_scope(ScopeType.BlockScopeType)
+            if b_real:
+                tokens.scope_continuation(False)
+                self.kw(tokens, "else")
+                tokens.begin_scope(ScopeType.BlockScopeType)
+                self.emit_list(list(b), tokens, settings, block)
+                tokens.end_scope(ScopeType.BlockScopeType)
+            tokens.finalize_scope()
+            tokens.new_line()
 
         # --- try-with-resources (jvm-78) ----------------------------------------------------------------
         @staticmethod

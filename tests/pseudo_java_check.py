@@ -177,6 +177,39 @@ if os.path.exists(SCHED):
     check("class supertypes", pj.class_supertypes(open(SCHED, "rb").read()), ("java/lang/Thread", []))
 check("class supertypes junk", pj.class_supertypes(b"nope"), None)
 
+# condition graphs (jvm-80): strings stand in for HLIL conditions
+def cg(nodes, root):
+    graph = dict(nodes)
+    top = pj.cg_reduce(nodes, root)
+    return top, pj.cg_verify(graph, root, top)
+
+A, B = ('leaf', 'A', []), ('leaf', 'B', [])
+# if (p) { if (q) A else B } else B  ->  p && q
+top, ok = cg({0: A, 1: B, 2: ('dec', 'q', 0, 1), 3: ('dec', 'p', 2, 1)}, 3)
+check("cg and", (top[1], top[2:], ok), (('and', 'p', 'q'), (0, 1), True))
+# if (p) A else { if (q) A else B }  ->  p || q
+top, ok = cg({0: A, 1: B, 2: ('dec', 'q', 0, 1), 3: ('dec', 'p', 0, 2)}, 3)
+check("cg or", (top[1], top[2:], ok), (('or', 'p', 'q'), (0, 1), True))
+# if (p) { if (q) A else B } else { if (r) A else B }  ->  p ? q : r
+top, ok = cg({0: A, 1: B, 2: ('dec', 'q', 0, 1), 3: ('dec', 'r', 0, 1), 4: ('dec', 'p', 2, 3)}, 4)
+check("cg tern", (top[1], top[2:], ok), (('tern', 'p', 'q', 'r'), (0, 1), True))
+# swapped exits on one side: p ? q : !r
+top, ok = cg({0: A, 1: B, 2: ('dec', 'q', 0, 1), 3: ('dec', 'r', 1, 0), 4: ('dec', 'p', 2, 3)}, 4)
+check("cg tern swap", (top[1], top[2:], ok), (('tern', 'p', 'q', ('not', 'r')), (0, 1), True))
+# test7's shape: ((c ? x : y) ? (u ? v : w) : (s ? t : z)) over two shared outcomes
+top, ok = cg({0: A, 1: B, 2: ('dec', 'v', 0, 1), 3: ('dec', 'w', 0, 1), 4: ('dec', 'u', 2, 3),
+              5: ('dec', 't', 0, 1), 6: ('dec', 'z', 0, 1), 7: ('dec', 's', 5, 6),
+              8: ('dec', 'x', 4, 7), 9: ('dec', 'y', 4, 7), 10: ('dec', 'c', 8, 9)}, 10)
+check("cg nested", (top[1], top[2:], ok),
+      (('tern', ('tern', 'c', 'x', 'y'), ('tern', 'u', 'v', 'w'), ('tern', 's', 't', 'z')), (0, 1), True))
+# three outcomes: stays a graph of decisions
+C = ('leaf', 'C', [])
+top, ok = cg({0: A, 1: B, 2: C, 3: ('dec', 'q', 0, 1), 4: ('dec', 'p', 3, 2)}, 4)
+check("cg three outcomes", top, ("dec", "p", 3, 2))  # not reducible: cg_verify only judges two outcomes
+# the verifier rejects a wrong reduction
+check("cg verify wrong", pj.cg_verify({0: A, 1: B, 2: ('dec', 'q', 0, 1), 3: ('dec', 'p', 2, 1)}, 3,
+                                      ('dec', ('or', 'p', 'q'), 0, 1)), False)
+
 if failures:
     print("\n".join(failures))
     print("%d failure(s)" % len(failures))
