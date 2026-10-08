@@ -67,9 +67,10 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
   `bn_open_item_open` (Raw / a GUI dialog instead) — create it explicitly with
   `BinaryViewType[name].create(BinaryView.open(path))`. Such views are not UI tabs.
 - **File > Load Whole JAR...** unpacks `foo.jar` to `foo/` beside it and asks which classes to open
-  (jvm-13; filter + multi-select, inner classes hidden by default, jvm-76). The decompiler reads the other classes from that folder when it needs them; **JVM > Open
-  class from this JAR...** opens one as a tab. Opening one `.class` directly is unchanged. Nested JARs
-  are jvm-15.
+  (jvm-13; filter + multi-select, inner classes hidden by default, jvm-76). `Main-Class` from the manifest
+  is preselected. Nested `.jar` entries can be unpacked the same way (`lib/bar.jar` → `foo/lib/bar/`, jvm-15);
+  other non-class entries are skipped and logged. The decompiler reads the other classes from that folder when it needs them; **JVM > Open
+  class from this JAR...** opens one as a tab. Opening one `.class` directly is unchanged.
 
 ## Testing workflow (fast → slow)
 
@@ -77,6 +78,7 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
    parses `mdg.jar`, decodes + lifts every instruction into a mock IL and checks decode tiling,
    no `unimplemented`, and the per-instruction stack effect against an independent table.
    `--all` runs every jar under `sample/` in parallel (≈47k classes, 11.6M instructions).
+   `python3 tests/synthetic_opcode_check.py` lifts the committed rare-opcode class (nop, swap, goto_w, jsr_w, wide).
 2. **Live in BN without restart**: `bnrun tests/bn_dev_load.py` copies the package to
    `/tmp/jvm_devN/`, renames arch/view to `JVM-devN` / `JVM Class devN` and registers them
    (BN cannot unregister types, so every reload needs fresh names; older dev views are disabled).

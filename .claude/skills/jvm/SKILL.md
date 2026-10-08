@@ -23,8 +23,9 @@ Generic Binary Ninja mechanics (MCP tools, `bnrun` bridge, usage lock) are in th
   favourite target **`mdg.jar`**, unpacked to `lib/mdg/` (see "Loading classes from a JAR").
 
 ## Loading classes from a JAR
-BN can't open a `.jar` directly yet (jvm-13), so **unpack it first, next to the JAR, into a
-directory named like the JAR without `.jar`**: `foo.jar` → `foo/`.
+**File > Load Whole JAR...** unpacks `foo.jar` to `foo/` beside it, preselects `Main-Class`, and can
+unpack nested JARs (`lib/bar.jar` → `foo/lib/bar/`). Opening one `.class` is unchanged. The same layout
+by hand: `foo.jar` → `foo/`.
 ```bash
 cd <dir with the jar> && unzip -o -q mdg.jar -d mdg      # -> mdg/com/is_teledata/…/X.class
 ```
@@ -35,8 +36,9 @@ Universal view active — switch to "JVM Class" (GUI: view dropdown; MCP: `bn_bi
 `tests/offline_lift_check.py --all` skips such `foo/` dirs (their classes are checked via the jar).
 
 ## Test loop (fast → slow)
-1. `python3 tests/offline_lift_check.py` (~1–2 s, mdg.jar; `--all` = every sample jar). Must
-   report 0 decode/lift/unimplemented/stack/tiling failures. Run it after every lifter change.
+1. `python3 tests/offline_lift_check.py` (~1–2 s, mdg.jar plus the rare-opcode class; `--all` = every
+   sample jar). Must report 0 decode/lift/unimplemented/stack/tiling failures. Run it after every lifter
+   change. `python3 tests/synthetic_opcode_check.py` requires nop, swap, goto_w, jsr_w and each wide form.
 2. Live, no restart: `bnrun tests/bn_dev_load.py` (serialized lane: registers `JVM-devN` /
    `JVM Class devN` globally; BN can't unregister types), then `bnrun --parallel
    tests/bn_batch_check.py` (20 classes), `--parallel tests/bn_golden.py` or a one-class dump. These
