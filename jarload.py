@@ -1,6 +1,6 @@
 """Whole JAR loading (jvm-13): unpack a .jar next to itself. The decompiler reads another class from
-that directory when it needs one (inner classes, supertypes, varargs). A tab opens only for a class
-the user picks from the list. One class is still one view."""
+that directory when it needs one (inner classes, supertypes, varargs). Tabs open only for the classes
+the user picks from the list (several at once, jvm-76). One class is still one view."""
 import os
 import zipfile
 
@@ -62,15 +62,78 @@ def classes_in(dest):
     return sorted(found)
 
 
-def choose_class(found, title):
-    """filterable list of binary names. Returns the chosen path, or None if cancelled."""
-    from binaryninja import get_large_choice_input
+MANY_TABS = 10  # opening more tabs than this at once asks first (each one analyses its class)
+
+
+def choose_classes(found, title):
+    """filterable multi-select list of binary names (Shift / Cmd click). Returns the chosen paths ([] if
+    cancelled). Inner classes ($) are hidden unless asked for: the class view prints them inside their
+    outer class. Falls back to BN's single-choice list without Qt"""
     if not found:
-        return None
-    index = get_large_choice_input("Open", title, [name for name, _path in found])
-    if index is None:
-        return None
-    return found[index][1]
+        return []
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox, QLabel, QLineEdit,
+                                       QListWidget, QListWidgetItem, QVBoxLayout)
+    except ImportError:
+        from binaryninja import get_large_choice_input
+        index = get_large_choice_input("Open", title, [name for name, _path in found])
+        return [] if index is None else [found[index][1]]
+
+    dialog = QDialog()
+    dialog.setWindowTitle(title)
+    dialog.resize(640, 560)
+    layout = QVBoxLayout(dialog)
+    flt = QLineEdit()
+    flt.setPlaceholderText("Filter (part of the name, e.g. log/Logger)")
+    inner = QCheckBox("Show inner and anonymous classes")
+    lst = QListWidget()
+    lst.setSelectionMode(QAbstractItemView.ExtendedSelection)
+    for name, path in found:
+        item = QListWidgetItem(name)
+        item.setData(Qt.UserRole, path)
+        lst.addItem(item)
+    status = QLabel()
+    buttons = QDialogButtonBox(QDialogButtonBox.Open | QDialogButtonBox.Cancel)
+    for w in (flt, inner, lst, status, buttons):
+        layout.addWidget(w)
+
+    def refresh():
+        text = flt.text().strip().lower()
+        shown = 0
+        for i in range(lst.count()):
+            item = lst.item(i)
+            name = item.text()
+            hide = (text and text not in name.lower()) or (not inner.isChecked() and "$" in name.rsplit("/", 1)[-1])
+            item.setHidden(bool(hide))
+            if hide:
+                item.setSelected(False)
+            shown += not hide
+        picked = len(lst.selectedItems())
+        status.setText("%d of %d classes shown, %d selected" % (shown, len(found), picked))
+        buttons.button(QDialogButtonBox.Open).setEnabled(picked > 0)
+
+    flt.textChanged.connect(refresh)
+    inner.toggled.connect(refresh)
+    lst.itemSelectionChanged.connect(refresh)
+    lst.itemDoubleClicked.connect(lambda _item: dialog.accept())
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+    refresh()
+    flt.setFocus()
+    if dialog.exec() != QDialog.Accepted:
+        return []
+    return [item.data(Qt.UserRole) for item in lst.selectedItems() if not item.isHidden()]
+
+
+def open_class_tabs(paths):
+    """open each path as a tab (asks first when there are many). Returns how many opened"""
+    from binaryninja import show_message_box, MessageBoxButtonSet, MessageBoxButtonResult
+    if len(paths) > MANY_TABS and show_message_box(
+            "Open classes", "Open %d classes as %d tabs?" % (len(paths), len(paths)),
+            MessageBoxButtonSet.YesNoButtonSet) != MessageBoxButtonResult.YesButton:
+        return 0
+    return sum(1 for path in paths if open_class_tab(path))
 
 
 def open_class_tab(path):
@@ -91,7 +154,7 @@ def open_class_tab(path):
 
 
 def load_whole_jar(path=None):
-    """ask for a .jar if path is omitted, unpack it, then open the one class the user picks"""
+    """ask for a .jar if path is omitted, unpack it, then open the classes the user picks"""
     from binaryninja import get_open_filename_input, log_error, log_info, show_message_box
     try:
         if not path:
@@ -111,13 +174,14 @@ def load_whole_jar(path=None):
             log_error("Whole JAR: no .class entries in %s" % path)
             show_message_box("Whole JAR", "No .class entries in %s" % path)
             return
-        chosen = choose_class(found, "Whole JAR (%d classes)" % len(found))
-        if chosen is None:
+        chosen = choose_classes(found, "Whole JAR: %s (%d classes)" % (os.path.basename(path), len(found)))
+        if not chosen:
             log_info("Whole JAR: unpacked %d classes to %s" % (len(found), dest))
             return
-        if open_class_tab(chosen):
-            log_info("Whole JAR: opened %s (%d classes unpacked)" % (os.path.basename(chosen), len(found)))
-        else:
+        opened = open_class_tabs(chosen)
+        if opened:
+            log_info("Whole JAR: opened %d of %d chosen classes (%d unpacked)" % (opened, len(chosen), len(found)))
+        elif len(chosen) <= MANY_TABS:
             show_message_box("Whole JAR", "Unpacked to %s but could not open a tab." % dest)
     except Exception as e:
         log_error("Whole JAR: %s" % e)
@@ -135,9 +199,7 @@ def open_class_in_same_tree(bv):
         log_error("Open class: this file is not inside an unpacked JAR directory")
         return
     found = classes_in(root)
-    chosen = choose_class(found, "Classes in %s" % os.path.basename(root.rstrip(os.sep)))
-    if chosen:
-        open_class_tab(chosen)
+    open_class_tabs(choose_classes(found, "Classes in %s" % os.path.basename(root.rstrip(os.sep))))
 
 
 def _has_tree(bv):
