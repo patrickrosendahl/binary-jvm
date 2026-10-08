@@ -12,7 +12,7 @@ PKG = globals().get("DEV_PKG") or (b._jvm_dev["pkg"].__name__ if hasattr(b, "_jv
 EXPECTED = [
     "Anon.this.bump();",                          # outer method through this$0
     "Anon.this.count = Anon.this.count + 2;",     # outer field
-    "arg2 + Anon.this.count",                     # captured local (val$label) next to an outer field
+    "System.out.println(arg2 + Anon.this.count);", # captured local (val$label); no "" + (javac 21 indy, jvm-75)
     "System.out.println(arg2);",                  # anonymous inside anonymous: this$1.val$n
     'return new Thread("t-" + arg2) {',           # super constructor argument, no extra parentheses
     "System.out.println(arg1);",                  # static context: no outer instance

@@ -51,6 +51,7 @@ import re
 
 from .constants import (ARCH_NAME, VIEW_NAME, PSEUDOMEMORY_TABLE, PSEUDOMEMORY_PRIMITIVES, POOL_STRIDE,
                         METHOD_BASE, METHOD_STRIDE)
+from .javatypes import split_method_descriptor
 
 # ---------------------------------------------------------------------------------------------------
 # configuration
@@ -4487,7 +4488,11 @@ if _HAVE_BN:
                 recipe = self.info.indy_recipe(idx) if name == "makeConcatWithConstants" else None
                 if recipe is not None:
                     parts = concat_recipe_parts(recipe[0], list(args), recipe[1])
-                    ops = [(p[1], False) if p[0] == 'arg' else ('"' + p[1] + '"', True) for p in parts if p[1] is not None]
+                    # a String argument (the call site's descriptor says so) needs no "" + in front (jvm-75)
+                    strings = {id(a) for a, d in zip(args, split_method_descriptor(desc)[0] if desc else [])
+                               if d == "Ljava/lang/String;"}
+                    ops = [(p[1], id(p[1]) in strings) if p[0] == 'arg' else ('"' + p[1] + '"', True)
+                           for p in parts if p[1] is not None]
                     self.emit_concat(ops, tokens, settings, precedence)
                     return
                 tokens.append(_tok(TT.CodeSymbolToken, name, value=slot))
