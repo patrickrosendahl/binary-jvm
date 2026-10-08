@@ -11,6 +11,6 @@ __pycache__/
 .vscode/
 
 # agent worktrees (Claude Code)
-.claude/worktrees/
+.claude/
 tests/golden/
 .scratch/

@@ -19,7 +19,7 @@ and runs the installed plugin at HEAD; restart again after plugin changes, or us
 `/Users/patrick/dev/minitick/.venv/bin/minitick … -p jvm`), documentation in miniwiki project
 **`jvm`** (`miniwiki tree jvm`; `tickets/` there is a read-only mirror of minitick). There is no
 code reviewer: finished tickets go straight to **RESOLVED** with a verification comment. The
-project skill **`.claude/skills/jvm/SKILL.md`** summarises the workflow and gotchas — load it.
+project skill **`skills/jvm/SKILL.md`** (linked from `.claude/skills`) summarises the workflow and gotchas — load it.
 
 ## What this is
 
