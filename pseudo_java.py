@@ -832,6 +832,21 @@ if _HAVE_BN:
 
     _EXC_BRANCH = "EXC_BRANCH"
 
+    class _ConstLock:
+        """a monitorenter / monitorexit operand that is a constant: equal when the constant is (jvm-82)"""
+        def __init__(self, expr):
+            self.expr = expr
+            self.key = (expr.operation, expr.constant)
+
+        def __eq__(self, other):
+            return isinstance(other, _ConstLock) and other.key == self.key
+
+        def __ne__(self, other):
+            return not self.__eq__(other)
+
+        def __hash__(self):
+            return hash(self.key)
+
     class _CgIf:
         """a loop's exit test that is a reduced condition graph (jvm-80): only its condition is used"""
         def __init__(self, cond):
@@ -2098,6 +2113,16 @@ if _HAVE_BN:
                         self.plan_cgraph(body, k, hi, run_at, sync_at, plan)
                     except Exception:
                         pass
+            if LOOP_CONDITIONS and block.as_ast:
+                for k in range(lo, hi + 1):  # `T x; do { x = e; } while (x)`: x disappears (jvm-82)
+                    s = body[k]
+                    if not isinstance(s, _ExcBranch) and s.operation == Op.HLIL_DO_WHILE and s.as_ast:
+                        try:
+                            found = self.do_while_compute(s)
+                        except Exception:
+                            found = None
+                        if found is not None:
+                            self.hidden_vars.add(found[0])
             if SPLIT_CONDITIONS and block.as_ast:
                 for k in range(lo, hi + 1):
                     try:
@@ -2463,6 +2488,8 @@ if _HAVE_BN:
                 return
             if isinstance(value, tuple) and value[0] == 'incdec':
                 _, load, step, pre, _, _ = value
+                if load.operation == Op.HLIL_VAR and self.inline.get(load.var) is value:
+                    del self.inline[load.var]  # `++x` stored under x itself: x prints as x from here on
                 if pre:
                     self.op(tokens, step * 2)
                 self.perform_get_expr_text(load, tokens, settings, P.UnaryOperatorPrecedence)
@@ -2485,11 +2512,17 @@ if _HAVE_BN:
 
         # --- synchronized blocks (jvm-47) ------------------------------------------------------------
         def monitor_var(self, s, name):
-            """the lock variable of a `monitorenter(v)` / `monitorexit(v)` statement, else None"""
+            """the lock variable of a `monitorenter(v)` / `monitorexit(v)` statement, else None. A constant
+            lock (`synchronized ("")`, `synchronized (o = null)` after BN propagated it) is a _ConstLock (jvm-82)"""
             if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_INTRINSIC or s.intrinsic.name != name or \
-                    len(s.params) != 1 or s.params[0].operation not in (Op.HLIL_VAR, Op.HLIL_VAR_SSA):
+                    len(s.params) != 1:
                 return None
-            return s.params[0].var
+            p = s.params[0]
+            if p.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA):
+                return p.var
+            if p.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR):
+                return _ConstLock(p)
+            return None
 
         def monitor_exits(self, roots, lock):
             """monitorexit(lock) statements below roots that are not javac's cleanup-handler code"""
@@ -2601,15 +2634,26 @@ if _HAVE_BN:
             if s.false is not None and s.false.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
                 for leave, rest, leave_true in ((s.true, s.false, True), (s.false, s.true, False)):
                     li, ri = self.flatten(self.stmts_of(leave)), self.flatten(self.stmts_of(rest))
-                    rr = [x for x in ri if not self.hidden_item(x)]
-                    if not rr or isinstance(rr[0], _ExcBranch) or self.monitor_var(rr[0], "monitorexit") != lock or \
-                            self.in_monitor_code(rr[0]) or self.monitor_exits(ri, lock) != 1:
+                    # the branch that stays: [code still in the block] release [code after it] (jvm-82)
+                    rel = [q for q, x in enumerate(ri) if not isinstance(x, _ExcBranch) and
+                           self.monitor_var(x, "monitorexit") == lock and not self.in_monitor_code(x)]
+                    if len(rel) != 1 or self.monitor_exits(ri, lock) != 1:
                         continue
+                    pre, ri = ri[:rel[0]], ri[rel[0]:]
+                    if any(isinstance(x, _ExcBranch) or x.operation in COMPOUND or
+                           x.operation in (Op.HLIL_RET, Op.HLIL_GOTO, Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_LABEL)
+                           for x in pre if not self.hidden_item(x)):
+                        continue  # (only plain statements move into the block)
+                    rr = [x for x in ri if not self.hidden_item(x)]
                     m = [q for q, x in enumerate(li) if not isinstance(x, _ExcBranch) and
                          self.monitor_var(x, "monitorexit") == lock]
+                    lr = [x for x in li if not self.hidden_item(x)]
+                    if not m and self.monitor_exits(li, lock) == 0 and lr and self.never_falls(lr[-1]):
+                        # `if (c) { throw ..; }` inside the block: the cleanup handler releases the lock (jvm-82)
+                        return ('branch', j, leave_true, li, ri, rr[0], rest, pre)
                     if len(m) != 1 or self.monitor_exits(li, lock) != 1 or not self.exit_leaves(li[m[0] + 1:]):
                         continue
-                    return ('branch', j, leave_true, li, ri, rr[0], rest)
+                    return ('branch', j, leave_true, li, ri, rr[0], rest, pre)
             shape = self.if_goto_shape(body, j, plan)
             if shape is not None and shape[0] == 'split':
                 tail = shape[3]
@@ -2625,7 +2669,7 @@ if _HAVE_BN:
             self.kw(tokens, "synchronized ")
             tokens.append_open_paren()
             if value is not None:
-                self.expr(value, tokens, settings)
+                self.emit_typed(value, 'L', tokens, settings)  # a reference: a constant 0 is null
             else:
                 self.emit_var(lock, body[k], tokens)
             tokens.append_close_paren()
@@ -2637,7 +2681,7 @@ if _HAVE_BN:
                     self.emit_range(body, k + 1, j - 1, plan, tokens, settings, block)
                     tokens.scope_separator()
                 if shape[0] == 'branch':
-                    _, _, leave_true, li, ri, release, rest_blk = shape
+                    _, _, leave_true, li, ri, release, rest_blk, pre = shape
                     self.kw(tokens, "if ")
                     tokens.append_open_paren()
                     if leave_true:
@@ -2650,6 +2694,9 @@ if _HAVE_BN:
                     tokens.end_scope(ScopeType.BlockScopeType)
                     tokens.finalize_scope()
                     tokens.new_line()
+                    if [x for x in pre if not self.hidden_item(x)]:  # still inside the block
+                        tokens.scope_separator()
+                        self.emit_list(pre, tokens, settings, rest_blk)
                     after, after_blk = ri, rest_blk
                 else:
                     _, _, ig, after, release = shape
@@ -2663,7 +2710,9 @@ if _HAVE_BN:
             self.consumed.add(release.expr_index)  # the release is the block's end
             if [x for x in after if not self.hidden_item(x)]:
                 tokens.scope_separator()
-                self.emit_list(after, tokens, settings, after_blk)
+                # at the method's end it is the method's end: a final `return;` is dropped there too
+                self.emit_list(after, tokens, settings, after_blk,
+                               is_root=bool(plan.get("root")) and self.rest_hidden(body, j, plan))
 
         def hidden_item(self, s):
             """a flattened item that prints nothing"""
@@ -2718,8 +2767,8 @@ if _HAVE_BN:
                     for i in _walk(self.hlil.root):
                         if i.operation == Op.HLIL_VAR:
                             reads[i.var] = reads.get(i.var, 0) + 1
-                        if self.monitor_var(i, "monitorenter") is not None or self.monitor_var(i, "monitorexit") is not None:
-                            v = i.params[0].var
+                        v = self.monitor_var(i, "monitorenter") or self.monitor_var(i, "monitorexit")
+                        if v is not None and not isinstance(v, _ConstLock):
                             mon[v] = mon.get(v, 0) + 1
                         if i.operation == Op.HLIL_ASSIGN and i.dest.operation == Op.HLIL_VAR:
                             assigns[i.dest.var] = assigns.get(i.dest.var, 0) + 1
@@ -2731,7 +2780,9 @@ if _HAVE_BN:
 
         def lock_value(self, body, k, lock, plan):
             """the expression the lock variable is set from right before the monitorenter, when the variable
-            is used for nothing else (its definition is then not printed)"""
+            is used for nothing else (its definition is then not printed); a constant lock is itself"""
+            if isinstance(lock, _ConstLock):
+                return lock.expr
             try:
                 defs = list(self.hlil.get_var_definitions(lock))
             except Exception:
@@ -2771,7 +2822,7 @@ if _HAVE_BN:
             self.kw(tokens, "synchronized ")
             tokens.append_open_paren()
             if value is not None:
-                self.expr(value, tokens, settings)
+                self.emit_typed(value, 'L', tokens, settings)  # a reference: a constant 0 is null
             else:
                 self.emit_var(lock, body[k], tokens)
             tokens.append_close_paren()
@@ -2930,9 +2981,11 @@ if _HAVE_BN:
             for d in defs:
                 if d.expr_index in assigned:
                     target, value, declare = assigned[d.expr_index]
-                    if value is not None:
-                        self.inline[d.dest if d.operation == Op.HLIL_VAR_INIT else d.dest.var] = \
-                            ('assignx', target, value, d)
+                    key = d.dest if d.operation == Op.HLIL_VAR_INIT else d.dest.var
+                    if isinstance(value, tuple) and value[0] == 'incdec':
+                        self.inline[key] = value
+                    elif value is not None:
+                        self.inline[key] = ('assignx', target, value, d)
                     if declare:
                         decls.append((target, d))
             self.loop_decls[w.expr_index] = decls
@@ -2965,6 +3018,22 @@ if _HAVE_BN:
                 return None
             return _CgIf(cond), items[end + 1:]
 
+        def step_of(self, s, x):
+            """'+' / '-' when statement s is `v = v + 1` / `v = v - 1` of the variable expression x, else None"""
+            if s is None or isinstance(s, _ExcBranch) or s.operation != Op.HLIL_ASSIGN or \
+                    s.dest.operation != Op.HLIL_VAR or x.operation != Op.HLIL_VAR or s.dest.var != x.var:
+                return None
+            v = s.src
+            if v.operation not in (Op.HLIL_ADD, Op.HLIL_SUB) or v.left.operation != Op.HLIL_VAR or \
+                    v.left.var != x.var or v.right.operation != Op.HLIL_CONST:
+                return None
+            c, bits = v.right.constant, 8 * (v.right.size or 4)
+            if c >= 1 << (bits - 1):
+                c -= 1 << bits  # BN writes a decrement as `x + -1` (0xffffffff)
+            if c not in (1, -1):
+                return None
+            return '+' if (c == 1) == (v.operation == Op.HLIL_ADD) else '-' 
+
         def assign_defs(self, defs, cond):
             """{expr_index of a def: (variable assigned, value or None if folded into another def, declare it
             before the loop)} for the defs before a loop's exit test that become `(x = e)` in its condition:
@@ -2976,6 +3045,20 @@ if _HAVE_BN:
                 return out
             for n, d in enumerate(defs):
                 var = d.dest if d.operation == Op.HLIL_VAR_INIT else d.dest.var
+                nxt = defs[n + 1] if n + 1 < len(defs) else None
+                step = self.step_of(nxt, d.src) if nxt is not None and d.operation == Op.HLIL_VAR_INIT else None
+                if step is not None and self.var_count(var) == 1 and self.refs(cond, var) == 1 and \
+                        self.def_count(var) == 1:
+                    # `t = x; x = x + 1; if (t ..)` -> `x++` where t was (javac's postfix in a loop test)
+                    out[d.expr_index] = (var, ('incdec', d.src, step, False, None, None), False)
+                    out[nxt.expr_index] = (var, None, False)
+                    continue
+                if d.expr_index in out:
+                    continue
+                step = self.step_of(d, d.dest) if d.operation == Op.HLIL_ASSIGN else None
+                if step is not None and self.refs(cond, var) == 1:
+                    out[d.expr_index] = (var, ('incdec', d.dest, step, True, None, None), False)  # ++x
+                    continue
                 if d.operation == Op.HLIL_VAR_INIT and self.var_count(var) == 1:
                     continue  # read only by the condition: inlined as it is
                 nxt = defs[n + 1] if n + 1 < len(defs) else None
@@ -2996,6 +3079,12 @@ if _HAVE_BN:
                 out[d.expr_index] = (var, d.src, d.operation == Op.HLIL_VAR_INIT and var not in self.hoisted)
             for d in defs:  # the moved value is evaluated where the condition reads it: nothing with effects first
                 if d.expr_index not in out or out[d.expr_index][1] is None:
+                    continue
+                if isinstance(out[d.expr_index][1], tuple):
+                    key = d.dest if d.operation == Op.HLIL_VAR_INIT else d.dest.var
+                    before, found = self.eval_nodes(cond, key)
+                    if found is not True or any(self.side_effect(i) for i in before):
+                        return None
                     continue
                 key = d.dest if d.operation == Op.HLIL_VAR_INIT else d.dest.var
                 before, found = self.eval_nodes(cond, key)
@@ -4664,6 +4753,43 @@ if _HAVE_BN:
             self.emit_body(body, tokens, settings, newline=False)
             tokens.end_scope(ScopeType.BlockScopeType if scope is None else scope)
 
+        def do_while_compute(self, w):
+            """(x, `x = e`) when a do-while's body only computes the value its test reads once, else None"""
+            if not LOOP_CONDITIONS or self.exc_test(w.condition) is not None:
+                return None
+            items = [x for x in self.flatten(self.stmts_of(w.body)) if not self.hidden_item(x)]
+            if len(items) != 1 or isinstance(items[0], _ExcBranch) or \
+                    items[0].operation not in (Op.HLIL_ASSIGN, Op.HLIL_VAR_INIT):
+                return None
+            a = items[0]
+            x = a.dest if a.operation == Op.HLIL_VAR_INIT else (a.dest.var if a.dest.operation == Op.HLIL_VAR else None)
+            if x is None or self.refs(w.condition, x) != 1 or self.var_count(x) - self.refs(a, x) != 1 or \
+                    self.mentions_exc(a.src):
+                return None
+            before, found = self.eval_nodes(w.condition, x)
+            if found is not True or any(self.side_effect(i) for i in before):
+                return None
+            return x, a
+
+        def do_while_break(self, w):
+            """the `if (x) break;` that ends a do-while's body right before its test, marked consumed (it
+            becomes `!x &&` in the test), else None"""
+            if not LOOP_CONDITIONS or self.exc_test(w.condition) is not None or self.side_effect(w.condition):
+                return None
+            items = [x for x in self.flatten(self.stmts_of(w.body)) if not self.hidden_item(x)]
+            if not items or isinstance(items[-1], _ExcBranch):
+                return None
+            last = items[-1]
+            if last.operation != Op.HLIL_IF or not last.as_ast or self.exc_if_parts(last) is not None or \
+                    not (last.false is None or last.false.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE)) or \
+                    self.mentions_exc(last.condition):
+                return None
+            t = [x for x in self.flatten(self.stmts_of(last.true)) if not self.hidden_item(x)]
+            if len(t) != 1 or isinstance(t[0], _ExcBranch) or t[0].operation != Op.HLIL_BREAK:
+                return None
+            self.consumed.add(last.expr_index)
+            return last
+
         def _loop_cond(self, instr, tokens, settings):
             """loop condition; an exception test (`while (exc == 0)`: the loop is left by an exception, which
             goes to a handler) prints as the value it has on the normal path"""
@@ -4723,12 +4849,28 @@ if _HAVE_BN:
                     self._loop_cond(instr.condition, tokens, settings)
                     self._scoped(instr, instr.body, tokens, settings)
                     tokens.finalize_scope()
+                elif instr.as_ast and self.do_while_compute(instr) is not None:
+                    x, asg = self.do_while_compute(instr)
+                    self.inline[x] = asg.src  # `do { x = e; } while (x)` -> `while (e) { }` (jvm-82)
+                    self.consumed.add(asg.expr_index)
+                    self.kw(tokens, "while ")
+                    self._loop_cond(instr.condition, tokens, settings)
+                    tokens.begin_scope(ScopeType.BlockScopeType)
+                    tokens.end_scope(ScopeType.BlockScopeType)
+                    tokens.finalize_scope()
                 elif instr.as_ast:
+                    merged = self.do_while_break(instr)
                     self.kw(tokens, "do")
                     self._scoped(instr, instr.body, tokens, settings)
                     tokens.scope_continuation(True)
                     self.kw(tokens, "while ")
-                    self._loop_cond(instr.condition, tokens, settings)
+                    if merged is not None:  # `if (x) break; } while (c)` -> `} while (!x && c)` (jvm-82)
+                        tokens.append_open_paren()
+                        self.emit_bexpr(('and', ('not', merged.condition), instr.condition), tokens, settings,
+                                        P.TopLevelOperatorPrecedence)
+                        tokens.append_close_paren()
+                    else:
+                        self._loop_cond(instr.condition, tokens, settings)
                     tokens.append_semicolon()
                     tokens.finalize_scope()
                 else:

@@ -9,11 +9,12 @@ stack as registers (jvm-33), typed signatures + names (jvm-35), compare fusion (
 edges inside methods (jvm-42), a Pseudo Java language representation (jvm-43/44) and a class view
 (jvm-41). The plugin is **installed** again (symlink + `files.container.excludedTransforms = ["Universal"]`).
 
-**▶ Handoff (2026-10-08 13:00).** jvm-13 is decided: one class per view, and **File > Load Whole JAR...**
-unpacks `foo.jar` to `foo/` and opens the class you pick. The 2026-10-08 review (jvm-69..74) checked every gate on
-`ed4d40e` and fixed jvm-69/71/72/73/75; jvm-70 (click through Load Whole JAR in the GUI) needs a human. Next concrete tickets: jvm-15 (manifest
-and nested JARs), jvm-44 leftovers, jvm-37. jvm-68 still waits on binary-cpp. Binary Ninja was restarted at 12:03
-and runs the installed plugin at HEAD; restart again after plugin changes, or use a dev load.
+**▶ Handoff (2026-10-08 evening).** Today: review of the jvm-13 JAR work (jvm-69..76), Vineflower's own Java 8 tests as
+a second gate (jvm-77, `tests/vineflower_suite.py`), try-with-resources (jvm-78), nested conditions / condition graphs
+(jvm-80), synchronized + loop-condition shapes (jvm-82, partly). Suite 7241 -> 6487 statements (Vineflower 5680).
+Open, in this order: jvm-85 (BUG: finally inside loops prints nonsense), jvm-84 (multi-catch), jvm-82 rest (sync blocks
+split by exception/loop edges, TestChainedCFG), jvm-79 (lambdas), jvm-81, jvm-83. jvm-15 waits for Patrick's GUI
+click-through (needs a BN restart to load jarload.py). jvm-68 still waits on binary-cpp. Use a dev load for live tests.
 
 **Project tracking:** tickets live in minitick project **`jvm`** (`jvm-N`; CLI
 `/Users/patrick/dev/minitick/.venv/bin/minitick … -p jvm`), documentation in miniwiki project
@@ -88,7 +89,7 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
    **Pseudo Java gates** (after any `pseudo_java.py` change; wiki `vineflower-comparison.md`):
    `python3 tests/vineflower_compare.py --decompile` (once: Vineflower, the decompiler Recaf uses, local fork),
  `tests/bn_dump_all.sh pj [jvm_devN]` (4 parallel batches, ~3 min; jvm-74), then
- `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=1 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0 ref_zero=0 double_casts=0 type_mismatch=0 if_else_assign=0 stmts=2017`
+ `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=1 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0 ref_zero=0 double_casts=0 type_mismatch=0 if_else_assign=0 stmts=2016`
  (exit 1 on a regression; `stmts` is the statement count, lower it as tickets land; `--excess N` lists where the
  extra statements against Vineflower come from); and `tests/bn_pseudo_java_compare_all.sh [jvm_devN]` (~18-25 min):
  every mdg method with an exception table against HLIL -- must stay 251/251 (~15 min on an idle machine). Both

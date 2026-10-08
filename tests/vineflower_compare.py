@@ -349,6 +349,8 @@ def compare_method(pj_body, vf_body, hoisted=()):
         r["lost_calls"] = sorted(lost)
         pj_strings = {s.replace(" ", "") for s in string_literals(pj_text)}
         r["lost_strings"] = sorted(s for s in string_literals(vf_text) if s.replace(" ", "") not in pj_strings)
+        # while (true) / do { beyond the ones Vineflower prints too (the plain counter counts every one)
+        r["while_true_excess"] = max(0, r["while_true"] - len(COUNTERS["while_true"].findall(vf_text)))
     return r
 
 
@@ -403,7 +405,8 @@ def main():
                 print("\n".join(body))
                 print("-" * 30, "Vineflower")
                 print("\n".join(vbody or ["(no match)"]))
-    keys = ["stmts", "vf_stmts", "lines", "vf_lines", "temps", "gotos", "labels", "sync_comments", "offset_stores", "while_true", "plumbing",
+    keys = ["stmts", "vf_stmts", "lines", "vf_lines", "temps", "gotos", "labels", "sync_comments", "offset_stores", "while_true",
+            "while_true_excess", "plumbing",
             "dead_code", "leaked_catch_var", "ref_zero", "double_casts", "type_mismatch", "if_else_assign"]
     for k in keys:
         totals[k] = sum(r.get(k, 0) for r in rows)
