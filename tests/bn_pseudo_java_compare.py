@@ -9,6 +9,8 @@
 #   * not truncated: balanced braces, last line `}`
 #   * a method with an exception table has `try` (except javac's synchronized-only cleanup handlers)
 #   * no catch variable used outside its catch block, no jump right after a jump (`return; break;`) (jvm-45)
+# A method whose HLIL is missing gets its analysis forced once and then counts as a problem instead of
+# being silently skipped (jvm-95). Exits non-zero when any problem was found (jvm-94).
 import os, re, sys, time
 import binaryninja as b
 sys.path.insert(0, "/Users/patrick/dev/binary-jvm/tests")
@@ -44,6 +46,14 @@ for rel in CLASSES:
             continue
         totals["methods"] += 1
         totals["with_table"] += bool(table)
+        if f.hlil is None or f.hlil.root is None:
+            # jvm-95: analysis unfinished or skipped under load -- force it and retry once
+            f.analysis_skip_override = b.FunctionAnalysisSkipOverride.NeverSkipFunctionAnalysis
+            v.update_analysis_and_wait()
+        if f.hlil is None or f.hlil.root is None:
+            totals["problems"] += 1
+            print("%s %s: no HLIL (analysis_skip_reason %r)" % (rel.rsplit("/", 1)[-1], f.name, f.analysis_skip_reason))
+            continue
         problems = []
         try:
             lines = pj.render_method(f)
@@ -52,8 +62,6 @@ for rel in CLASSES:
             problems.append("render raised %r" % e)
         text = "\n".join(lines)
         flat = re.sub(r'"\s*\n\s*"', "", text)  # long string literals wrap across lines
-        if f.hlil is None or f.hlil.root is None:
-            continue
         # calls and strings in HLIL
         names, strings = set(), set()
         lr = pj.PseudoJavaFunction(pj.register(), f.arch, f, f.hlil)
@@ -108,3 +116,5 @@ for rel in CLASSES:
     print("#### %s (%.1fs)" % (rel, time.time() - t))
     v.file.close()
 print("TOTAL", totals)
+if totals["problems"]:
+    raise SystemExit("%d problem(s)" % totals["problems"])

@@ -2,7 +2,8 @@
 # Prepend settings to override, e.g. `LABEL = "after"; VIEW_NAME = "JVM Class dev3"`.
 # Dumps the HLIL of a few reference classes to tests/golden/<LABEL>/<Class>.txt (git-ignored: sample code) and prints readability
 # metrics over CLASS_DIR (first LIMIT classes): .d/.q accessor lines, $catch_ functions, functions
-# whose signature has no type other than int32_t, analysis time.
+# whose signature has no type other than int32_t, analysis time. Exits non-zero when a class fails to
+# open (jvm-94); the metrics are still printed and written first.
 import os, re, time
 import binaryninja as b
 
@@ -30,12 +31,13 @@ def hlil_lines(f):
 paths = sorted(os.path.relpath(os.path.join(d, n), CLASS_DIR) for d, _, ns in os.walk(CLASS_DIR) for n in ns if n.endswith(".class"))[:LIMIT]
 m = {"classes": 0, "functions": 0, "accessor_lines": 0, "accessor_classes": 0, "catch_funcs": 0, "int_only_sigs": 0, "seconds": 0.0}
 times = []
+failed = []
 for rel in paths:
     t = time.time()
     raw = b.BinaryView.open(os.path.join(CLASS_DIR, rel))
     v = vt.create(raw) if raw else None
     if v is None:
-        print("FAIL", rel); continue
+        failed.append(rel); print("FAIL", rel); continue
     v.update_analysis_and_wait()
     times.append(time.time() - t)
     m["classes"] += 1
@@ -64,3 +66,5 @@ if times:
 print(m)
 with open(os.path.join(out_dir, "metrics.txt"), "w") as fh:
     fh.write(repr(m) + "\n")
+if failed:
+    raise SystemExit("%d class(es) failed to open" % len(failed))

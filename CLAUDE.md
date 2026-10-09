@@ -94,7 +94,8 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
  `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=1 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0 ref_zero=0 double_casts=0 type_mismatch=0 if_else_assign=0 stmts=2016`
  (exit 1 on a regression; `stmts` is the statement count, lower it as tickets land; `--excess N` lists where the
  extra statements against Vineflower come from); and `tests/bn_pseudo_java_compare_all.sh [jvm_devN]` (~18-25 min):
- every mdg method with an exception table against HLIL -- must stay 251/251 (~15 min on an idle machine). Both
+ every mdg method with an exception table against HLIL -- must stay 251/251 (~15 min on an idle machine); the
+ script exits non-zero unless every batch is ok == with_table (jvm-95). Both
  scripts fill the 4 parallel bnrun slots, so run them one after the other (compare_all in the background).
  **Vineflower's test corpus** (Java 8 constructs mdg lacks; jvm-77): `python3 tests/vineflower_suite.py prep` (once),
  `tests/bn_dump_all.sh suite [jvm_devN]` (~12 min), `python3 tests/vineflower_suite.py compare` (gate at the current
@@ -102,7 +103,8 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
  **Class view gate** (after a `classui.py` / class metadata change): `tests/bn_dump_all.sh cv [jvm_devN]`
  (~4 min), then `python3 tests/class_view_compare.py --max imports=2 headers=0 fields=0 override=0 head=0 throws=0 missing=0`
  (declarations against Vineflower; the 2 imports are types Vineflower names for locals we fold away), and
- `bnrun --parallel --timeout 300 tests/bn_anon_check.py` (anonymous classes at their `new`, javac 8 + 21; jvm-69).
+ `bnrun --parallel --timeout 300 tests/bn_anon_check.py` (anonymous classes at their `new`, javac 8 + 21; jvm-69;
+ exits non-zero on failure, as do the other bnrun check scripts -- jvm-94).
 3. bnrun has two lanes: serialized (default; UI work and global registration like `bn_dev_load.py`)
    and `--parallel` (scripts on their own views, up to 4 at once, no lock). Always pass **`--timeout N`**; a running script can be stopped
    with `bnrun --cancel` (or Ctrl-C on the client), `bnrun --status` shows what is running.

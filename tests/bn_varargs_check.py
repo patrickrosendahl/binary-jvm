@@ -2,7 +2,8 @@
 #   bnrun --timeout 300 tests/bn_varargs_check.py          (prepend DEV_PKG = "jvm_devN" for a dev load)
 # jvm-64: varargs callees declared next to their caller (tests/synthetic/, built by tests/synthetic/build.sh).
 # Pseudo Java reads ACC_VARARGS from the callee's class file in the same directory (jvm-57); every caller
-# method must contain its expected text and none of the forbidden ones. Prints PASS / FAIL per case.
+# method must contain its expected text and none of the forbidden ones. Prints PASS / FAIL per case and
+# exits non-zero when a case fails (jvm-94).
 import os, sys
 import binaryninja as b
 
@@ -42,3 +43,5 @@ for build in BUILDS:
         print("FAIL %-9s %-17s no such function" % (build, name))
     v.file.close()
 print("RESULT", "FAIL %d" % failed if failed else "PASS")
+if failed:
+    raise SystemExit("%d case(s) failed" % failed)

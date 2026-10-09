@@ -2,7 +2,8 @@
 #   bnrun --parallel --timeout 300 tests/bn_anon_check.py      (prepend DEV_PKG = "jvm_devN" for a dev load)
 # jvm-66 / jvm-69: anonymous classes printed at their new in the class view (tests/synthetic/, jvmtest.Anon,
 # built by tests/synthetic/build.sh). The class text must contain every expected snippet and none of the
-# forbidden ones; javac 21 drops an unused this$0, javac 8 keeps it. Prints PASS / FAIL per build.
+# forbidden ones; javac 21 drops an unused this$0, javac 8 keeps it. Prints PASS / FAIL per build and
+# exits non-zero when one fails (jvm-94: a raise reaches bnrun as ok=false -> exit 1, stdout kept).
 import os, sys
 import binaryninja as b
 
@@ -35,3 +36,5 @@ for build in BUILDS:
     else:
         print("PASS %s" % build)
 print("failed: %d" % failed)
+if failed:
+    raise SystemExit("%d build(s) failed" % failed)

@@ -1,6 +1,8 @@
 #!/bin/bash
 # Pseudo Java vs HLIL check (tests/bn_pseudo_java_compare.py) on every mdg method with an exception table:
 # 108 classes in 4 parallel bnrun batches (~20-30 min). Prints the four TOTAL lines and every problem.
+# Exits non-zero unless every batch reported ok == with_table (a missing TOTAL line means the batch died;
+# a method without HLIL counts as a problem since jvm-95).
 #   tests/bn_pseudo_java_compare_all.sh [DEV_PKG]     (no argument: the installed plugin)
 set -e
 REPO=/Users/patrick/dev/binary-jvm
@@ -22,4 +24,17 @@ for i in 0 1 2 3; do
 done
 wait
 grep -h "TOTAL" "$OUT"/result_*.txt
-grep -hv "^####\|TOTAL\|^   JAVA" "$OUT"/result_*.txt || true
+grep -hv "^####\|TOTAL\|^   JAVA\|^Traceback\|^  File\|^SystemExit" "$OUT"/result_*.txt || true
+status=0
+for i in 0 1 2 3; do
+  totals=$(grep -h "^TOTAL" "$OUT/result_$i.txt" || true)
+  if [ -z "$totals" ]; then
+    echo "gate: batch $i produced no TOTAL line (script died?)"; status=1; continue
+  fi
+  ok=$(printf "%s" "$totals" | sed -n "s/.*'ok': \([0-9][0-9]*\).*/\1/p")
+  with_table=$(printf "%s" "$totals" | sed -n "s/.*'with_table': \([0-9][0-9]*\).*/\1/p")
+  if [ "$ok" != "$with_table" ]; then
+    echo "gate: batch $i ok=$ok with_table=$with_table"; status=1
+  fi
+done
+exit $status

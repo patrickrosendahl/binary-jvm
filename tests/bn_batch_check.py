@@ -3,6 +3,7 @@
 # bnrun scripts cannot be interrupted -- keep LIMIT small (default 20 classes).
 # For each .class: create the dev JVM view, analyze, and report functions whose stack pointer becomes
 # undetermined or whose HLIL fails (set CHECK_LLIL = True to also scan LLIL for `unimplemented`).
+# Exits non-zero when any fail/unimpl/sp/hlil entry was collected (jvm-94).
 import os, time
 import binaryninja as b
 CLASS_DIR = globals().get("CLASS_DIR", "/Users/patrick/dev/binary-jvm/sample/ActiveTraderDE_app/Contents/WorkingDir/current/lib/mdg")
@@ -38,3 +39,6 @@ print("classes %d, functions %d, %.1fs total" % (stats["classes"], stats["functi
 for k in ("fail", "unimpl", "sp", "hlil"):
     print(k, len(stats[k]))
     for x in stats[k][:15]: print("   ", x)
+bad = {k: stats[k] for k in ("fail", "unimpl", "sp", "hlil") if stats[k]}
+if bad:
+    raise SystemExit("check failures: " + ", ".join("%s=%d" % (k, len(v)) for k, v in bad.items()))
