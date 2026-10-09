@@ -91,7 +91,7 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
    **Pseudo Java gates** (after any `pseudo_java.py` change; wiki `vineflower-comparison.md`):
    `python3 tests/vineflower_compare.py --decompile` (once: Vineflower, the decompiler Recaf uses, local fork),
  `tests/bn_dump_all.sh pj [jvm_devN]` (4 parallel batches, ~3 min; jvm-74), then
- `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=1 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0 ref_zero=0 double_casts=0 type_mismatch=0 if_else_assign=0 stmts=2016`
+ `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=1 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0 ref_zero=0 double_casts=0 type_mismatch=0 if_else_assign=0 stmts=2014`
  (exit 1 on a regression; `stmts` is the statement count, lower it as tickets land; `--excess N` lists where the
  extra statements against Vineflower come from); and `tests/bn_pseudo_java_compare_all.sh [jvm_devN]` (~18-25 min):
  every mdg method with an exception table against HLIL -- must stay 251/251 (~15 min on an idle machine); the
