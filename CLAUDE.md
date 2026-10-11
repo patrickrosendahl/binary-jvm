@@ -60,19 +60,18 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
   (`architecture.py`, `binaryview.py`, `types.py`, `function.py` are the relevant ones).
 - **User plugin directory:** `~/Library/Application Support/Binary Ninja/plugins/`
 
-## Binary Ninja MCP + the skill
+## Binary Ninja + the skill
 
-- The **`binaryninja-mcp` skill is installed globally** (`~/.claude/skills/binaryninja-mcp`),
-  so it is available to you automatically — invoke it for any BN work. It covers the `bn_*`
-  MCP tools, the `bnrun` full-API script bridge, the shared usage lock across sessions, and
-  the Personal-license workarounds.
-- Typical loop: load a `.class` in the GUI → `bn_binary_view_list` → `bn_binary_view_set_active`
-  → inspect with `bn_function_list` / `bn_function_disassembly` / `bn_function_il` /
-  `bn_string_list` / `bn_symbol_list`. For anything the `bn_*` tools don't cover (defining
-  types, registering architectures, poking the view during `init`), use the `bnrun` bridge for
-  the full Python API inside the app.
-- ⚠️ A view type registered after startup (dev loads) is **not** picked by `bn.load()` or MCP
-  `bn_open_item_open` (Raw / a GUI dialog instead) — create it explicitly with
+- BN work goes through the **`bnrun` script bridge** (the `binaryninja-bridge` skill —
+  install a `.claude/skills/binaryninja-bridge/` symlink into `~/dev/bn-script-bridge/skills/`
+  per project; there are no `bn_*` MCP tools any more). It covers the full Python API
+  inside the running app, the shared usage lock across sessions, and the
+  Personal-license workarounds.
+- Typical loop: load a `.class` in the GUI, pick the view (`--view <name>`), then inspect
+  with one-liners (`bv.functions`, `fn.hlil`, `bv.strings`, `bv.get_symbols()`) — the
+  skill's Common recipes cover all of it.
+- ⚠️ A view type registered after startup (dev loads) is **not** picked by `bn.load()`
+  (Raw / a GUI dialog instead) — create it explicitly with
   `BinaryViewType[name].create(BinaryView.open(path))`. Such views are not UI tabs.
 - **File > Load Whole JAR...** unpacks `foo.jar` to `foo/` beside it and asks which classes to open
   (jvm-13; filter + multi-select, inner classes hidden by default, jvm-76). `Main-Class` from the manifest
