@@ -13,13 +13,17 @@ edges inside methods (jvm-42), a Pseudo Java language representation (jvm-43/44)
 a second gate (jvm-77, `tests/vineflower_suite.py`), try-with-resources (jvm-78), nested conditions / condition graphs
 (jvm-80), synchronized + loop-condition shapes (jvm-82, partly), finally inside loops (jvm-85). Suite 7241 -> 6417
 statements (Vineflower 5680). 2026-10-09: jvm-79 (lambdas), jvm-44 rest (assert, access$, enum/String switches), jvm-87
-(unreachable handlers, not a bug) -> 6139 statements; follow-ups jvm-91..94. Open, in this order: jvm-86, jvm-84 (multi-catch),
+(unreachable handlers, not a bug) -> 6139 statements; follow-ups jvm-91..94. jvm-86 (finally copies with own locals) and
+jvm-84 (multi-catch `catch (A | B e)`) done -> 6097. Open, in this order:
 jvm-82 rest (sync blocks split by exception/loop edges, TestChainedCFG), jvm-81, jvm-83, jvm-88..90
 (remaining finally shapes). jvm-15 waits for Patrick's GUI
 click-through (needs a BN restart to load jarload.py). jvm-68 still waits on binary-cpp. Use a dev load for live tests.
 
-**Project tracking:** tickets live in minitick project **`jvm`** (`jvm-N`; CLI
-`/Users/patrick/dev/minitick/.venv/bin/minitick … -p jvm`), documentation in miniwiki project
+**Project tracking:** tickets live in minitick project **`jvm`** (`jvm-N`) — use the **minitick MCP
+tools** (`ticket` / `tickets` / `update` / `create` at `http://127.0.0.1:8000/mcp/`, registered
+user-scope; `update("jvm-N", {fields}, comment=…)` resolves with its verification comment in one
+call) instead of the CLI (`/Users/patrick/dev/minitick/.venv/bin/minitick … -p jvm`, fallback) —
+documentation in miniwiki project
 **`jvm`** (`miniwiki tree jvm`; `tickets/` there is a read-only mirror of minitick). There is no
 code reviewer: finished tickets go straight to **RESOLVED** with a verification comment. The
 project skill **`skills/jvm/SKILL.md`** summarises the workflow and gotchas — load it. `.claude/` is git-ignored;

@@ -93,6 +93,15 @@ check("groups two catches + finally", pj.group_try_entries(
     [[0, 10, 12, "A"], [0, 10, 20, "B"], [0, 11, 30, ""], [12, 18, 30, ""], [20, 26, 30, ""], [30, 32, 30, ""]]),
     [(0, 11, [(12, "A"), (20, "B"), (30, "")])])
 check("groups self-covering only", pj.group_try_entries([[5, 9, 12, ""], [12, 15, 12, ""]]), [(5, 9, [(12, "")])])
+# javac's catch (A | B e): one handler pc, one entry per type (jvm-84)
+check("groups one handler two types", pj.group_try_entries([[0, 10, 12, "a/A"], [0, 10, 12, "b/B"]]),
+      [(0, 10, [(12, ("a/A", "b/B"))])])
+check("groups multi-type catch + finally", pj.group_try_entries(
+    [[0, 10, 12, "a/A"], [0, 10, 12, "b/B"], [0, 11, 30, ""], [12, 18, 30, ""], [30, 32, 30, ""]]),
+    [(0, 11, [(12, ("a/A", "b/B")), (30, "")])])
+check("catch type str", (pj.catch_type_str("java/io/IOException"),
+                         pj.catch_type_str(("java/net/URISyntaxException", "java/io/IOException"))),
+      ("IOException", "URISyntaxException | IOException"))
 # statements at pcs 0, 3, 8, 12 (outside), 20 (handler)
 pcs = [[0], [3], [8], [12], [20]]
 check("runs outer", pj.try_runs(pcs, groups), [(0, 2, groups[0])])

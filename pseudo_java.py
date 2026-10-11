@@ -128,6 +128,14 @@ def java_class_name(internal, simple=None):
     return name
 
 
+def catch_type_str(types):
+    """a catch clause's type as printed: `IOException`, or `IOException | ArithmeticException`
+    for the multi-catch handlers javac emits one exception-table handler pc for (jvm-84)."""
+    if isinstance(types, tuple):
+        return " | ".join(java_class_name(t) for t in types)
+    return java_class_name(types)
+
+
 def parse_field_type(desc, i=0, simple=None):
     """Parse one field descriptor at desc[i]: returns (java type name, index after it)."""
     dims = 0
@@ -801,19 +809,28 @@ def group_try_entries(table):
         the last end
       * typed handlers sharing the same ranges are the clauses of one try; a catch-all without a range before
         its own code (javac's self-covering entry) is not a try of its own.
+      * one handler pc with several exception-table types is javac's catch (A | B e): the clause keeps
+        them all (a tuple) and prints `catch (A | B e)` (jvm-84).
     """
-    by_handler = {}  # handler pc -> [type, [(start, end), ...]]
+    by_handler = {}  # handler pc -> ([catch types...], [(start, end), ...])
     order = []
     for start, end, handler, ctype in table:
         if handler not in by_handler:
-            by_handler[handler] = [ctype, []]
+            by_handler[handler] = [[], []]
             order.append(handler)
+        if ctype and ctype not in by_handler[handler][0]:  # multi-catch: several types, one pc
+            by_handler[handler][0].append(ctype)
         by_handler[handler][1].append((start, end))
+
+    def clause_type(h):
+        types = by_handler[h][0]
+        return tuple(types) if len(types) > 1 else (types[0] if types else "")
+
     groups = []
     used = set()
     for f in order:
-        ctype, ranges = by_handler[f]
-        if ctype:
+        types, ranges = by_handler[f]
+        if any(types):  # a typed handler; catch-alls ("" only) are the finally candidates
             continue
         used.add(f)
         prim = [r for r in ranges if r[0] < f]
@@ -831,13 +848,13 @@ def group_try_entries(table):
         limit = min(catches + [f])
         prim = [r for r in prim if r[0] < limit] or prim
         used.update(catches)
-        groups.append((s0, max(r[1] for r in prim), [(h, by_handler[h][0]) for h in catches] + [(f, "")]))
+        groups.append((s0, max(r[1] for r in prim), [(h, clause_type(h)) for h in catches] + [(f, "")]))
     rest = {}
     for h in order:
         if h in used:
             continue
         t, hr = by_handler[h]
-        rest.setdefault(tuple(sorted(hr)), []).append((h, t))
+        rest.setdefault(tuple(sorted(hr)), []).append((h, clause_type(h)))
     for hr, handlers in rest.items():
         groups.append((min(r[0] for r in hr), max(r[1] for r in hr), handlers))
     groups.sort(key=lambda g: (g[0], -g[1]))
@@ -1595,9 +1612,21 @@ if _HAVE_BN:
             return False
 
         def is_type_test(self, e):
-            return e.operation == Op.HLIL_INTRINSIC and e.intrinsic.name in ("instanceof", "__instanceof") and \
-                e.params and self.is_exc_value(e.params[0]) and self.mentions_exc(e.params[0]) and \
-                not self.user_instanceof(e)
+            """a handler's dispatch test on the caught exception: `instanceof(exc, T)`, or the
+            bitwise-or of such tests the lifter emits for a multi-catch handler (jvm-84)"""
+            return self.type_test_parts(e, frozenset())
+
+        def type_test_parts(self, e, known_vars):
+            """is_type_test, plus operands `known_vars` already hold type tests for (so an OR
+            over type-test temps counts too)"""
+            if e.operation == Op.HLIL_INTRINSIC and e.intrinsic.name in ("instanceof", "__instanceof") and \
+                    e.params and self.is_exc_value(e.params[0]) and self.mentions_exc(e.params[0]) and \
+                    not self.user_instanceof(e):
+                return True
+            if e.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and e.var in known_vars:
+                return True
+            return e.operation == Op.HLIL_OR and e.size != 0 and len(e.operands) == 2 and \
+                all(self.type_test_parts(o, known_vars) for o in e.operands)
 
         def user_instanceof(self, e):
             """an instanceof the method's code does itself (`if (e instanceof T)` in a catch body, on the caught
@@ -1609,7 +1638,9 @@ if _HAVE_BN:
                 return False
 
         def type_temps(self):
-            """variables BN parks a handler's type test in: `temp0 = instanceof(exc, T)`"""
+            """variables BN parks a handler's type test in: `temp0 = instanceof(exc, T)`, or the
+            or-joined pair of them for a multi-catch handler (a fixpoint: an OR counts once its
+            operands are known)"""
             if getattr(self, "_type_temps", None) is None:
                 self._type_temps = set()
                 cands = {}
@@ -1619,7 +1650,15 @@ if _HAVE_BN:
                             cands.setdefault(i.dest, []).append(i.src)
                         elif i.operation == Op.HLIL_ASSIGN and i.dest.operation == Op.HLIL_VAR:
                             cands.setdefault(i.dest.var, []).append(i.src)
-                    self._type_temps = {v for v, srcs in cands.items() if all(self.is_type_test(x) for x in srcs)}
+                    known = set()
+                    grew = True
+                    while grew:  # temp0 = instanceof(...); temp1 = instanceof(...); temp2 = temp0 | temp1
+                        grew = False
+                        for v, srcs in cands.items():
+                            if v not in known and all(self.type_test_parts(x, known) for x in srcs):
+                                known.add(v)
+                                grew = True
+                    self._type_temps = known
                 except Exception:
                     pass
             return self._type_temps
@@ -1726,8 +1765,7 @@ if _HAVE_BN:
                                                 (left.operation == Op.HLIL_INTRINSIC and
                                                  left.intrinsic.name == "__exception")):
                     kind, exc_true = 'exc', ne  # `__exception() != 0` directly in the condition
-                elif self.is_type_test(left) or (left.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and
-                                                 left.var in self.type_temps()):
+                elif self.type_test_parts(left, self.type_temps()):
                     kind, exc_true = 'type', not ne  # instanceof(...) == 0: true branch = other types
                 else:
                     return None
@@ -2473,7 +2511,7 @@ if _HAVE_BN:
                     off += d[2]
                 if throws:
                     continue
-                clauses = ", ".join("%s at pc %#x" % ("catch (%s)" % java_class_name(t) if t else "finally", h)
+                clauses = ", ".join("%s at pc %#x" % ("catch (%s)" % catch_type_str(t) if t else "finally", h)
                                     for h, t in handlers)
                 notes.append("// unreachable: %s -- nothing in the try range pc %#x..%#x can throw"
                              % (clauses, lo, hi))
@@ -4087,7 +4125,7 @@ if _HAVE_BN:
                         tokens.scope_separator()
                     ctype = self.handler_types.get(h, "")
                     self.note(tokens, "// exception handler (%s) at pc %#x:" %
-                              ("catch " + java_class_name(ctype) if ctype else "finally", h))
+                              ("catch " + catch_type_str(ctype) if ctype else "finally", h))
                     tokens.new_line()
                     need_separator = False
                     break
@@ -4325,7 +4363,7 @@ if _HAVE_BN:
                 h = cls[1]
                 ctype = self.handler_types.get(h, "")
                 self.note(tokens, "/* on exception -> handler (%s) at pc %#x */" %
-                          ("catch " + java_class_name(ctype) if ctype else "finally", h))
+                          ("catch " + catch_type_str(ctype) if ctype else "finally", h))
                 region = self.handler_region(h)
                 items = self.flatten(region)
                 self.consume(region, items)
@@ -5160,7 +5198,7 @@ if _HAVE_BN:
         def catch_header(self, word, ctype, var, tokens):
             self.kw(tokens, word + " ")
             tokens.append_open_paren()
-            self.type_tok(tokens, java_class_name(ctype))
+            self.type_tok(tokens, catch_type_str(ctype))
             self.txt(tokens, " ")
             name = self.display_name(var) if var is not None else "e"
             if var is not None:
@@ -5744,7 +5782,7 @@ if _HAVE_BN:
             found = []
             for start, end, handlers in self.try_groups:
                 if start <= pc < end:
-                    found += [java_class_name(t) if t else "finally" for _, t in handlers]
+                    found += [catch_type_str(t) if t else "finally" for _, t in handlers]
             return " " + " / ".join(found) if found else ""
 
         def handler_hint(self, hpc):

@@ -13,9 +13,11 @@ Generic Binary Ninja mechanics (MCP tools, `bnrun` bridge, usage lock) are in th
 ## Where things live
 - **Code**: repo root = plugin package (`__init__.py`, `constants.py`, `opcodes.py` (pure Python),
   `classfile.py`, `lifter.py`, `arch.py`, `view.py`). Layout + environment: `CLAUDE.md`.
-- **Roadmap**: `README.md`. **Tickets**: minitick project `jvm` (`jvm-N`), CLI
-  `/Users/patrick/dev/minitick/.venv/bin/minitick … -p jvm`. Finished work goes straight to
-  `RESOLVED` with a verification comment — there is no code reviewer.
+- **Roadmap**: `README.md`. **Tickets**: minitick project `jvm` (`jvm-N`) — prefer the
+  **minitick MCP tools** (`ticket` / `tickets` / `update` / `create`; one `update` call sets
+  fields *and* appends the verification comment; refs like `jvm-84` name the project); CLI
+  `/Users/patrick/dev/minitick/.venv/bin/minitick … -p jvm` as fallback. Finished work goes
+  straight to `RESOLVED` with a verification comment — there is no code reviewer.
 - **Wiki**: miniwiki project `jvm` (`miniwiki tree jvm`): `index`, `plugin-architecture`, `lifting`,
   `testing`, `classfile`, `opcodes/…`, `environment`, `references`. `tickets/` is a read-only mirror
   of minitick — never write there.
