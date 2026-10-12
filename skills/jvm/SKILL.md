@@ -7,8 +7,8 @@ description: Project skill for the binary-jvm Binary Ninja plugin (Java .class A
 
 **Resumed 2026-10-06** (after a short pause, jvm-28) — plugin installed; current work: jvm-32/33/35/41–44.
 
-Generic Binary Ninja mechanics (MCP tools, `bnrun` bridge, usage lock) are in the global
-`binaryninja-mcp` skill — load it for any BN work. This skill is the project layer on top.
+Generic Binary Ninja mechanics (`bnrun` bridge, bundled scripts, usage lock) are in the global
+`binaryninja-bridge` skill — load it for any BN work. This skill is the project layer on top.
 
 ## Where things live
 - **Code**: repo root = plugin package (`__init__.py`, `constants.py`, `opcodes.py` (pure Python),
@@ -34,7 +34,7 @@ cd <dir with the jar> && unzip -o -q mdg.jar -d mdg      # -> mdg/com/is_teledat
 Then open the individual `X.class`. Opening a `.class` also needs
 `files.container.excludedTransforms = ["Universal"]`, because BN's
 Mach-O/Universal handling claims the shared `0xCAFEBABE` magic (jvm-39); BN may still make the
-Universal view active — switch to "JVM Class" (GUI: view dropdown; MCP: `bn_binary_view_set_active`).
+Universal view active — switch to "JVM Class" (GUI: view dropdown; bridge: `--view`).
 `tests/offline_lift_check.py --all` skips such `foo/` dirs (their classes are checked via the jar).
 
 ## Test loop (fast → slow)
@@ -54,7 +54,7 @@ Universal view active — switch to "JVM Class" (GUI: view dropdown; MCP: `bn_bi
 3. Real install (**installed**): symlink the
    repo as `plugins/binary-jvm` and set the Universal exclusion; after changing
    the plugin, restart BN with `/Users/patrick/dev/bn-script-bridge/bnrestart` (saves modified
-   views, reopens files, waits for the bridge) — with the user's OK; see the binaryninja-mcp skill.
+   views, reopens files, waits for the bridge) — with the user's OK; see the binaryninja-bridge skill.
 
 ## Gotchas (learned the hard way)
 - **bnrun lanes:** serialized by default (one at a time), `--parallel` for own-view scripts (up to 4
@@ -62,7 +62,7 @@ Universal view active — switch to "JVM Class" (GUI: view dropdown; MCP: `bn_bi
   `bnrun --cancel` (Ctrl-C on the client also cancels), check with `bnrun --status`. A long native
   call (`update_analysis_and_wait()`) can't be cut short, so keep live batches to a few classes and
   put long runs in background subagents.
-- `bn.load()` / MCP `bn_open_item_open` pick Raw (or pop a dialog in the GUI) for a view type
+- `bn.load()` picks Raw (or pops a dialog in the GUI) for a view type
   registered after startup — use `BinaryViewType[name].create(BinaryView.open(path))`.
 - Views created through the bridge are in-process, **not UI tabs**; open in the GUI for visual checks.
 - BN does not track a `pop` inside an `if` condition → always pop into an LLIL temp first.
