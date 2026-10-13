@@ -1869,6 +1869,8 @@ if _HAVE_BN:
                     self.branch_class(s.branch, s.address - self.function.start)[0] not in ('hide', 'rethrow')]
             if not stmts and not excs:
                 return ('hide',)
+            if self.monitor_handlers and self.cleanup_then_placed(xb):
+                return ('hide',)
             if len(stmts) == 1 and not excs and stmts[0].operation in (Op.HLIL_GOTO, Op.HLIL_BREAK, Op.HLIL_CONTINUE):
                 # a jump to the handler: hidden when that handler is printed as a catch or is javac's
                 # synchronized cleanup
@@ -1889,6 +1891,22 @@ if _HAVE_BN:
                 if self.finally_printed() and not any(i.operation == Op.HLIL_RET for c in cleanup for i in _walk(c)):
                     return ('rethrow', cleanup)  # a finally's rethrow path with branches: the finally prints it
             return ('code',)
+
+        def cleanup_then_placed(self, xb):
+            """xb is javac's synchronized cleanup (monitorexit; rethrow) running on into the code of a handler
+            printed as a catch: the exception goes to that catch, nothing to show here (jvm-82)"""
+            cleanup = False
+            for s in self.flatten(self.stmts_of(xb)):
+                if isinstance(s, _ExcBranch):
+                    return False
+                if self.in_monitor_code(s):
+                    cleanup = True
+                    continue
+                if self.is_exc_plumbing(s) or s.operation in (Op.HLIL_NOP, Op.HLIL_VAR_DECLARE):
+                    continue
+                return cleanup and s.operation == Op.HLIL_LABEL and \
+                    self.handler_of_label(s.target) in self.placed_handlers
+            return False
 
         def is_rethrow(self, s):
             """__propagate(exc) / __propagate(caught exception variable)"""
@@ -3137,10 +3155,15 @@ if _HAVE_BN:
                     lr = [x for x in li if not self.hidden_item(x)]
                     if not m and self.monitor_exits(li, lock) == 0 and lr and self.never_falls(lr[-1]):
                         # `if (c) { throw ..; }` inside the block: the cleanup handler releases the lock (jvm-82)
-                        return ('branch', j, leave_true, li, ri, rr[0], rest, pre)
+                        return ('branch', j, leave_true, li, ri, rr[0], rest, pre, False)
+                    if len(m) == 1 and self.monitor_exits(li, lock) == 1 and \
+                            not [x for x in li[m[0] + 1:] if not self.hidden_item(x)] and rr[1:]:
+                        # `if (c) { X; exit; } else { exit; T }`: leaving skips T -> a labeled block left by
+                        # `break` (javac's layout of a labeled break out of a synchronized block, jvm-82)
+                        return ('branch', j, leave_true, li, ri, rr[0], rest, pre, True)
                     if len(m) != 1 or self.monitor_exits(li, lock) != 1 or not self.exit_leaves(li[m[0] + 1:]):
                         continue
-                    return ('branch', j, leave_true, li, ri, rr[0], rest, pre)
+                    return ('branch', j, leave_true, li, ri, rr[0], rest, pre, False)
             shape = self.if_goto_shape(body, j, plan)
             if shape is not None and shape[0] == 'split':
                 tail = shape[3]
@@ -3153,6 +3176,11 @@ if _HAVE_BN:
         def emit_sync_split(self, body, k, shape, lock, value, plan, tokens, settings, block):
             j = shape[1]
             s = body[j]
+            label = None
+            if shape[0] == 'branch' and shape[8]:
+                label = "label%d" % (body[k].address - self.function.start)
+                self.txt(tokens, label + ":")
+                tokens.begin_scope(ScopeType.BlockScopeType)
             self.kw(tokens, "synchronized ")
             tokens.append_open_paren()
             if value is not None:
@@ -3168,7 +3196,7 @@ if _HAVE_BN:
                     self.emit_range(body, k + 1, j - 1, plan, tokens, settings, block)
                     tokens.scope_separator()
                 if shape[0] == 'branch':
-                    _, _, leave_true, li, ri, release, rest_blk, pre = shape
+                    _, _, leave_true, li, ri, release, rest_blk, pre, _ = shape
                     self.kw(tokens, "if ")
                     tokens.append_open_paren()
                     if leave_true:
@@ -3178,6 +3206,11 @@ if _HAVE_BN:
                     tokens.append_close_paren()
                     tokens.begin_scope(ScopeType.BlockScopeType)
                     self.emit_list(li, tokens, settings, s.true if leave_true else s.false)
+                    if label is not None:
+                        self.kw(tokens, "break ")
+                        self.txt(tokens, label)
+                        tokens.append_semicolon()
+                        tokens.new_line()
                     tokens.end_scope(ScopeType.BlockScopeType)
                     tokens.finalize_scope()
                     tokens.new_line()
@@ -3199,7 +3232,11 @@ if _HAVE_BN:
                 tokens.scope_separator()
                 # at the method's end it is the method's end: a final `return;` is dropped there too
                 self.emit_list(after, tokens, settings, after_blk,
-                               is_root=bool(plan.get("root")) and self.rest_hidden(body, j, plan))
+                               is_root=label is None and bool(plan.get("root")) and self.rest_hidden(body, j, plan))
+            if label is not None:
+                tokens.end_scope(ScopeType.BlockScopeType)
+                tokens.finalize_scope()
+                tokens.new_line()
 
         def hidden_item(self, s):
             """a flattened item that prints nothing"""
