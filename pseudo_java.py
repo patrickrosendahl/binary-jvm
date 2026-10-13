@@ -3130,6 +3130,10 @@ if _HAVE_BN:
             if j is None:
                 return None
             s = body[j]
+            if not any(a <= j and b >= k for a, b, _ in run_at.values()):
+                lp = self.sync_loop_shape(body, k, j, lock)
+                if lp is not None:
+                    return lp
             if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_IF or \
                     self.block_exits(lock, body[k]) != self.monitor_exits([s], lock) or \
                     any(a <= j and b >= k for a, b, _ in run_at.values()) or \
@@ -3173,6 +3177,54 @@ if _HAVE_BN:
                     return ('goto', j, shape, tail, tr[0])
             return None
 
+        def sync_loop_shape(self, body, k, j, lock):
+            """('loop'): `enter; S; L: if (c) { pre; exit; T } else { B; goto L; }` -- a loop javac put at the
+            block's start, HLIL rebuilt with a goto back to L -> synchronized { S; while (!c) { B } pre } T (jvm-82)"""
+            s = body[j]
+            if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_IF or s.false is None or \
+                    s.false.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
+                return None
+            q = j - 1
+            while q > k and self.hidden_item(body[q]):
+                q -= 1
+            lab = body[q]
+            if q <= k or isinstance(lab, _ExcBranch) or lab.operation != Op.HLIL_LABEL:
+                return None
+            lid = lab.target.label_id
+            if self.label_uses(lid) != 1 or self.monitor_exits(body[k + 1:q], lock):
+                return None
+            # the block's releases (up to the next monitorenter of the lock, jvm-82) are all in the if
+            addr = body[k].address
+            nxt = min((i.address for i in _walk(self.hlil.root)
+                       if self.monitor_var(i, "monitorenter") == lock and i.address > addr), default=None)
+            mine = [i for i in _walk(s) if self.monitor_var(i, "monitorexit") == lock and
+                    not self.in_monitor_code(i) and (nxt is None or i.address < nxt)]
+            if len(mine) != 1 or self.block_exits(lock, body[k]) != 1:
+                return None
+            for leave, loop_b, leave_true in ((s.true, s.false, True), (s.false, s.true, False)):
+                li, bi = self.flatten(self.stmts_of(leave)), self.flatten(self.stmts_of(loop_b))
+                br = [x for x in bi if not self.hidden_item(x)]
+                if not br or isinstance(br[-1], _ExcBranch) or br[-1].operation != Op.HLIL_GOTO or \
+                        br[-1].target.label_id != lid:
+                    continue
+                if any(isinstance(x, _ExcBranch) or
+                       any(i.operation in (Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_RET, Op.HLIL_GOTO, Op.HLIL_LABEL)
+                           or self.monitor_var(i, "monitorenter") == lock or self.monitor_var(i, "monitorexit") == lock
+                           for i in _walk(x))
+                       for x in br[:-1]):
+                    continue  # (B moves into a loop of its own: no jumps, no lock operations)
+                rel = [m for m, x in enumerate(li) if not isinstance(x, _ExcBranch) and
+                       x.expr_index == mine[0].expr_index]
+                if len(rel) != 1:
+                    continue
+                pre = li[:rel[0]]
+                if any(isinstance(x, _ExcBranch) or x.operation in COMPOUND or
+                       x.operation in (Op.HLIL_RET, Op.HLIL_GOTO, Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_LABEL)
+                       for x in pre if not self.hidden_item(x)):
+                    continue
+                return ('loop', j, leave_true, q, bi, br[-1], pre, li[rel[0]:], li[rel[0]], leave, loop_b)
+            return None
+
         def emit_sync_split(self, body, k, shape, lock, value, plan, tokens, settings, block):
             j = shape[1]
             s = body[j]
@@ -3191,11 +3243,30 @@ if _HAVE_BN:
             tokens.begin_scope(ScopeType.BlockScopeType)
             self.active_syncs.append(lock)
             try:
-                if [m for m in range(k + 1, j) if not self.hidden_item(body[m]) and
+                head_end = shape[3] - 1 if shape[0] == 'loop' else j - 1  # (a loop's label is not printed)
+                if [m for m in range(k + 1, head_end + 1) if not self.hidden_item(body[m]) and
                         m not in plan.get("folded", ()) and m not in plan.get("done", ())]:
-                    self.emit_range(body, k + 1, j - 1, plan, tokens, settings, block)
+                    self.emit_range(body, k + 1, head_end, plan, tokens, settings, block)
                     tokens.scope_separator()
-                if shape[0] == 'branch':
+                if shape[0] == 'loop':
+                    _, _, leave_true, _, bi, goto, pre, after, release, after_blk, loop_blk = shape
+                    self.kw(tokens, "while ")
+                    tokens.append_open_paren()
+                    if leave_true:
+                        self.emit_negated(s.condition, tokens, settings)
+                    else:
+                        self.expr(s.condition, tokens, settings)
+                    tokens.append_close_paren()
+                    tokens.begin_scope(ScopeType.BlockScopeType)
+                    self.consumed.add(goto.expr_index)  # the jump back is the loop's
+                    self.emit_list(bi, tokens, settings, loop_blk)
+                    tokens.end_scope(ScopeType.BlockScopeType)
+                    tokens.finalize_scope()
+                    tokens.new_line()
+                    if [x for x in pre if not self.hidden_item(x)]:
+                        tokens.scope_separator()
+                        self.emit_list(pre, tokens, settings, after_blk)
+                elif shape[0] == 'branch':
                     _, _, leave_true, li, ri, release, rest_blk, pre, _ = shape
                     self.kw(tokens, "if ")
                     tokens.append_open_paren()
@@ -3228,6 +3299,11 @@ if _HAVE_BN:
             tokens.finalize_scope()
             tokens.new_line()
             self.consumed.add(release.expr_index)  # the release is the block's end
+            real_after = [x for x in after if not self.hidden_item(x)]
+            if label is None and plan.get("list_kind") == 'loop' and real_after and \
+                    not isinstance(real_after[-1], _ExcBranch) and real_after[-1].operation == Op.HLIL_CONTINUE and \
+                    self.rest_hidden(body, j, plan):
+                self.consumed.add(real_after[-1].expr_index)  # ends the loop body: the loop's implicit continue
             if [x for x in after if not self.hidden_item(x)]:
                 tokens.scope_separator()
                 # at the method's end it is the method's end: a final `return;` is dropped there too
