@@ -28,7 +28,7 @@ documentation in miniwiki project
 code reviewer: finished tickets go straight to **RESOLVED** with a verification comment. The
 project skill **`skills/jvm/SKILL.md`** summarises the workflow and gotchas — load it. `.claude/` is git-ignored;
 Claude Code finds the skills through local symlinks, so after a fresh clone run
-`mkdir -p .claude/skills && cd .claude/skills && ln -s ../../skills/jvm && ln -s ../../../bn-script-bridge/skills/binaryninja-bridge && ln -s ../../../binary-cpp/skills/cpp`
+`mkdir -p .claude/skills && cd .claude/skills && ln -s ../../skills/jvm && ln -s ../../../bn-script-bridge/skills/binaryninja-bridge && ln -s ../../../binary-cpp/skills/bncpp`
 (the sister repos sit beside this one under `~/dev`; there is no global bridge skill).
 
 ## What this is
