@@ -1445,9 +1445,10 @@ if _HAVE_BN:
                         self.param_codes[v] = slots[slot][1]
                         self.param_types[v] = arg_types[slots[slot][0]]
             self.table = self.info.exception_table(func)
-            # javac's synchronized-block cleanup handlers (catch-any doing monitorexit) are not try/finally
-            self.try_groups = [g for g in group_try_entries(self.table)
-                               if not all(not t and self.is_monitor_cleanup(h) for h, t in g[2])]
+            # javac's synchronized-block cleanup handlers (catch-any doing monitorexit) are not try/finally; left
+            # out before grouping, or they join a catch inside the block as an empty finally (jvm-82)
+            self.try_groups = group_try_entries([e for e in self.table
+                                                 if e[3] or not self.is_monitor_cleanup(e[2])])
             self.handler_types = {}
             for g in self.try_groups:
                 for h, t in g[2]:
@@ -3010,10 +3011,11 @@ if _HAVE_BN:
             return None
 
         def monitor_exits(self, roots, lock):
-            """monitorexit(lock) statements below roots that are not javac's cleanup-handler code"""
+            """monitorexit(lock) statements below roots that are not javac's cleanup-handler code; an _ExcBranch
+            counts its exceptional branch only, its normal path is flattened in line (jvm-82)"""
             n = 0
             for r in roots:
-                for i in _walk(r.instr if isinstance(r, _ExcBranch) else r):
+                for i in _walk(r.branch if isinstance(r, _ExcBranch) else r):
                     if self.monitor_var(i, "monitorexit") == lock and not self.in_monitor_code(i):
                         n += 1
             return n

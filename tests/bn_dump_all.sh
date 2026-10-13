@@ -6,6 +6,7 @@
 # suite: Pseudo Java of Vineflower's Java 8 test classes (after tests/vineflower_suite.py prep; jvm-77), into
 # .scratch/vfsuite/pj; then python3 tests/vineflower_suite.py compare
 set -e
+JOBS=${JOBS:-4}   # parallel bnrun batches; above 4 needs scriptbridge.maxParallel >= JOBS
 REPO=/Users/patrick/dev/binary-jvm
 SUITE=$REPO/.scratch/vfsuite
 SETTINGS=""
@@ -19,8 +20,9 @@ case "$1" in
 esac
 OUT=$REPO/.scratch/dump_all_$1
 mkdir -p "$OUT"
+rm -f "$OUT"/batch_*.txt "$OUT"/run_*.py "$OUT"/result_*.txt
 rm -rf "$DUMP"
-python3 - "$OUT" "$1" <<'PY'
+python3 - "$OUT" "$1" "$JOBS" <<'PY'
 import sys
 sys.path.insert(0, "/Users/patrick/dev/binary-jvm/tests")
 import vineflower_compare
@@ -28,10 +30,11 @@ if sys.argv[2] == "suite":
     classes = open("/Users/patrick/dev/binary-jvm/.scratch/vfsuite/tests.txt").read().split()
 else:
     classes = vineflower_compare.DEFAULT_CLASSES
-for i in range(4):
-    open("%s/batch_%d.txt" % (sys.argv[1], i), "w").write("\n".join(classes[i::4]) + "\n")
+n = int(sys.argv[-1])
+for i in range(n):
+    open("%s/batch_%d.txt" % (sys.argv[1], i), "w").write("\n".join(classes[i::n]) + "\n")
 PY
-for i in 0 1 2 3; do
+for i in $(seq 0 $((JOBS - 1))); do
   { [ -n "$2" ] && echo "DEV_PKG=\"$2\""
     [ -n "$SETTINGS" ] && echo "$SETTINGS"
     python3 -c "print('CLASSES=' + repr(open('$OUT/batch_$i.txt').read().split()))"

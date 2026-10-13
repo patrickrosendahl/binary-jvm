@@ -5,18 +5,21 @@
 # a method without HLIL counts as a problem since jvm-95).
 #   tests/bn_pseudo_java_compare_all.sh [DEV_PKG]     (no argument: the installed plugin)
 set -e
+JOBS=${JOBS:-4}   # parallel bnrun batches; above 4 needs scriptbridge.maxParallel >= JOBS
 REPO=/Users/patrick/dev/binary-jvm
 OUT=$REPO/.scratch/compare_all
 mkdir -p "$OUT"
-python3 - "$OUT" <<'PY'
+rm -f "$OUT"/batch_*.txt "$OUT"/run_*.py "$OUT"/result_*.txt
+python3 - "$OUT" "$JOBS" <<'PY'
 import subprocess, sys
 out = sys.argv[1]
 classes = subprocess.run(["python3", "/Users/patrick/dev/binary-jvm/tests/exception_table_classes.py"],
                          capture_output=True, text=True, check=True).stdout.split()
-for i in range(4):
-    open("%s/batch_%d.txt" % (out, i), "w").write("\n".join(classes[i::4]) + "\n")
+n = int(sys.argv[-1])
+for i in range(n):
+    open("%s/batch_%d.txt" % (out, i), "w").write("\n".join(classes[i::n]) + "\n")
 PY
-for i in 0 1 2 3; do
+for i in $(seq 0 $((JOBS - 1))); do
   { [ -n "$1" ] && echo "DEV_PKG=\"$1\""; echo "ONLY_EXC=True"
     python3 -c "print('CLASSES=' + repr(open('$OUT/batch_$i.txt').read().split()))"
     cat "$REPO/tests/bn_pseudo_java_compare.py"; } > "$OUT/run_$i.py"
@@ -26,7 +29,7 @@ wait
 grep -h "TOTAL" "$OUT"/result_*.txt
 grep -hv "^####\|TOTAL\|^   JAVA\|^Traceback\|^  File\|^SystemExit" "$OUT"/result_*.txt || true
 status=0
-for i in 0 1 2 3; do
+for i in $(seq 0 $((JOBS - 1))); do
   totals=$(grep -h "^TOTAL" "$OUT/result_$i.txt" || true)
   if [ -z "$totals" ]; then
     echo "gate: batch $i produced no TOTAL line (script died?)"; status=1; continue
