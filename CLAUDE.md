@@ -14,8 +14,11 @@ a second gate (jvm-77, `tests/vineflower_suite.py`), try-with-resources (jvm-78)
 (jvm-80), synchronized + loop-condition shapes (jvm-82, partly), finally inside loops (jvm-85). Suite 7241 -> 6417
 statements (Vineflower 5680). 2026-10-09: jvm-79 (lambdas), jvm-44 rest (assert, access$, enum/String switches), jvm-87
 (unreachable handlers, not a bug) -> 6139 statements; follow-ups jvm-91..94. jvm-86 (finally copies with own locals) and
-jvm-84 (multi-catch `catch (A | B e)`) done -> 6097. Open, in this order:
-jvm-82 rest (sync blocks split by exception/loop edges, TestChainedCFG), jvm-81, jvm-83, jvm-88..90
+jvm-84 (multi-catch `catch (A | B e)`) done -> 6097. 2026-10-14 (MacBook clone): jvm-82 round 3/4 (catch in
+synchronized, labeled break out of synchronized, loop at the start of synchronized, `L: ..; goto L` as
+`while (true)`) -> 6090, gotos 13, labels 10, sync_comments 9; jvm-97 filed (lambda flakiness, lost_calls ±4).
+Dump scripts take `JOBS=N`; second remote `github` (push to both). Open, in this order:
+jvm-82 rest (TestSynchronizedLoop.test12, TestSwitchLoop.test7 labels, TestEmptyBlocks), jvm-81, jvm-83, jvm-88..90
 (remaining finally shapes). jvm-15 waits for Patrick's GUI
 click-through (needs a BN restart to load jarload.py). jvm-68 still waits on binary-cpp. Use a dev load for live tests.
 
@@ -175,4 +178,6 @@ has the full plan; the same rules apply here:
   (web: <http://mackup.local:3000/patrick/binary-jvm>). Default branch `main`.
 - Gitea sometimes sleeps; if a push/clone hangs, the host (`mackup.local`, 192.168.1.117) or
   the service may just be down — retry shortly.
+- Second remote `github` = `git@github.com:patrickrosendahl/binary-jvm.git`; push `main` to both
+  (`git push origin main && git push github main`).
 - Commit the plugin + `docs/`; never commit `sample/` (it's git-ignored).

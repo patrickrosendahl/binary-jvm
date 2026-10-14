@@ -5,7 +5,13 @@ description: Project skill for the binary-jvm Binary Ninja plugin (Java .class A
 
 # binary-jvm project workflow
 
-**Resumed 2026-10-06** (after a short pause, jvm-28) — plugin installed; current work: jvm-32/33/35/41–44.
+**Resumed 2026-10-06** (after a short pause, jvm-28) — plugin installed. Current work (2026-10-14): Pseudo Java
+quality against Vineflower — jvm-82 rest, then jvm-81, jvm-83, jvm-88..90 (CLAUDE.md handoff has the order).
+
+**Two machines:** MusicMac.local (original; minitick :8000 / miniwiki :8001 servers) and MacBook-Pro.local (clone
+since 2026-10-12; `/opt/anaconda3/bin/minitick|miniwiki` reach MusicMac, the MCP tools may not be loaded). The
+git-ignored `sample/`, `.scratch/` and `~/dev/vineflower` must be rsynced from MusicMac (ssh MusicMac -> MacBook
+only). Push `main` to both remotes: `git push origin main && git push github main`.
 
 Generic Binary Ninja mechanics (`bnrun` bridge, bundled scripts, usage lock) are in the global
 `binaryninja-bridge` skill — load it for any BN work. This skill is the project layer on top.
@@ -49,7 +55,10 @@ Universal view active — switch to "JVM Class" (GUI: view dropdown; bridge: `--
    Gates (CLAUDE.md has the `--max` lines): `tests/bn_dump_all.sh pj|cv [jvm_devN]` (dumps in 4 parallel
    batches, a few minutes), then `vineflower_compare.py` / `class_view_compare.py`; and
    `tests/bn_pseudo_java_compare_all.sh` (~15 min, background). Java 8 constructs: `tests/vineflower_suite.py prep`, `bn_dump_all.sh suite`,
-   `vineflower_suite.py compare` (Vineflower's own tests, jvm-77). Run all of them before resolving a ticket
+   `vineflower_suite.py compare` (Vineflower's own tests, jvm-77). The dump scripts take `JOBS=N` (default 4 = bridge
+   `scriptbridge.maxParallel`; more batches are slower, GIL-bound). Warn sessions sharing the BN instance
+   (binary-cpp) before a gate round — a heavy job alongside made compare_all time out. `lost_calls` in the suite
+   flips by about ±4 between runs (jvm-97). Run all of them before resolving a ticket
    that touches `view.py`, `classfile.py`, `classui.py` or `pseudo_java.py`, not only the ones for the file you changed.
 3. Real install (**installed**): symlink the
    repo as `plugins/binary-jvm` and set the Universal exclusion; after changing
