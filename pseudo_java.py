@@ -61,6 +61,7 @@ FOLD_TEMPORARIES = True      # print a single-use operand-stack temporary inside
 SYNC_BLOCKS = True           # monitorenter ... monitorexit -> synchronized (x) { ... } (jvm-47)
 ARRAY_LITERALS = True        # new T[n] + n element stores -> new T[]{...} (jvm-49)
 LOOP_CONDITIONS = True       # while (true) { if (c) { tail; break; } ... } -> while (!c) { ... } tail (jvm-50)
+GOTO_LOOPS = True            # L: S...; goto L; -> [label:] while (true) { S... } with gotos to L as continue (jvm-82)
 RENAME_TEMPORARIES = True    # st0_lo_8 / r_12 / l3_lo -> names from their value: rawValue, vector, str (jvm-55)
 VARARGS_CALLS = True         # m(new T[]{a, b}) -> m(a, b) when m is varargs (jvm-57)
 SPLIT_CONDITIONS = True      # T x; if (a) { x = e; } if (!a || p(x)) -> if (!a || p(e)) (jvm-54)
@@ -1476,6 +1477,7 @@ if _HAVE_BN:
             self.array_lits = {}    # array variable -> (new instr, element values, other uses) (jvm-49)
             self.hidden_vars = set()  # lock variables whose definition moved into a synchronized header
             self.twr_labels = set()  # labels of folded try-with-resources tails (jvm-78)
+            self.goto_continue = {}  # label id -> (loop label, expr_index of gotos in nested loops) (jvm-82)
             self.twr_open = []       # resources whose try-with-resources body is being printed
             self.loop_decls = {}     # loop expr_index -> [(var, def)] declared before it (assignment in its condition)
             self._def_counts = None
@@ -2479,6 +2481,7 @@ if _HAVE_BN:
                 self.array_lits = {}
                 self.hidden_vars = set()
                 self.twr_labels = set()
+                self.goto_continue = {}
                 self.twr_open = []
                 self.loop_decls = {}
                 if TRY_WITH_RESOURCES:
@@ -2642,9 +2645,26 @@ if _HAVE_BN:
                     self.plan_folds(body, lo, hi, run_at, plan)
                 except Exception:
                     pass
+            goto_loops = {}
+            if GOTO_LOOPS and block.as_ast:
+                try:
+                    goto_loops = self.plan_goto_loops(body, lo, hi, run_at, sync_at, plan)
+                except Exception:
+                    goto_loops = {}
             need_separator = None  # None: nothing emitted yet in this range
             idx = lo
             while idx <= hi:
+                if idx in goto_loops:
+                    if need_separator is not None:
+                        tokens.scope_separator()
+                    q = goto_loops[idx][0]
+                    try:
+                        self.emit_goto_loop(body, idx, goto_loops[idx], plan, tokens, settings, block)
+                    except Exception as ex:
+                        self.emit_error(body[idx], ex, tokens)
+                    idx = q + 1
+                    need_separator = True
+                    continue
                 if idx in sync_at and self.finally_bodies() and not isinstance(body[idx], _ExcBranch):
                     run = self.finally_copy_len(body, idx, plan)
                     if run is not None and idx + run - 1 >= sync_at[idx][0]:
@@ -2685,6 +2705,86 @@ if _HAVE_BN:
                     self.emit_error(body[idx], ex, tokens)
                     need_separator = True
                 idx += 1
+
+        # --- loops left as `L: ...; goto L;` (jvm-82) -------------------------------------------------
+        def loop_jumps(self, items):
+            """(instr, in_loop, in_switch) for every break / continue / goto below items; in_loop: inside a loop
+            nested in items, in_switch: inside a nested switch"""
+            stack = [(x, False, False) for x in reversed(items)]
+            while stack:
+                i, in_loop, in_sw = stack.pop()
+                if i.operation in (Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_GOTO):
+                    yield i, in_loop, in_sw
+                loop = in_loop or i.operation in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE, Op.HLIL_FOR)
+                sw = in_sw or i.operation == Op.HLIL_SWITCH
+                stack.extend((c, loop, sw) for c in reversed(list(_children(i))))
+
+        def plan_goto_loops(self, body, lo, hi, run_at, sync_at, plan):
+            """{index of label L: (index of the final `goto L`, loop label or None, gotos needing that label)}
+            for `L: S...; goto L;` in body[lo..hi] where every jump to L lies in S (a loop javac's layout or
+            labeled continues left to HLIL as gotos)"""
+            out = {}
+            p = lo
+            while p <= hi:
+                lab = body[p]
+                if isinstance(lab, _ExcBranch) or lab.operation != Op.HLIL_LABEL:
+                    p += 1
+                    continue
+                lid = lab.target.label_id
+                uses = self.label_uses(lid)
+                q = next((m for m in range(hi, p, -1) if not self.hidden_item(body[m])), None)
+                g = body[q] if q is not None else None
+                if g is None or isinstance(g, _ExcBranch) or g.operation != Op.HLIL_GOTO or \
+                        g.target.label_id != lid or uses < 1 or \
+                        any(p <= a <= q or p <= b <= q for a, b, _ in run_at.values()) or \
+                        any(p <= a <= q or p <= v[0] <= q for a, v in sync_at.items()) or \
+                        any(m in plan.get("folded", ()) or m in plan.get("done", ()) or m in plan["skip"]
+                            for m in range(p, q + 1)):
+                    p += 1
+                    continue
+                inner = [x for x in body[p + 1:q] if not self.hidden_item(x)]
+                if any(isinstance(x, _ExcBranch) for x in inner):
+                    p += 1
+                    continue
+                n, nested, ok = 1, set(), True
+                for i, in_loop, in_sw in self.loop_jumps(inner):
+                    if i.operation == Op.HLIL_GOTO:
+                        if i.target.label_id == lid:
+                            n += 1
+                            if in_loop:
+                                nested.add(i.expr_index)
+                    elif not in_loop and (i.operation == Op.HLIL_CONTINUE or not in_sw):
+                        ok = False  # a break / continue of the enclosing loop would bind to the new one
+                if not ok or n != uses:
+                    p += 1
+                    continue
+                name = "label%d" % (lab.address - self.function.start) if nested else None
+                out[p] = (q, name, nested)
+                p = q + 1
+            return out
+
+        def emit_goto_loop(self, body, p, loop, plan, tokens, settings, block):
+            q, name, nested = loop
+            lid = body[p].target.label_id
+            if name is not None:
+                self.txt(tokens, name + ":")
+                tokens.new_line()
+            self.kw(tokens, "while ")
+            tokens.append_open_paren()
+            self.kw(tokens, "true")
+            tokens.append_close_paren()
+            tokens.begin_scope(ScopeType.BlockScopeType)
+            self.goto_continue[lid] = (name, nested)
+            self.consumed.add(body[q].expr_index)  # the jump back: the loop's end
+            saved = (plan.get("root"), plan.get("list_kind"))
+            plan["root"], plan["list_kind"] = False, 'loop'  # (a final return is not the method's end here)
+            try:
+                self.emit_range(body, p + 1, q - 1, plan, tokens, settings, block)
+            finally:
+                plan["root"], plan["list_kind"] = saved
+                tokens.end_scope(ScopeType.BlockScopeType)
+            tokens.finalize_scope()
+            tokens.new_line()
 
         # --- folding single-use temporaries (jvm-46) -------------------------------------------------
         def def_count(self, var):
@@ -4357,6 +4457,16 @@ if _HAVE_BN:
                 return need_separator  # the resource's implicit close (jvm-78)
             if s.operation == Op.HLIL_GOTO and s.target.label_id in self.twr_labels:
                 return need_separator  # into a folded try-with-resources tail: the close is implicit
+            if s.operation == Op.HLIL_GOTO and s.target.label_id in self.goto_continue:
+                name, nested = self.goto_continue[s.target.label_id]
+                if need_separator:
+                    tokens.scope_separator()
+                self.kw(tokens, "continue")
+                if s.expr_index in nested:
+                    self.txt(tokens, " " + name)
+                tokens.append_semicolon()
+                tokens.new_line()
+                return False
             if s.operation == Op.HLIL_GOTO and self.label_after(body, idx, plan) == s.target.label_id:
                 # `goto L` right before L (also at the end of a branch whose statement is followed by L)
                 self.hidden_gotos[s.target.label_id] = self.hidden_gotos.get(s.target.label_id, 0) + 1
@@ -6264,6 +6374,11 @@ if _HAVE_BN:
                 self.note(tokens, "/* jump -> ")
                 self.expr(instr.dest, tokens, settings)
                 self.note(tokens, " */")
+            elif o == Op.HLIL_GOTO and instr.target.label_id in self.goto_continue:
+                name, nested = self.goto_continue[instr.target.label_id]  # a loop's continue (jvm-82)
+                self.kw(tokens, "continue")
+                if instr.expr_index in nested:
+                    self.txt(tokens, " " + name)
             elif o == Op.HLIL_GOTO:
                 self.kw(tokens, "goto ")
                 tokens.append(_tok(TT.GotoLabelToken, instr.target.name, value=instr.target.label_id))
