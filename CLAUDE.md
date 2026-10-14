@@ -20,7 +20,7 @@ synchronized, labeled break out of synchronized, loop at the start of synchroniz
 Dump scripts take `JOBS=N`; second remote `github` (push to both). Open, in this order:
 jvm-82 rest (TestSynchronizedLoop.test12, TestSwitchLoop.test7 labels, TestEmptyBlocks), jvm-81, jvm-83, jvm-88..90
 (remaining finally shapes). jvm-15 waits for Patrick's GUI
-click-through (needs a BN restart to load jarload.py). jvm-68 still waits on binary-cpp. Use a dev load for live tests.
+click-through (BN restarted 2026-10-14 with the symlinked plugin, so jarload.py is loaded). jvm-68 still waits on binary-cpp. Use a dev load for live tests.
 
 **Project tracking:** tickets live in minitick project **`jvm`** (`jvm-N`) — use the **minitick MCP
 tools** (`ticket` / `tickets` / `update` / `create` at `http://127.0.0.1:8000/mcp/`, registered
