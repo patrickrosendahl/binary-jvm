@@ -64,6 +64,9 @@ Universal view active — switch to "JVM Class" (GUI: view dropdown; bridge: `--
    repo as `plugins/binary-jvm` and set the Universal exclusion; after changing
    the plugin, restart BN with `/Users/patrick/dev/bn-script-bridge/bnrestart` (saves modified
    views, reopens files, waits for the bridge) — with the user's OK; see the binaryninja-bridge skill.
+   A restart (also one for binary-cpp's plugin, which shares the BN instance) drops every dev load and bridge view:
+   redo `bn_dev_load.py` before the next gate round. Smoke test of the installed plugin: `tests/bn_pseudo_java_dump.py`
+   without `DEV_PKG` (prints `package binary-jvm`) on one or two `CLASSES`, `OUT_DIR` in a scratch dir.
 
 ## Gotchas (learned the hard way)
 - **bnrun lanes:** serialized by default (one at a time), `--parallel` for own-view scripts (up to 4
