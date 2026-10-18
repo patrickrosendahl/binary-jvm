@@ -23,8 +23,7 @@ jvm-82 rest (TestSynchronizedLoop.test12, TestSwitchLoop.test7 labels, TestEmpty
 click-through (BN restarted 2026-10-14 with the symlinked plugin, so jarload.py is loaded). jvm-68 still waits on binary-cpp. Use a dev load for live tests.
 
 **Project tracking:** tickets live in minitick project **`jvm`** (`jvm-N`) — use the **minitick MCP
-tools** (`ticket` / `tickets` / `update` / `create` at `http://127.0.0.1:8000/mcp/`, registered
-user-scope; `update("jvm-N", {fields}, comment=…)` resolves with its verification comment in one
+tools** (`ticket` / `tickets` / `update` / `create`, registered user-scope; `update("jvm-N", {fields}, comment=…)` resolves with its verification comment in one
 call) instead of the CLI (`/Users/patrick/dev/minitick/.venv/bin/minitick … -p jvm`, fallback) —
 documentation in miniwiki project
 **`jvm`** (`miniwiki tree jvm`; `tickets/` there is a read-only mirror of minitick). There is no
