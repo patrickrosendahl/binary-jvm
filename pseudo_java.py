@@ -4398,6 +4398,9 @@ if _HAVE_BN:
                 if run is not None:
                     # javac's inline copy of a finally body, printed by its `finally` clause
                     plan["skip"].update(range(idx + 1, idx + run))
+                    if idx + run < len(body) and not isinstance(body[idx + run], _ExcBranch) and \
+                            self.is_rethrow(body[idx + run]):
+                        plan["skip"].add(idx + run)  # BN's merge of the handler's own `body; throw exc`
                     return need_separator
             if self.is_exc_plumbing(s) or self.in_monitor_code(s):
                 return need_separator
@@ -6197,7 +6200,10 @@ if _HAVE_BN:
                     if not end_ok:
                         continue
                 elif isinstance(after, _ExcBranch) or after.operation not in \
-                        (Op.HLIL_RET, Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_GOTO, Op.HLIL_NORET):
+                        (Op.HLIL_RET, Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_GOTO, Op.HLIL_NORET) and \
+                        not self.is_rethrow(after):
+                    # (a rethrow: BN merged the handler's own `body; throw exc` into the normal path's
+                    # tail -- javac never copies a finally before rethrowing the caught exception)
                     continue
                 ident = tuple(x.expr_index for x in window)
                 wk = self._copy_keys.get(ident)
