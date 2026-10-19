@@ -2606,8 +2606,8 @@ if _HAVE_BN:
                         throws = True  # (unreachable for another reason, e.g. only through another handler)
                         break
                     off += d[2]
-                if throws:
-                    continue
+                if throws or TRY_WITH_RESOURCES and self.twr_bytecode_close((lo, hi, handlers)) is not None:
+                    continue  # (a try-with-resources: plan_twr_empty prints it)
                 clauses = ", ".join("%s at pc %#x" % ("catch (%s)" % catch_type_str(t) if t else "finally", h)
                                     for h, t in handlers)
                 notes.append("// unreachable: %s -- nothing in the try range pc %#x..%#x can throw"
@@ -2661,6 +2661,10 @@ if _HAVE_BN:
             if TRY_WITH_RESOURCES and block.as_ast:
                 try:
                     self.plan_twr(body, lo, hi, run_at, plan)
+                except Exception:
+                    pass
+                try:
+                    self.plan_twr_empty(body, lo, hi, plan)
                 except Exception:
                     pass
             if CONDITION_GRAPHS and block.as_ast:
@@ -2755,6 +2759,17 @@ if _HAVE_BN:
                                                  settings, block)
                         else:
                             self.emit_sync(body, idx, end, lock, value, plan, tokens, settings, block)
+                    except Exception as ex:
+                        self.emit_error(body[idx], ex, tokens)
+                    idx = end + 1
+                    need_separator = True
+                    continue
+                if idx in plan.get("twr_empty", {}):
+                    first, last, end, group, twr = plan["twr_empty"][idx]
+                    if need_separator is not None:
+                        tokens.scope_separator()
+                    try:
+                        self.emit_twr(body, first, last, group, plan, twr, tokens, settings, block)
                     except Exception as ex:
                         self.emit_error(body[idx], ex, tokens)
                     idx = end + 1
@@ -4563,6 +4578,9 @@ if _HAVE_BN:
             if idx in plan["new_at"]:
                 self.emit_new(plan["new_at"][idx], tokens, settings)
                 tokens.append_semicolon()
+            elif self.no_effect_value(s):
+                self.note(tokens, "// no effect: ")  # (a bare value is no Java statement)
+                self.perform_get_expr_text(s, tokens, settings, P.TopLevelOperatorPrecedence, True)
             else:
                 loop = s.operation in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE, Op.HLIL_FOR, Op.HLIL_SWITCH)
                 self._follow.append(None if loop else self.label_after(body, idx, plan))
@@ -4690,6 +4708,24 @@ if _HAVE_BN:
                     and self.exc_copy_of(s) is None]
             return bool(real) and self.is_rethrow(real[-1]) and \
                 all(s.operation not in COMPOUND and s.operation not in (Op.HLIL_GOTO, Op.HLIL_RET) for s in real)
+
+        def no_effect_value(self, s):
+            """a bare comparison / logical value as a statement whose only calls are String methods on literals:
+            javac's String switch on a constant with BN's folding of `"x".hashCode() == 0x78 && "x".equals("y")`
+            left over (jvm-91 item 4) -- printed as a comment, it has no effect and is no Java statement"""
+            name = s.operation.name
+            if not (name.startswith("HLIL_CMP_") or name.startswith("HLIL_FCMP_") or
+                    s.operation in (Op.HLIL_AND, Op.HLIL_OR, Op.HLIL_XOR, Op.HLIL_NOT)):
+                return False
+            for i in _walk(s):
+                if not self.side_effect(i):
+                    continue
+                shape = self.call_shape(i)
+                if not (shape and shape[1] == "java/lang/String" and shape[2] in ("hashCode", "equals", "length")
+                        and shape[4] is not None and self.is_string_expr(shape[4]) and
+                        all(self.is_string_expr(a) for a in shape[5])):
+                    return False
+            return True
 
         def needs_semicolon(self, s):
             if s.operation in COMPOUND or s.operation in (Op.HLIL_LABEL, Op.HLIL_BLOCK, Op.HLIL_NOP):
@@ -5287,6 +5323,39 @@ if _HAVE_BN:
                 end += 1
             return list(range(j, end + 1))
 
+        def twr_init(self, body, lo, k, r, plan):
+            """the header of a resource assigned by body[k]: ('new', new_at entry) or ('value', statement), None
+            if body[k] does not assign r. `T t = e; r = t;` (javac's copy when the try sits in another one, t
+            used nowhere else) takes t's init; t's statement is skipped"""
+            known = plan.setdefault("twr_inits", {})
+            if (k, r) not in known:  # (planned again for the try body)
+                known[(k, r)] = self._twr_init(body, lo, k, r, plan)
+            return known[(k, r)]
+
+        def _twr_init(self, body, lo, k, r, plan):
+            if k in plan["new_at"] and plan["new_at"][k][1] == r:
+                return ('new', plan["new_at"][k])  # `r = new C(..)`: the constructor call is the statement
+            if body[k].operation not in (Op.HLIL_VAR_INIT, Op.HLIL_ASSIGN) or self.twr_var(body[k].dest) != r:
+                return None
+            init, src = ('value', body[k]), body[k].src
+            k2 = k - 1
+            while k2 >= lo and (isinstance(body[k2], _ExcBranch) or self.is_exc_plumbing(body[k2]) or
+                                body[k2].operation in (Op.HLIL_LABEL, Op.HLIL_NOP)):
+                k2 -= 1
+            if k2 < lo or src.operation != Op.HLIL_VAR or self.var_count(src.var) != 2 or k2 in plan["skip"]:
+                return init
+            t = src.var
+            if k2 in plan["new_at"] and plan["new_at"][k2][1] == t:
+                e = plan["new_at"][k2]
+                init = ('new', (e[0], r, e[2], e[3]))
+            elif body[k2].operation == Op.HLIL_VAR_INIT and self.twr_var(body[k2].dest) == t:
+                init = ('value', body[k2])
+            else:
+                return init
+            plan["skip"].add(k2)
+            self.hidden_vars.add(t)
+            return init
+
         def _mark_twr(self, body, lo, hi, first, last, group, plan):
             """mark one try run as try-with-resources when its shape matches; True when marked"""
             if len(group[2]) != 1 or group[2][0][1] != "java/lang/Throwable":
@@ -5300,11 +5369,8 @@ if _HAVE_BN:
                 k -= 1
             if k < lo:
                 return False
-            if k in plan["new_at"] and plan["new_at"][k][1] == r:
-                init = ('new', plan["new_at"][k])  # `r = new C(..)`: the constructor call is the statement
-            elif body[k].operation in (Op.HLIL_VAR_INIT, Op.HLIL_ASSIGN) and self.twr_var(body[k].dest) == r:
-                init = ('value', body[k])
-            else:
+            init = self.twr_init(body, lo, k, r, plan)
+            if init is None:
                 return False
             # the normal-path close follows the try, or (every path leaving early) sits before each exit
             # inside it, where emit_statement hides it (twr_hidden_close)
@@ -5338,6 +5404,99 @@ if _HAVE_BN:
             self.hidden_vars.add(r)
             self.twr_hide_suppress(group[2][0][0])
             return True
+
+        def twr_bytecode_close(self, group):
+            """the local index of the resource when group is javac 9+'s close handler of a try-with-resources
+            whose body cannot throw (jvm-83 item 4): only `aload r` runs before the normal-path close at the range
+            end, and the handler is `astore t; aload r; [ifnull ..; aload r;] invoke r.close()`. Its code has no
+            exception edge, so it is not in HLIL; None if the bytecode is anything else"""
+            if len(group[2]) != 1 or group[2][0][1] != "java/lang/Throwable":
+                return None
+            from .opcodes import decode_instruction
+            func = self.function
+
+            def instrs(pc, n):
+                data, off, out = func.view.read(func.start + pc, 24), 0, []
+                while len(out) < n and off < len(data):
+                    d = decode_instruction(data[off:], func.start + pc + off)
+                    if d[0] is None:
+                        break
+                    out.append(d)
+                    off += d[2]
+                return out
+
+            def aload(d):
+                return (int(d[0][6:]) if len(d[0]) == 7 else d[3]) if d[0][:5] == "aload" and \
+                    len(d[0]) in (5, 7) else None
+
+            def closes(ins, r):
+                for a, b in zip(ins, ins[1:]):
+                    if aload(a) == r and b[0] in ("invokevirtual", "invokeinterface"):
+                        m = self.info.member(b[3]) if self.info is not None else None
+                        return bool(m and m[1] == "close" and m[2] in (None, "()V"))
+                return False
+            tail = instrs(group[1], 4)
+            r = aload(tail[0]) if tail else None
+            if r is None or not closes(tail, r) and not (len(tail) > 1 and tail[1][0] == "ifnull"):
+                return None
+            head = instrs(group[2][0][0], 6)
+            if not head or not head[0][0].startswith("astore") or not closes(head[1:], r):
+                return None
+            return r
+
+        def plan_twr_empty(self, body, lo, hi, plan):
+            """`try (R r = e) { return r; }` whose body cannot throw (jvm-83 item 4): the try range holds no
+            statement and its close handler is not in HLIL, so only `r = e; r.close(); [return r;]` is left --
+            found from the exception table + bytecode (twr_bytecode_close)"""
+            start = self.function.start
+            for group in self.try_groups:
+                if (group[0], group[1]) in self.placed or self.twr_bytecode_close(group) is None:
+                    continue
+                if self.function.get_basic_block_at(start + group[2][0][0]) is not None:
+                    continue
+                c = next((k for k in range(lo, hi + 1) if not isinstance(body[k], _ExcBranch) and
+                          body[k].expr_index not in self.consumed and
+                          group[1] <= body[k].address - start < group[1] + 8), None)
+                if c is None:
+                    continue
+                s = body[c]  # `r.close();` or `if (r != null) r.close();`
+                if s.operation == Op.HLIL_IF:
+                    r = s.condition.left.var if s.condition.operation == Op.HLIL_CMP_NE and \
+                        s.condition.left.operation == Op.HLIL_VAR else None
+                else:
+                    shape = self.call_shape(self.stmt_call(s))
+                    r = shape[4].var if shape and shape[4] is not None and shape[4].operation == Op.HLIL_VAR else None
+                if r is None:
+                    continue
+                self.twr_open.append(r)
+                try:
+                    if self.twr_guard_close(s) != r:
+                        continue
+                finally:
+                    self.twr_open.pop()
+                k = c - 1
+                while k >= lo and (isinstance(body[k], _ExcBranch) or self.is_exc_plumbing(body[k]) or
+                                   body[k].operation in (Op.HLIL_LABEL, Op.HLIL_NOP)):
+                    k -= 1
+                if k < lo or body[k].address - start >= group[0]:
+                    continue
+                init = self.twr_init(body, lo, k, r, plan)
+                if init is None:
+                    continue
+                end, ret = c, None
+                j = c + 1
+                while j <= hi and (isinstance(body[j], _ExcBranch) or self.is_exc_plumbing(body[j]) or
+                                   body[j].operation in (Op.HLIL_LABEL, Op.HLIL_NOP)):
+                    j += 1
+                if j <= hi and body[j].operation == Op.HLIL_RET and self.refs(body[j], r):
+                    end = ret = j
+                self.placed.add((group[0], group[1]))
+                self.placed_handlers.add(group[2][0][0])
+                self.printed_handlers.add(group[2][0][0])
+                self.hidden_vars.add(r)
+                plan["skip"].add(k)
+                plan.setdefault("twr_empty", {})[k] = (k + 1, c - 1, end, group,
+                                                       {"var": r, "init": init, "ret": ret})
 
         def _twr_runs_of(self, body, lo, hi, active):
             """the try runs that fit body[lo..hi] (like emit_range computes them), given the open ranges"""
@@ -5403,7 +5562,8 @@ if _HAVE_BN:
                 try:
                     self.emit_range(body, first, last, plan, tokens, settings, block)
                     if twr["ret"] is not None:
-                        tokens.scope_separator()
+                        if any(k not in plan["skip"] for k in range(first, last + 1)):
+                            tokens.scope_separator()
                         self.emit_statement(body, twr["ret"], {"skip": set(), "new_at": {}}, tokens, settings,
                                             block, None)
                 finally:
