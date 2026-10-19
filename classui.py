@@ -58,6 +58,10 @@ try:
     from .pseudo_java import hoist_field_initializers
 except ImportError:
     hoist_field_initializers = None
+try:
+    from .pseudo_java import class_view_rendering
+except ImportError:
+    class_view_rendering = None
 
 INDENT = "    "
 
@@ -142,7 +146,7 @@ def method_header(info, m, func, outer_param=False):
     if type_params:
         words.append(type_params)
     if m["name"] == "<init>":
-        words.append(simple_name(info["name"].replace(".", "/")).rsplit("$", 1)[-1])
+        words.append(re.sub(r"^\d+(?=[A-Za-z_])", "", simple_name(info["name"].replace(".", "/")).rsplit("$", 1)[-1]))
     else:
         words += [ret_text, m["name"]]
     return " ".join(words) + "(" + params + ")" + (" throws " + ", ".join(throws) if throws else "")
@@ -339,7 +343,7 @@ def _anon_literal(lines, new_args, base, outer_this="this"):
         return None
     extends, implements = m.group(2), (m.group(3) or "").strip()
     ctor = next((mem for mem in members if mem[0] == "method" and any("// <init>" in h for h in mem[1])), None)
-    params, captures, super_args = [], {}, ""
+    params, captures, super_args, init = [], {}, "", []
     if ctor is not None:
         sig = " ".join(h.strip() for h in ctor[1])
         sig = sig[sig.find("(") + 1:sig.rfind(")")]
@@ -351,6 +355,8 @@ def _anon_literal(lines, new_args, base, outer_this="this"):
             am = re.match(r"\s*this\.([\w$]+)\s*=\s*([\w$]+)\s*;\s*$", line)  # javac: this$0, val$x
             if am and am.group(2) in params:
                 captures[am.group(1)] = params.index(am.group(2))
+            elif not sm and line.strip():
+                init.append(line)  # the rest of the constructor: an instance initializer (`new T() {{ add(x); }}`)
         if super_args:
             # each parameter in one pass (no re-substitution); a whole argument needs no parentheses
             value = {name: new_args[idx] for idx, name in enumerate(params) if idx < len(new_args)}
@@ -378,6 +384,10 @@ def _anon_literal(lines, new_args, base, outer_this="this"):
             body.extend(mem[1])
             continue
         if mem is ctor:
+            if init:
+                body.append(INDENT + "{")
+                body.extend(init)
+                body.append(INDENT + "}")
             continue
         body.extend(mem[1])
         body.extend(mem[2])
@@ -446,6 +456,15 @@ def _embed_news(bv, info, lines, refs, cache, anonymous=False):
 
 
 def render_class(bv, nested=None, refs=None, cache=None):
+    """the class skeleton as a list of text lines (see _render_class); the method bodies leave anonymous classes as
+    `new Outer$1(..)`, which _embed_news replaces"""
+    if class_view_rendering is None:
+        return _render_class(bv, nested, refs, cache)
+    with class_view_rendering():
+        return _render_class(bv, nested, refs, cache)
+
+
+def _render_class(bv, nested=None, refs=None, cache=None):
     """the class skeleton as a list of text lines. anonymous classes are printed at the `new` that creates
     them (jvm-66); other member classes stay at the end, from their class files next to this one.
     nested: {flags, anonymous, outer} when rendering such a class; refs collects the classes all of them
@@ -483,6 +502,8 @@ def render_class(bv, nested=None, refs=None, cache=None):
         except (ValueError, IndexError, KeyError):
             out.append("// generic signature: %s" % info["signature"])
     shown = name if nested is not None and nested["anonymous"] else name.rsplit("$", 1)[-1]
+    if nested is not None and not nested["anonymous"] and re.match(r"\d+[A-Za-z_]", shown):
+        shown = shown.lstrip("0123456789")  # a local class Outer$1Local is declared as Local (jvm-81)
     header = modifiers(flags, "class") + [class_keyword(flags), shown + type_params]
     if sup and sup != "Object" and not flags & ACC_ENUM:
         header += ["extends", sup]

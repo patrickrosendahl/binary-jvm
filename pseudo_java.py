@@ -48,6 +48,7 @@ What it does on top of plain HLIL (all at render time, nothing is rewritten in t
 `render_method(func) -> list[str]` returns the Java header plus body lines (used by the class view).
 """
 import re
+import threading
 
 from .constants import (ARCH_NAME, VIEW_NAME, PSEUDOMEMORY_TABLE, PSEUDOMEMORY_PRIMITIVES, POOL_STRIDE,
                         METHOD_BASE, METHOD_STRIDE)
@@ -75,6 +76,7 @@ ASSERTS = True               # if (!$assertionsDisabled && c) throw new Assertio
 SWITCH_KEYS = True           # $SwitchMap$..[e.ordinal()] / String hashCode+equals key -> e == E.X, s.equals("x"), switch (e) (jvm-44)
 SYNTHETIC_ACCESS = True      # Outer.access$002(o, v) -> o.f = v; this.this$0 -> Outer.this in a member class (jvm-44)
 LAMBDAS = True               # invokedynamic LambdaMetafactory -> `x -> body` from the lambda$ method, `Type::m` (jvm-79)
+ANONYMOUS_CLASSES = True     # new Outer$1(this, x) -> new Super(..) { members } from Outer$1.class beside this one (jvm-81)
 LAMBDA_FACTORIES = ("java/lang/invoke/LambdaMetafactory.metafactory", "java/lang/invoke/LambdaMetafactory.altMetafactory")
 # intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
 PURE_INTRINSICS = {"getfield", "arraylength", "checkcast", "instanceof", "new", "newarray", "anewarray",
@@ -122,8 +124,12 @@ def java_class_name(internal, simple=None):
     name = internal.replace('/', '.')
     if simple:
         name = name.rsplit('.', 1)[-1]
-    # inner classes: Outer$Inner -> Outer.Inner (anonymous Outer$1 stays as is)
+    # inner classes: Outer$Inner -> Outer.Inner (anonymous Outer$1 stays as is); a local class Outer$1Local is
+    # known by its own name only (jvm-81)
     parts = name.split('$')
+    local = re.match(r"\d+([A-Za-z_]\w*)$", parts[-1]) if len(parts) > 1 else None
+    if local:
+        return local.group(1)
     if len(parts) > 1 and all(p and not p[0].isdigit() for p in parts[1:]):
         name = '.'.join(parts)
     return name
@@ -320,9 +326,9 @@ def class_method_flags(data):
         return None
 
 
-def class_methods_code(data):
+def class_methods_code(data, fields=None):
     """(pool, {(name, descriptor): (access flags, code bytes or None)}) of a class file (pure; None if it does
-    not parse). pool: index -> ('utf8', text) / ('class', name index) / ('ref', class index, name-and-type
+    not parse); fields: a list that gets (access flags, name, descriptor) of each field, in class-file order. pool: index -> ('utf8', text) / ('class', name index) / ('ref', class index, name-and-type
     index) / ('nat', name index, descriptor index) / ('str', utf8 index) / ('int', value)"""
     import struct
     try:
@@ -368,6 +374,8 @@ def class_methods_code(data):
                     i += 6 + alen
                 if kind == "methods":
                     out[(utf8(name), utf8(desc))] = (flags, code)
+                elif fields is not None:
+                    fields.append((flags, utf8(name), utf8(desc)))
         return pool, out
     except Exception:
         return None
@@ -507,6 +515,16 @@ def enum_switch_map(data, field):
             continue
         out[v] = fb[1]
     return out or None
+
+
+def enum_constants(data):
+    """{ordinal: constant name} of an enum's class file: its ACC_ENUM fields in class-file order, which javac
+    writes in declaration order (pure; None if it does not parse or declares none)"""
+    fields = []
+    if not data or class_methods_code(data, fields) is None:
+        return None
+    names = [name for flags, name, _ in fields if flags & 0x4000]
+    return dict(enumerate(names)) or None
 
 
 def varargs_call_args(desc, n_args, elems, overloads):
@@ -1164,9 +1182,18 @@ if _HAVE_BN:
             except Exception:
                 key = id(view)
             info = cls._cache.get(key)
-            if info is None:
+            if info is None or not info.current(view):
                 info = cls._cache[key] = cls(view)
             return info
+
+        def current(self, view):
+            """still the class of view: a closed view's handle address is reused by the next view, which registers
+            a new class reader under it (jvm-97)"""
+            try:
+                from .classfile import reader_for_view
+                return reader_for_view(view) is self.reader
+            except Exception:
+                return True
 
         def __init__(self, view):
             self.view = view
@@ -1197,6 +1224,44 @@ if _HAVE_BN:
                     if os.path.isfile(other):
                         with open(other, "rb") as fh:
                             return fh.read()
+            except Exception:
+                pass
+            return None
+
+        def anonymous_class(self, owner):
+            """the InnerClasses entry of owner (internal name) when it is an anonymous class of this class, else None"""
+            try:
+                dotted_owner = owner.replace("/", ".")
+                own = (self.meta or {}).get("name")
+                for e in (self.meta or {}).get("inner_classes", []) or []:
+                    if e["inner"] == dotted_owner and not e["outer"] and not e["name"] and \
+                            dotted_owner.rsplit("$", 1)[0] == own:
+                        return e
+            except Exception:
+                pass
+            return None
+
+        def anonymous_supertype(self, owner):
+            """the printed type an anonymous class is known by: its interface, else its superclass"""
+            try:
+                st = class_supertypes(self.sibling_class(owner))
+            except Exception:
+                st = None
+            if not st:
+                return None
+            sup, ifaces = st
+            return java_class_name(ifaces[0] if ifaces and sup in (None, "java/lang/Object") else sup or ifaces[0])
+
+        def local_class(self, owner):
+            """the InnerClasses entry of owner (internal name) when it is a local class of this class (named,
+            declared in a method body), else None"""
+            try:
+                dotted_owner = owner.replace("/", ".")
+                own = (self.meta or {}).get("name")
+                for e in (self.meta or {}).get("inner_classes", []) or []:
+                    if e["inner"] == dotted_owner and not e["outer"] and e["name"] and \
+                            re.match(re.escape(own) + r"\$\d+" + re.escape(e["name"]) + "$", dotted_owner):
+                        return e
             except Exception:
                 pass
             return None
@@ -1347,6 +1412,16 @@ if _HAVE_BN:
                 except Exception:
                     cache[(owner, field)] = None
             return cache[(owner, field)]
+
+        def enum_ordinals(self, owner):
+            """enum_constants of an enum class in the same jar dir (cached)"""
+            cache = self.__dict__.setdefault("_enum_ordinals", {})
+            if owner not in cache:
+                try:
+                    cache[owner] = enum_constants(self.sibling_class(owner))
+                except Exception:
+                    cache[owner] = None
+            return cache[owner]
 
         def lambda_impl(self, index):
             """(MethodHandle kind, owner, name, descriptor) of the implementation method of an invokedynamic through
@@ -3108,6 +3183,8 @@ if _HAVE_BN:
                 return
             if isinstance(value, tuple):
                 s, var, cls_idx, shape = value[1]
+                if self.emit_anonymous_new(self.info.class_ref(cls_idx) or "?", shape[5], shape[3], tokens, settings):
+                    return
                 self.kw(tokens, "new ")
                 self.type_tok(tokens, java_class_name(self.info.class_ref(cls_idx) or "?"))
                 self.typed_args(tokens, settings, shape[5], shape[3])
@@ -4640,12 +4717,16 @@ if _HAVE_BN:
 
         def emit_new(self, entry, tokens, settings):
             s, var, cls_idx, shape = entry
-            cls = java_class_name(self.info.class_ref(cls_idx) or "?")
+            cls = decl = java_class_name(self.info.class_ref(cls_idx) or "?")
+            if ANONYMOUS_CLASSES and self.info.anonymous_class(self.info.class_ref(cls_idx) or "?") is not None:
+                decl = self.info.anonymous_supertype(self.info.class_ref(cls_idx)) or cls  # Outer$1 has no name
             if s.operation == Op.HLIL_VAR_INIT and var not in self.hoisted:
-                self.type_tok(tokens, cls)
+                self.type_tok(tokens, decl)
                 self.txt(tokens, " ")
             self.emit_var(var, s, tokens)
             self.op(tokens, " = ")
+            if self.emit_anonymous_new(self.info.class_ref(cls_idx) or "?", shape[5], shape[3], tokens, settings):
+                return
             self.kw(tokens, "new ")
             self.type_tok(tokens, cls)
             self.typed_args(tokens, settings, shape[5], shape[3])
@@ -5041,7 +5122,7 @@ if _HAVE_BN:
                 items.append(x)
             real = self.twr_real(items)
             var = self.twr_var(var)  # None: the handler rethrows the exception register itself
-            if len(real) < 2:
+            if not real or (len(real) < 2 and real[0].operation != Op.HLIL_IF):
                 return None
             if real[0].operation != Op.HLIL_IF:
                 # `r.close(); throw e;`: a `new` resource, javac knows it is not null
@@ -5050,8 +5131,6 @@ if _HAVE_BN:
                         shape[4].operation == Op.HLIL_VAR) or not self.twr_only_rethrows(real[1:], var):
                     return None
                 return shape[4].var
-            if len(real) < 3:
-                return None
             c = real[0].condition
             if not (c.operation == Op.HLIL_CMP_E and c.right.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR)
                     and c.right.constant == 0 and c.left.operation == Op.HLIL_VAR):
@@ -5059,7 +5138,12 @@ if _HAVE_BN:
             r = c.left.var
             if not self.twr_only_rethrows(self.flatten(self.stmts_of(real[0].true)), var):
                 return None
-            if not self.twr_is_close(real[1], r) or not self.twr_only_rethrows(real[2:], var):
+            rest = real[1:]
+            f = real[0].false
+            if f is not None and f.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
+                # `if (r == null) e = e; else { r.close(); e = e; }`: HLIL put the close into the else (jvm-83)
+                rest = self.twr_real(self.flatten(self.stmts_of(f))) + rest
+            if len(rest) < 2 or not self.twr_is_close(rest[0], r) or not self.twr_only_rethrows(rest[1:], var):
                 return None
             return r
 
@@ -6932,6 +7016,8 @@ if _HAVE_BN:
                     return
                 if recv.operation == Op.HLIL_INTRINSIC and recv.intrinsic.name == "new":
                     # BN folds a `new` whose object is never used again into its constructor call
+                    if self.emit_anonymous_new(owner, args, desc, tokens, settings):
+                        return
                     self.kw(tokens, "new ")
                     self.type_tok(tokens, java_class_name(owner))
                     self.typed_args(tokens, settings, args, desc)
@@ -6970,6 +7056,11 @@ if _HAVE_BN:
                     sh = self.call_shape(i)
                     if sh is not None and sh[2] == "ordinal" and sh[3] == "()I" and sh[4] is not None:
                         ordinal = sh
+            if field is None and ordinal is not None and calls == 1 and \
+                    (self.call_shape(src) or (None, None, None))[2] == "ordinal":
+                # `switch (e.ordinal())`: javac's switch on an enum of the same compilation unit (jvm-91)
+                labels = self.info.enum_ordinals(ordinal[1])
+                return ('enum', ordinal[4], labels, ordinal[1]) if labels else None
             if field is None or ordinal is None or calls != 1:
                 return None
             labels = self.info.switch_map(field[0], field[1])
@@ -7103,7 +7194,8 @@ if _HAVE_BN:
             """the switch_key e stands for (a key variable or an inline $SwitchMap$ lookup), else None"""
             if e.operation == Op.HLIL_VAR:
                 return self.switch_keys()[0].get(e.var)
-            if e.operation == Op.HLIL_DEREF or e.operation == Op.HLIL_ARRAY_INDEX:
+            if e.operation in (Op.HLIL_DEREF, Op.HLIL_ARRAY_INDEX, Op.HLIL_CALL) or \
+                    (e.operation == Op.HLIL_INTRINSIC and e.intrinsic.name.startswith("invoke")):
                 key = self.enum_lookup(e)
                 return key if key is not None and key[1].operation == Op.HLIL_VAR else None
             return None
@@ -7321,6 +7413,91 @@ if _HAVE_BN:
             return True
 
         # --- lambdas and method references (jvm-79) ---------------------------------------------------
+        def emit_anonymous_new(self, owner, args, desc, tokens, settings):
+            """`new Outer$1(this, x)` of an anonymous class of this class as `new Super(..) { members }`, its
+            members rendered from Outer$1.class beside this one (classui's class view does the same, jvm-69);
+            False when that class file is missing or would have to be analysed on the main thread"""
+            if not ANONYMOUS_CLASSES:
+                return False
+            if getattr(_anon_local, "off", False):
+                return False
+            local = self.info.local_class(owner)
+            if local is not None:
+                self.emit_local_class(owner, local, tokens)
+                # javac passes the outer instance first
+                if args and args[0].operation == Op.HLIL_VAR and args[0].var == self.this_var:
+                    args, desc = args[1:], ("(" + "".join(split_method_descriptor(desc)[0][1:]) + ")V") if desc else desc
+                self.kw(tokens, "new ")
+                self.type_tok(tokens, java_class_name(owner))
+                self.typed_args(tokens, settings, args, desc)
+                return True
+            e = self.info.anonymous_class(owner)
+            if e is None:
+                return False
+            # the arguments as text: the class body refers to them through this.val$x / this.this$0
+            # (on one line: an anonymous class among them is embedded into the text below)
+            before = tokens.current_tokens
+            saved, _anon_local.off = getattr(_anon_local, "off", False), True
+            try:
+                self.typed_args(tokens, settings, args, desc)
+            finally:
+                _anon_local.off = saved
+            text = "".join(t.text for t in tokens.current_tokens[len(before):])
+            tokens.current_tokens = before
+            lines = anonymous_class_lines(self.function.view, self.info.meta, e)
+            if not lines:
+                return False
+            from .classui import _anon_literal, _scan_call, _replace_calls, shown_class_name
+            arg_texts = _scan_call(text, 1)[0]
+            if arg_texts is None:
+                return False
+            outer_this = "this" if re.search(r"\$\d+$", self.info.class_name or "") else \
+                java_class_name(self.info.class_name) + ".this"
+            literal = _anon_literal(lines, [a.strip() for a in arg_texts if a.strip()], 0, outer_this)
+            if literal is None:
+                return False
+            for other in (self.info.meta or {}).get("inner_classes", []) or []:
+                if "new " + shown_class_name(other["inner"]) + "(" not in literal or \
+                        self.info.anonymous_class(other["inner"].replace(".", "/")) is None:
+                    continue
+
+                def build(nargs, base, other=other):
+                    got = anonymous_class_lines(self.function.view, self.info.meta, other)
+                    return _anon_literal(got, nargs, base, outer_this) if got else None
+
+                literal, _ = _replace_calls(literal, shown_class_name(other["inner"]), build)
+            # without the class view's method addresses (`{  // foo @ 0x1100000`)
+            rows = [re.sub(r"\s*// \S+ @ 0x[0-9a-f]+$", "", r) for r in literal.split("\n")]
+            self.txt(tokens, rows[0])
+            for row in rows[1:-1]:
+                tokens.new_line()
+                if row.strip():
+                    tokens.append(_tok(TT.TextToken, row))
+            tokens.new_line()
+            self.txt(tokens, rows[-1].strip())
+            return True
+
+        def emit_local_class(self, owner, entry, tokens):
+            """`class Local { .. }` on the lines before the statement that first creates the local class (jvm-81):
+            the line being built is set aside while the declaration is emitted"""
+            done = self.__dict__.setdefault("_local_declared", set())
+            if owner in done:
+                return
+            done.add(owner)
+            lines = anonymous_class_lines(self.function.view, self.info.meta, entry)
+            if not lines:
+                return
+            line = tokens.current_tokens
+            lead = []
+            for t in line:
+                if t.type != TT.IndentationToken:
+                    break
+                lead.append(t)
+            for row in local_class_declaration(lines, entry["name"]):
+                tokens.current_tokens = lead + [_tok(TT.TextToken, row)] if row.strip() else [_tok(TT.TextToken, "")]
+                tokens.new_line()
+            tokens.current_tokens = line
+
         def emit_lambda(self, call, idx, args, tokens, settings, precedence):
             """an invokedynamic through LambdaMetafactory as `(a, b) -> body` (from the synthetic lambda$ method of
             this class, its captured parameters replaced by the call's arguments) or as a method reference
@@ -7456,7 +7633,10 @@ if _HAVE_BN:
             addr, flags, lvt = m
             view = self.function.view
             lf = view.get_function_at(addr)
-            if lf is None or addr in _lambda_active:
+            from .classfile import view_key
+            key = (view_key(view), addr)
+            active = _lambda_active()
+            if lf is None or key in active:
                 return False
             hlil = lf.hlil_if_available
             if hlil is None or hlil.root is None:
@@ -7481,11 +7661,11 @@ if _HAVE_BN:
                 names.append(n)
             lam = PseudoJavaFunction(register(), lf.arch, lf, hlil)
             lam.captures = captures
-            _lambda_active.add(addr)
+            active.add(key)
             try:
                 lines = linear_line_tokens(lam, hlil.root, settings)
             finally:
-                _lambda_active.discard(addr)
+                active.discard(key)
             body = []
             for line in lines:
                 toks = [t for t in line if t.type != TT.AddressSeparatorToken]
@@ -8006,7 +8186,93 @@ if _HAVE_BN:
                 out.append(InstructionTextToken._from_core_struct(lines[i].tokens, lines[i].count))
             core.BNFreeDisassemblyTextLines(lines, count.value)
         return out
-    _lambda_active = set()  # addresses of lambda$ methods being rendered into their call site (recursion guard)
+    _lambda_local = threading.local()
+
+    def _lambda_active():
+        """(view, address) of the lambda$ methods this thread is rendering into their call site (recursion guard).
+        Per thread and per view: the dump scripts render 4 classes in parallel, and method addresses repeat across
+        classes, so a shared set of addresses made a lambda fall back to its invokedynamic at random (jvm-97)"""
+        active = getattr(_lambda_local, "active", None)
+        if active is None:
+            active = _lambda_local.active = set()
+        return active
+
+    _anon_local = threading.local()  # off: classui is rendering, it embeds anonymous classes itself
+
+    class class_view_rendering:
+        """while classui renders a class: no anonymous classes embedded in method bodies (it does that itself)"""
+        def __enter__(self):
+            self.saved = getattr(_anon_local, "off", False)
+            _anon_local.off = True
+
+        def __exit__(self, *exc):
+            _anon_local.off = self.saved
+
+    _anon_cache = {}  # (class file path, mtime) -> rendered lines of an anonymous class (jvm-81)
+    _anon_lock = threading.Lock()
+
+    def anonymous_class_lines(view, meta, entry):
+        """classui.render_class of the anonymous class entry (an InnerClasses entry of the class in view), from its
+        class file beside this one; None when missing, or when it is not rendered yet and this is the main thread
+        (opening and analysing another class there would block the UI)"""
+        import os
+        from binaryninja import BinaryView, BinaryViewType
+        from binaryninja.mainthread import is_main_thread
+        from . import classui
+        own = (meta or {}).get("name") if isinstance(meta, dict) else None
+        path = view.file.original_filename if view.file else None
+        tail = (own or "").replace(".", "/") + ".class"
+        if not own or not path or not path.endswith(tail):
+            return None
+        other = os.path.join(path[:-len(tail)], entry["inner"].replace(".", "/") + ".class")
+        try:
+            key = (other, os.path.getmtime(other))
+        except OSError:
+            return None
+        with _anon_lock:
+            if key in _anon_cache:
+                return _anon_cache[key]
+        if is_main_thread():
+            return None
+        lines = None
+        try:
+            iv = BinaryViewType[view.view_type].create(BinaryView.open(other))
+            iv.update_analysis_and_wait()
+            try:
+                lines = classui.render_class(iv, {"flags": entry["access_flags"], "anonymous": not entry["name"],
+                                                  "outer": own}, set(), {})
+            finally:
+                iv.file.close()
+        except Exception:
+            lines = None
+        with _anon_lock:
+            _anon_cache[key] = lines
+        return lines
+
+    def local_class_declaration(lines, name):
+        """classui.render_class lines of a local class as its declaration in a method body: under its source name,
+        without the method addresses and without javac's outer-instance plumbing (a constructor that only stores
+        this$0 goes away)"""
+        out, skip = [], False
+        for l in lines:
+            if l.startswith("//"):
+                continue
+            l = re.sub(r"\s*// \S+ @ 0x[0-9a-f]+$", "", l)
+            l = re.sub(r"(?<![\w$])\d+" + re.escape(name) + r"(?![\w$])", name, l)
+            if re.match(r"\s*this\.this\$0 = this\$0;$", l):
+                continue
+            out.append(l)
+        # an emptied no-argument constructor: `Name() {` + `}`
+        k = 0
+        while k < len(out) - 1:
+            if re.match(r"\s*" + re.escape(name) + r"\(\) \{$", out[k]) and out[k + 1].strip() == "}":
+                del out[k:k + 2]
+                while k < len(out) and k > 0 and not out[k].strip() and not out[k - 1].strip():
+                    del out[k]
+                continue
+            k += 1
+        out = [l for k, l in enumerate(out) if l.strip() or (k and out[k - 1].strip() and not out[k - 1].endswith("{"))]
+        return out + [""]
 
     def register():
         global _registered
