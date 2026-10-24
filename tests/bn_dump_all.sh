@@ -5,9 +5,12 @@
 # then: python3 tests/vineflower_compare.py --max ...   /   python3 tests/class_view_compare.py --max ...
 # suite: Pseudo Java of Vineflower's Java 8 test classes (after tests/vineflower_suite.py prep; jvm-77), into
 # .scratch/vfsuite/pj; then python3 tests/vineflower_suite.py compare
+# Each output gets a stamp (<dump>/.stamps.json, tests/gate_state.py, jvm-105). RESUME=1 keeps the previous dump and
+# skips classes whose output carries the current stamp: continues a run that was cut off (jvm-106).
 set -e
 JOBS=${JOBS:-4}   # parallel bnrun batches; above 4 needs scriptbridge.maxParallel >= JOBS
 TIMEOUT=${TIMEOUT:-1800}   # per batch, seconds (raise it when the BN instance is shared with heavy jobs)
+RESUME=${RESUME:-0}
 REPO=/Users/patrick/dev/binary-jvm
 SUITE=$REPO/.scratch/vfsuite
 SETTINGS=""
@@ -22,7 +25,7 @@ esac
 OUT=$REPO/.scratch/dump_all_$1
 mkdir -p "$OUT"
 rm -f "$OUT"/batch_*.txt "$OUT"/run_*.py "$OUT"/result_*.txt
-rm -rf "$DUMP"
+[ "$RESUME" = 1 ] || rm -rf "$DUMP"
 python3 - "$OUT" "$1" "$JOBS" <<'PY'
 import sys
 sys.path.insert(0, "/Users/patrick/dev/binary-jvm/tests")
@@ -38,6 +41,7 @@ PY
 for i in $(seq 0 $((JOBS - 1))); do
   { [ -n "$2" ] && echo "DEV_PKG=\"$2\""
     [ -n "$SETTINGS" ] && echo "$SETTINGS"
+    [ "$RESUME" = 1 ] && echo "RESUME = True"
     python3 -c "print('CLASSES=' + repr(open('$OUT/batch_$i.txt').read().split()))"
     cat "$REPO/tests/$SCRIPT"; } > "$OUT/run_$i.py"
   /Users/patrick/dev/bn-script-bridge/bnrun --parallel --timeout $TIMEOUT "$OUT/run_$i.py" > "$OUT/result_$i.txt" 2>&1 &

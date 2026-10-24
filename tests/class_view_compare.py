@@ -5,11 +5,13 @@ ignored, bodies and initialisers too). Inputs under .scratch/vfcmp/: vf/ (tests/
 
 usage:
   python3 tests/class_view_compare.py [--classes C ...] [--show] [--max K=V ...]   # exit 1 if a total exceeds V
+                                     [--strict] [--ref NAME] [--save-ref NAME]   # as in vineflower_compare.py
 """
 import argparse, json, os, re, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vineflower_compare as vc
+import gate_state
 
 OUT = vc.OUT
 
@@ -92,10 +94,14 @@ def main():
     ap.add_argument("--cv", default=os.path.join(OUT, "cv"))
     ap.add_argument("--show", action="store_true", help="print every difference")
     ap.add_argument("--max", nargs="*", default=[])
+    ap.add_argument("--strict", action="store_true", help="exit 1 on a stamp warning (stale or mixed outputs)")
+    ap.add_argument("--ref", help="print the totals of a saved reference run (REF) and the differences (DELTA)")
+    ap.add_argument("--save-ref", help="save this run's totals as a reference under this name")
     a = ap.parse_args()
     totals = {"classes": 0, "imports": 0, "headers": 0, "fields": 0, "override": 0, "head": 0, "throws": 0,
               "missing": 0}
-    for rel in a.classes or vc.DEFAULT_CLASSES:
+    classes = a.classes or vc.DEFAULT_CLASSES
+    for rel in classes:
         simple = os.path.basename(rel)[:-len(".class")]
         cv_path = os.path.join(a.cv, rel[:-len(".class")] + ".java")
         vf_path = os.path.join(OUT, "vf", os.path.dirname(rel), simple + ".java")
@@ -119,8 +125,15 @@ def main():
             for m in r["methods"]:
                 print("  method", m)
     print("TOTAL", json.dumps(totals))
+    if a.ref:
+        gate_state.print_ref(a.cv, a.ref, totals)
+    if a.save_ref:
+        gate_state.save_ref(a.cv, a.save_ref, totals)
+    warned = gate_state.warn_stamps(a.cv, "cv", classes)
     failed = ["%s=%d > %s" % (k, totals.get(k, 0), v) for k, v in (kv.split("=") for kv in a.max)
               if totals.get(k, 0) > int(v)]
+    if a.strict and warned:
+        failed.append("%d stamp warning(s) (--strict)" % warned)
     if failed:
         print("FAIL", ", ".join(failed))
         return 1

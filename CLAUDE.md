@@ -120,6 +120,13 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
  (declarations against Vineflower; the 2 imports are types Vineflower names for locals we fold away), and
  `bnrun --parallel --timeout 300 tests/bn_anon_check.py` (anonymous classes at their `new`, javac 8 + 21; jvm-69;
  exits non-zero on failure, as do the other bnrun check scripts -- jvm-94).
+ **Stamps / RESUME / REF** (`tests/gate_state.py`): every dump output carries a stamp (plugin / dump-script / class
+ hashes, `<dump>/.stamps.json`; jvm-105); the compare scripts print `WARNING` lines for outputs that are unstamped,
+ from several plugin states or not from the working tree (an old `jvm_devN`, edits since the dev load) -- rerun the
+ dump before resolving a ticket on such numbers; `--strict` makes that exit 1. `RESUME=1 tests/bn_dump_all.sh ...` /
+ `RESUME=1 tests/bn_pseudo_java_compare_all.sh ...` continue a cut-off run (classes with the current stamp are skipped
+ / replayed; jvm-106). Before / after numbers (jvm-107): `--save-ref before` on the compare scripts before a ticket,
+ `--ref before` after it prints `REF` + `DELTA` under `TOTAL` (refs in `.scratch/vfcmp/refs/`, `.scratch/vfsuite/refs/`).
 3. bnrun has two lanes: serialized (default; UI work and global registration like `bn_dev_load.py`)
    and `--parallel` (scripts on their own views, up to 4 at once, no lock). Always pass **`--timeout N`**; a running script can be stopped
    with `bnrun --cancel` (or Ctrl-C on the client), `bnrun --status` shows what is running.

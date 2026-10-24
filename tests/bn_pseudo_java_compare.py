@@ -11,16 +11,22 @@
 #   * no catch variable used outside its catch block, no jump right after a jump (`return; break;`) (jvm-45)
 # A method whose HLIL is missing gets its analysis forced once and then counts as a problem instead of
 # being silently skipped (jvm-95). Exits non-zero when any problem was found (jvm-94).
+# RESULT_DIR = "..." keeps each class's problems and totals in RESULT_DIR/<pkg/Class>.txt with a stamp
+# (tests/gate_state.py, jvm-105); with RESUME = True a class whose result carries the current stamp is not
+# analysed again, its saved result is printed and counted instead (jvm-106).
 import os, re, sys, time
 import binaryninja as b
 sys.path.insert(0, "/Users/patrick/dev/binary-jvm/tests")
-import importlib, vineflower_compare as _vc
+import importlib, json, vineflower_compare as _vc, gate_state
 _vc = importlib.reload(_vc)  # the app's interpreter keeps modules between bnrun calls
+gate_state = importlib.reload(gate_state)
 
 CLASS_DIR = globals().get("CLASS_DIR", "/Users/patrick/dev/binary-jvm/sample/ActiveTraderDE_app/Contents/WorkingDir/current/lib/mdg")
 CLASSES = globals().get("CLASSES", ["com/is_teledata/cache/HashCache.class"])
 SHOW = globals().get("SHOW", False)
 ONLY_EXC = globals().get("ONLY_EXC", False)
+RESULT_DIR = globals().get("RESULT_DIR", None)
+RESUME = globals().get("RESUME", False)
 PKG = globals().get("DEV_PKG") or (b._jvm_dev["pkg"].__name__ if hasattr(b, "_jvm_dev") else "binary-jvm")
 pj = sys.modules[PKG + ".pseudo_java"]
 vt = b.BinaryViewType[sys.modules[PKG + ".constants"].VIEW_NAME]
@@ -30,8 +36,25 @@ SKIP_NAMES = {"<init>", "append", "toString", "valueOf", "intValue", "longValue"
 PLUMBING = [r"\bexc(_\d+)?\b", r"__exception", r"__propagate", r"\binstanceof\(", r"could not render"]
 
 totals = {"methods": 0, "with_table": 0, "ok": 0, "problems": 0}
+stamper = RESULT_DIR and gate_state.Stamper("hlil", sys.modules[PKG].__path__[0], PKG, RESULT_DIR,
+                                            {"only_exc": bool(ONLY_EXC), "show": bool(SHOW)})
+resumed = 0
 for rel in CLASSES:
+    result = RESULT_DIR and os.path.join(RESULT_DIR, rel[:-len(".class")] + ".txt")
+    if RESUME and stamper and stamper.current(rel, os.path.join(CLASS_DIR, rel), [result]):
+        saved = open(result, encoding="utf-8").read().splitlines()
+        for l in saved[:-1]:
+            print(l)
+        for k, n in json.loads(saved[-1].split(" ", 1)[1]).items():
+            totals[k] += n
+        resumed += 1
+        continue
     t = time.time()
+    cls_totals = dict.fromkeys(totals, 0)
+    cls_lines = []
+    def say(line):
+        print(line)
+        cls_lines.append(line)
     v = vt.create(b.BinaryView.open(os.path.join(CLASS_DIR, rel)))
     v.update_analysis_and_wait()
     skipped = [f for f in v.functions if f.analysis_skipped]
@@ -45,15 +68,15 @@ for rel in CLASSES:
         table = info.exception_table(f)
         if ONLY_EXC and not table:
             continue
-        totals["methods"] += 1
-        totals["with_table"] += bool(table)
+        cls_totals["methods"] += 1
+        cls_totals["with_table"] += bool(table)
         if f.hlil is None or f.hlil.root is None:
             # jvm-95: analysis unfinished or skipped under load -- force it and retry once
             f.analysis_skip_override = b.FunctionAnalysisSkipOverride.NeverSkipFunctionAnalysis
             v.update_analysis_and_wait()
         if f.hlil is None or f.hlil.root is None:
-            totals["problems"] += 1
-            print("%s %s: no HLIL (analysis_skip_reason %r)" % (rel.rsplit("/", 1)[-1], f.name, f.analysis_skip_reason))
+            cls_totals["problems"] += 1
+            say("%s %s: no HLIL (analysis_skip_reason %r)" % (rel.rsplit("/", 1)[-1], f.name, f.analysis_skip_reason))
             continue
         problems = []
         try:
@@ -107,15 +130,24 @@ for rel in CLASSES:
         if real and not re.search(r"\btry\b", text):
             problems.append("no try for %s" % real)
         if problems:
-            totals["problems"] += 1
-            print("%s %s: %s" % (rel.rsplit("/", 1)[-1], f.name, "; ".join(problems)))
+            cls_totals["problems"] += 1
+            say("%s %s: %s" % (rel.rsplit("/", 1)[-1], f.name, "; ".join(problems)))
             if SHOW:
                 for l in lines:
-                    print("   JAVA |", l)
+                    say("   JAVA | " + l)
         else:
-            totals["ok"] += 1
+            cls_totals["ok"] += 1
     print("#### %s (%.1fs)" % (rel, time.time() - t))
     v.file.close()
+    for k, n in cls_totals.items():
+        totals[k] += n
+    if stamper and not any(": no HLIL (" in l for l in cls_lines):  # skipped under load: redo on RESUME
+        os.makedirs(os.path.dirname(result), exist_ok=True)
+        with open(result, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(cls_lines + ["CLASS_TOTAL " + json.dumps(cls_totals)]) + "\n")
+        stamper.stamp(rel, os.path.join(CLASS_DIR, rel))
+if resumed:
+    print("RESUME: %d class(es) already current" % resumed)
 print("TOTAL", totals)
 if totals["problems"]:
     raise SystemExit("%d problem(s)" % totals["problems"])

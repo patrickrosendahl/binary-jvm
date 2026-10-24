@@ -15,8 +15,14 @@ usage:
   bnrun --parallel --timeout 600 tests/bn_pseudo_java_dump.py
   python3 tests/vineflower_compare.py [--show NAME] [--worst N] [--excess N] [--json FILE]
                                      [--pj DIR] [--max K=V ...]  # exit 1 if a total exceeds V (e.g. --max lost_calls=0)
+                                     [--strict] [--ref NAME] [--save-ref NAME]
+WARNING lines: the Pseudo Java outputs carry no stamp, come from several plugin states or not from the working
+tree (tests/gate_state.py, jvm-105); --strict exits 1 on one. --save-ref NAME keeps this run's TOTAL, --ref NAME
+prints it (REF) and the differences (DELTA) under TOTAL: before / after numbers for a ticket (jvm-107).
 """
 import argparse, glob, json, os, re, subprocess, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate_state
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIB = os.path.join(REPO, "sample/ActiveTraderDE_app/Contents/WorkingDir/current/lib")
@@ -377,6 +383,9 @@ def main():
     ap.add_argument("--pj", default=os.path.join(OUT, "pj"), help="directory of the Pseudo Java dump")
     ap.add_argument("--vf", default=os.path.join(OUT, "vf"), help="directory of the Vineflower output")
     ap.add_argument("--max", nargs="*", default=[], help="K=V: fail if total K exceeds V")
+    ap.add_argument("--strict", action="store_true", help="exit 1 on a stamp warning (stale or mixed outputs)")
+    ap.add_argument("--ref", help="print the totals of a saved reference run (REF) and the differences (DELTA)")
+    ap.add_argument("--save-ref", help="save this run's totals as a reference under this name")
     a = ap.parse_args()
     classes = a.classes or DEFAULT_CLASSES
     if a.decompile:
@@ -424,6 +433,8 @@ def main():
         for k, v in r["causes"].items():
             causes[k] = causes.get(k, 0) + v
     print("TOTAL", json.dumps(totals))
+    if a.ref:
+        gate_state.print_ref(a.pj, a.ref, totals)
     print("EXCESS", json.dumps(dict(sorted(causes.items(), key=lambda kv: -kv[1]))))
     for r in sorted(matched, key=lambda r: r["vf_stmts"] - r["stmts"])[:a.excess]:
         if r["stmts"] <= r["vf_stmts"]:
@@ -445,11 +456,16 @@ def main():
     if a.json:
         with open(a.json, "w") as fh:
             json.dump({"totals": totals, "methods": rows}, fh, indent=1)
+    if a.save_ref:
+        gate_state.save_ref(a.pj, a.save_ref, totals)
+    warned = gate_state.warn_stamps(a.pj, "pj", classes)
     failed = []
     for kv in a.max:
         k, v = kv.split("=")
         if totals.get(k, 0) > int(v):
             failed.append("%s=%d > %s" % (k, totals[k], v))
+    if a.strict and warned:
+        failed.append("%d stamp warning(s) (--strict)" % warned)
     if failed:
         print("FAIL", ", ".join(failed))
         return 1

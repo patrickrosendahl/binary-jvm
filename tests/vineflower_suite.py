@@ -9,6 +9,7 @@ Java 5 and never shows those constructs.
   python3 tests/vineflower_suite.py prep       # javac --release 8 -g the sources, references -> vf/*.java
   tests/bn_dump_all.sh suite [jvm_devN]        # Pseudo Java of every test class (4 parallel bnrun batches)
   python3 tests/vineflower_suite.py compare [--max K=V ...] [vineflower_compare.py options]
+                                       (--strict, --ref NAME, --save-ref NAME: refs in .scratch/vfsuite/refs/)
 
 Everything goes to .scratch/vfsuite/ (git-ignored): classes/java8/, vf/pkg/<Test>.java (the reference without
 its line-number comments and mapping tables), pj/pkg/<Test>.pj, tests.txt (one pkg/<Test>.class per line).

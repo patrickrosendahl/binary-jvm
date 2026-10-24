@@ -58,7 +58,9 @@ Universal view active — switch to "JVM Class" (GUI: view dropdown; bridge: `--
    `vineflower_suite.py compare` (Vineflower's own tests, jvm-77). The dump scripts take `JOBS=N` (default 4 = bridge
    `scriptbridge.maxParallel`; more batches are slower, GIL-bound). Warn sessions sharing the BN instance
    (binary-cpp) before a gate round — a heavy job alongside made compare_all time out; with the instance shared by
-   heavy jobs pass `TIMEOUT=7200` (per batch, dump scripts and compare_all; default 1800 / 2400). Two suite runs are
+   heavy jobs pass `TIMEOUT=7200` (per batch, dump scripts and compare_all; default 1800 / 2400). A run that was cut
+   off continues with `RESUME=1` (jvm-106); heed the compare scripts' stamp `WARNING`s (stale / mixed outputs, jvm-105)
+   and use `--save-ref NAME` / `--ref NAME` for a ticket's before / after numbers (jvm-107). Two suite runs are
    identical since jvm-97 (LVT names applied before rendering via `view.analyze_now`, lambda HLIL built on demand). Run all of them before resolving a ticket
    that touches `view.py`, `classfile.py`, `classui.py` or `pseudo_java.py`, not only the ones for the file you changed.
 3. Real install (**installed**): symlink the
