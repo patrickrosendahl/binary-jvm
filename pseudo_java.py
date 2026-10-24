@@ -1627,6 +1627,7 @@ if _HAVE_BN:
             self.break_subst = {}     # expr_index of a loop break -> (items, block) printed in its place (jvm-54)
             self.break_used = set()
             self._finally_bodies = None  # handler pc -> (items, caught var), see finally_bodies()
+            self._fb_rethrows = set()
             self._finally_decided = {}   # handler pc -> prints as a finally clause
             self._loop_depth = 0         # >0 while a loop's body is being printed (jvm-85)
             self._tail_ret_hide = []     # try statements whose catch clauses may hide the implicit final return (jvm-86)
@@ -2740,6 +2741,10 @@ if _HAVE_BN:
                     if isinstance(s, _ExcBranch) or s.operation == Op.HLIL_LABEL or self.is_exc_plumbing(s) or \
                             s.expr_index in self.consumed:
                         pcs.append(None)
+                    elif s.operation in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE, Op.HLIL_FOR):
+                        # a loop lies in a try range only with its jumps back: javac's do-while whose try covers
+                        # the start of the body only has its header in the range (TestLoopFinally.test3, jvm-88)
+                        pcs.append([s.address - start] + self.loop_try_pcs(s))
                     else:
                         pcs.append([s.address - start])
                 # a try range is printed once per function, where it first fits
@@ -2762,6 +2767,11 @@ if _HAVE_BN:
                     pass
                 try:
                     self.plan_twr_empty(body, lo, hi, plan)
+                except Exception:
+                    pass
+            if run_at:
+                try:
+                    self.plan_post_copies(body, run_at, plan)
                 except Exception:
                     pass
             if CONDITION_GRAPHS and block.as_ast:
@@ -2917,6 +2927,37 @@ if _HAVE_BN:
                     self.emit_error(body[idx], ex, tokens)
                     need_separator = True
                 idx += 1
+
+        def loop_back_pcs(self, addr):
+            """pcs of the jumps back to the loop header whose basic block holds addr (the HLIL loop's address)"""
+            if getattr(self, "_back_edges", None) is None:
+                self._back_edges = []
+                try:
+                    for bb in self.function.basic_blocks:
+                        for e in bb.outgoing_edges:
+                            if e.back_edge:  # (an instruction's last byte: inside a range iff its start is)
+                                self._back_edges.append((e.target.start, e.target.end, bb.end - 1))
+                except Exception:
+                    pass
+            start = self.function.start
+            return [src - start for lo, hi, src in self._back_edges if lo <= addr < hi]
+
+        def loop_try_pcs(self, w):
+            """the jumps back of loop w that keep a try range from wrapping it: the range holds the header but not
+            the jump, and some code of the body lies in it (the try then fits inside the body); a range holding
+            only the loop test still wraps the loop (TestClassLoop.testFinally) -- else nothing would print it"""
+            start = self.function.start
+            head = w.address - start
+            back = self.loop_back_pcs(w.address)
+            if not back:
+                return []
+            body_pcs = {i.address - start for i in _walk(w.body)  # (a block carries the header's pc)
+                        if i.operation not in (Op.HLIL_BLOCK, Op.HLIL_NOP, Op.HLIL_LABEL)}
+            keep = set()
+            for lo, hi, _ in self.try_groups:
+                if lo <= head < hi and any(lo <= p < hi for p in body_pcs):
+                    keep.update(p for p in back if not lo <= p < hi)
+            return sorted(keep)
 
         # --- loops left as `L: ...; goto L;` (jvm-82) -------------------------------------------------
         def loop_jumps(self, items):
@@ -3502,6 +3543,12 @@ if _HAVE_BN:
                 return all(self.ends_flow(self.flatten(self.stmts_of(b))) or
                            (self.flatten(self.stmts_of(b)) and self.never_falls(self.flatten(self.stmts_of(b))[-1]))
                            for b in (s.true, s.false))
+            if s.operation in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE) and self.infinite_loop(s):
+                # `while (true) { .. }` without a break or goto of its own (TestSynchronizedLoop.testLoop, jvm-98)
+                items = self.flatten(self.stmts_of(s.body))
+                return not any(i.operation == Op.HLIL_BREAK for i in self.loop_breaks(items)) and \
+                    not any(i.operation == Op.HLIL_GOTO for x in items if not isinstance(x, _ExcBranch)
+                            for i in _walk(x))
             return self.ends_flow([s])
 
         def plan_syncs(self, body, lo, hi, run_at, plan):
@@ -3526,7 +3573,11 @@ if _HAVE_BN:
                 last = end - 1 if end is not None else hi
                 if end is None:
                     real = [x for x in range(k + 1, hi + 1) if not self.fold_transparent(body, x, plan)]
-                    if not real or not self.never_falls(body[real[-1]]):
+                    tail = body[real[-1]] if real else None
+                    # an endless loop closes the block only when nothing releases it (the split shapes fold a loop
+                    # left by a release, jvm-98)
+                    if not real or not self.never_falls(tail) or not isinstance(tail, _ExcBranch) and \
+                            tail.operation in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE) and self.block_exits(lock, body[k]):
                         k = self.plan_sync_split(body, k, hi, lock, run_at, plan, out)
                         continue
                 inner = body[k + 1:(end if end is not None else hi) + 1]
@@ -4742,6 +4793,20 @@ if _HAVE_BN:
             if (s.operation == Op.HLIL_VAR_INIT and s.dest in self.inline) or \
                     (idx in plan["new_at"] and plan["new_at"][idx][1] in self.inline):
                 return need_separator  # folded into its use (jvm-46)
+            if idx in plan.get("post_copy", {}) and self._finally_decided.get(plan["post_copy"][idx]):
+                return need_separator  # the try's normal-path copy of its printed finally (jvm-88)
+            if self.active_tries and not isinstance(s, _ExcBranch) and s.operation == Op.HLIL_IF:
+                for g in self.active_tries:
+                    h = next((h for h, t in g[2] if not t), None)
+                    fb = self.finally_bodies().get(h) if h is not None else None
+                    mc = self.merged_copy_at(body, idx, h) if fb is not None else None
+                    if mc is not None and self.handler_is_finally(h, fb[0]):
+                        # `if (!c) { E } J`: E with javac's copy of `finally { if (c) J }` merged in (jvm-88)
+                        plan["skip"].add(mc[1])
+                        if need_separator:
+                            tokens.scope_separator()
+                        self.emit_list(mc[0], tokens, settings, s.true)
+                        return True
             if self.finally_bodies() and not isinstance(s, _ExcBranch):
                 run = self.finally_copy_len(body, idx, plan)
                 if run is not None:
@@ -5274,15 +5339,19 @@ if _HAVE_BN:
             """jvm-80: plan["cgraph"][k] = (condition, outcome A, outcome B, kind) for the region body[k..end]"""
             s = body[k]
             if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_IF or not s.as_ast or \
-                    s.expr_index in self.consumed or k in plan.get("done", ()) or self.exc_if_parts(s) is not None:
+                    s.expr_index in self.consumed or k in plan.get("done", ()) or self.exc_if_parts(s) is not None or \
+                    k in plan.get("post_copy", ()):
                 return False
             end = self.cg_region(body, k, hi)
             if end is None:
                 return False
+            copies = plan.get("post_copy", ())
+            if any(k < m <= end for m in copies):
+                return False
             # the decisions a label leads to may follow the region: if the minimal region does not reduce,
             # try it extended over the ifs and labels right after it (its outcomes then include them)
             ext = end
-            while ext + 1 <= hi and not isinstance(body[ext + 1], _ExcBranch) and \
+            while ext + 1 <= hi and not isinstance(body[ext + 1], _ExcBranch) and ext + 1 not in copies and \
                     body[ext + 1].operation in (Op.HLIL_IF, Op.HLIL_LABEL) and body[ext + 1].as_ast:
                 ext = max(ext + 1, self.cg_region(body, ext + 1, hi) or ext + 1)
             for end in ([end, ext] if ext != end else [end]):
@@ -6300,7 +6369,7 @@ if _HAVE_BN:
                 elif fb is not None and self._try_in_loop[hpc] and self._finally_exit[hpc] is None and \
                         hpc not in self._inline_handlers:
                     kinds = self.exit_kinds(fb[0])
-                    if 'fall' in kinds and 'rethrow' not in kinds:
+                    if 'fall' in kinds and 'rethrow' not in kinds and hpc not in self._fb_rethrows:
                         # never rethrows and runs off its end inside a loop: javac jumps from there past the
                         # inline copies after the try (TestSynchronizedLoop.test12, a finally leaving a
                         # synchronized loop) -- as catch (Throwable) the copies would run after it again
@@ -6347,6 +6416,7 @@ if _HAVE_BN:
             if getattr(self, "_finally_bodies", None) is not None:
                 return self._finally_bodies
             out = {}
+            self._fb_rethrows = set()  # handlers whose code ends by rethrowing the caught exception
             for g in self.try_groups:
                 for h, t in g[2]:
                     if t:
@@ -6374,6 +6444,8 @@ if _HAVE_BN:
                             self.is_exc_plumbing(trimmed[-1]) or
                             (trimmed[-1].operation == Op.HLIL_INTRINSIC and
                              trimmed[-1].intrinsic.name in ("athrow", "__propagate"))):
+                        if not isinstance(trimmed[-1], _ExcBranch) and self.rethrow_stmt(trimmed[-1]):
+                            self._fb_rethrows.add(h)
                         trimmed.pop()  # the rethrow path: the finally clause never prints it
                     out[h] = (trimmed, var, self.norm_keys(trimmed, True))
             self._finally_bodies = out
@@ -6611,9 +6683,68 @@ if _HAVE_BN:
                 for idx, s in enumerate(body):
                     if isinstance(s, _ExcBranch) or s.expr_index in own or s.expr_index in region:
                         continue
-                    if self.copy_window(body, idx, keys, True) is not None:
+                    if self.copy_window(body, idx, keys, True) is not None or \
+                            self.merged_copy_at(body, idx, hpc) is not None:
                         return True
             return False
+
+        def finally_if(self, h):
+            """(condition, jump) of a finally body that is one else-less `if (c) { J }` with J a single break /
+            continue / return (TestLoopFinally.test3: `finally { if (x == 3) break; }`, jvm-88), else None"""
+            fb = self.finally_bodies().get(h)
+            if fb is None:
+                return None
+            real = [x for x in fb[0] if isinstance(x, _ExcBranch) or not (
+                x.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE, Op.HLIL_LABEL, Op.HLIL_VAR_DECLARE) or
+                self.is_exc_plumbing(x))]
+            if len(real) != 1 or isinstance(real[0], _ExcBranch):
+                return None
+            s = real[0]
+            if s.operation != Op.HLIL_IF or not s.as_ast or \
+                    s.false is not None and s.false.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
+                return None
+            jump = [x for x in self.flatten(self.stmts_of(s.true)) if isinstance(x, _ExcBranch) or
+                    x.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE, Op.HLIL_LABEL)]
+            if len(jump) != 1 or isinstance(jump[0], _ExcBranch) or \
+                    jump[0].operation not in (Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_RET):
+                return None
+            return s.condition, jump[0]
+
+        def merged_copy_at(self, body, idx, h):
+            """(exit items, index of the jump) when body[idx..] is javac's copy of finally h (`if (c) { J }`) before
+            an exit E that HLIL merged with it: `if (!c) { E } J` -- prints as E alone (jvm-88)"""
+            fi = self.finally_if(h)
+            s = body[idx]
+            if fi is None or isinstance(s, _ExcBranch) or s.operation != Op.HLIL_IF or not s.as_ast or \
+                    s.false is not None and s.false.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE) or \
+                    not self.negation_of(fi[0], s.condition):
+                return None
+            exit_items = self.flatten(self.stmts_of(s.true))
+            if not self.ends_flow(exit_items):
+                return None
+            q = idx + 1
+            while q < len(body) and self.hidden_item(body[q]):
+                q += 1
+            if q >= len(body) or isinstance(body[q], _ExcBranch) or \
+                    self.norm_keys([body[q]], False) != self.norm_keys([fi[1]], False):
+                return None
+            return exit_items, q
+
+        def plan_post_copies(self, body, run_at, plan):
+            """plan["post_copy"][q] = handler: body[q], right after a try run, is javac's copy of that try's
+            `finally { if (c) J }` on the normal path, followed by more code (no exit, so finally_copy_len does not
+            see it); it is hidden once the clause prints as finally, and no condition graph takes it in -- one would
+            fuse it with the loop test after it: `if (x == 3 || x >= 45) break;` (TestLoopFinally.test3, jvm-88)"""
+            for first, last, group in run_at.values():
+                h = next((h for h, t in group[2] if not t), None)
+                if h is None or self.finally_if(h) is None:
+                    continue
+                q = last + 1
+                while q < len(body) and self.hidden_item(body[q]):
+                    q += 1
+                if q < len(body) and not isinstance(body[q], _ExcBranch) and \
+                        self.norm_keys([body[q]], False) == self.finally_bodies()[h][2]:
+                    plan.setdefault("post_copy", {})[q] = h
 
         def emit_body(self, instr, tokens, settings, newline=True):
             """a block, or a single statement terminated like one"""
