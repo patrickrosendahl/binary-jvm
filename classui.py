@@ -632,8 +632,9 @@ def open_sibling(bv, info, binary_name):
     if not path or not os.path.isfile(path):
         return None
     try:
+        from .view import analyze_now
         v = BinaryViewType[bv.view_type].create(BinaryView.open(path))
-        v.update_analysis_and_wait()
+        analyze_now(v)
         return v
     except Exception:
         return None

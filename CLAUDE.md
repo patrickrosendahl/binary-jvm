@@ -17,9 +17,10 @@ statements (Vineflower 5680). 2026-10-09: jvm-79 (lambdas), jvm-44 rest (assert,
 jvm-84 (multi-catch `catch (A | B e)`) done -> 6097. 2026-10-14 (MacBook clone): jvm-82 round 3/4 (catch in
 synchronized, labeled break out of synchronized, loop at the start of synchronized, `L: ..; goto L` as
 `while (true)`) -> 6090, gotos 13, labels 10, sync_comments 9; jvm-97 filed (lambda flakiness, lost_calls ±4).
-Dump scripts take `JOBS=N`; second remote `github` (push to both). Open, in this order:
-jvm-82 rest (TestSynchronizedLoop.test12, TestSwitchLoop.test7 labels, TestEmptyBlocks), jvm-81, jvm-83, jvm-88..90
-(remaining finally shapes). jvm-15 waits for Patrick's GUI
+Dump scripts take `JOBS=N` (and `TIMEOUT=S` per batch); second remote `github` (push to both). 2026-10-23/24: jvm-97 (two suite runs identical: `view.analyze_now`, lambda HLIL on demand), jvm-81 (unused local
+classes), jvm-82 round 5 (test7/test6/TestEmptyBlocks/sync while(true)), jvm-83 (or-goto condition graphs, TWR return
+scope) -> 6264 statements, gotos 7, labels 4. Open, in this order: jvm-88..90 (finally with jumps; TestSynchronizedLoop.test12
+still prints the handler in place falling into the inline copy), jvm-83 rest (testFinallyNested). jvm-15 waits for Patrick's GUI
 click-through (BN restarted 2026-10-14 with the symlinked plugin, so jarload.py is loaded). jvm-68 still waits on binary-cpp. Use a dev load for live tests.
 
 **Project tracking:** tickets live in minitick project **`jvm`** (`jvm-N`) — use the **minitick MCP

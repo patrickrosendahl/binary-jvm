@@ -1,10 +1,12 @@
 """The "JVM Class" BinaryView: maps each method's code as a segment and defines pool symbols/types."""
 import struct
+import threading
 import traceback
 
 from binaryninja import (Architecture, BinaryView, Symbol, SymbolType, SegmentFlag, SectionSemantics, Settings,
                          SettingsScope, Type, TypeBuilder, FunctionParameter, ReturnValue, BaseStructure,
-                         CoreVariable, VariableSourceType, MetadataStoreFlag, NamedTypeReferenceClass, log_info)
+                         CoreVariable, VariableSourceType, MetadataStoreFlag, NamedTypeReferenceClass, log_info,
+                         FunctionAnalysisSkipOverride)
 
 from .constants import *
 from .opcodes import decode_instruction
@@ -218,9 +220,43 @@ def same_class_call_refs(view, reader):
                         func.add_user_code_ref(addr, target)
             off += length
 
+_finish_lock = threading.Lock()
+
 def completeUpdateWhenDone(event):
-    view = event.view
+    finish_analysis(event.view)
+
+def finish_analysis(view):
+    """switch tables, local names (LocalVariableTable), same-class call refs, components: once per view,
+    after the first analysis. Runs from the analysis-completion event; a script that renders right after
+    update_analysis_and_wait() calls it too (jvm-97: otherwise the render can race the event and print
+    locals without their LVT names) -- whichever comes second waits for the first and does nothing."""
     reader = reader_for_view(view)
+    with _finish_lock:
+        if reader is not None:
+            if getattr(reader, "analysis_finished", False):
+                return False
+            reader.analysis_finished = True
+        _finish_analysis(view, reader)
+    return True
+
+def analyze_now(view):
+    """update_analysis_and_wait() with the post-analysis steps done before returning (for a view rendered
+    right away: a sibling class, a test dump)"""
+    view.update_analysis_and_wait()
+    if not finish_analysis(view):
+        reader = reader_for_view(view)
+        if reader is not None:
+            with _finish_lock:  # functions analysed after the event (skipped ones a script forced)
+                for f in view.functions:
+                    name_locals(view, f, reader)
+    view.update_analysis_and_wait()  # the local names (also those the event set) re-run the functions
+    skipped = [f for f in view.functions if f.analysis_skipped]
+    if skipped:  # that second pass can exceed the analysis time limit on a busy instance
+        for f in skipped:
+            f.analysis_skip_override = FunctionAnalysisSkipOverride.NeverSkipFunctionAnalysis
+        view.update_analysis_and_wait()
+
+def _finish_analysis(view, reader):
     for f in view.functions:
         analyze_tables(view, f)
         if reader is not None:

@@ -39,6 +39,7 @@ for rel in CLASSES:
         for f in skipped:
             f.analysis_skip_override = b.FunctionAnalysisSkipOverride.NeverSkipFunctionAnalysis
         v.update_analysis_and_wait()
+    getattr(sys.modules[PKG + ".view"], "analyze_now", lambda v: None)(v)  # LVT names before rendering (jvm-97)
     info = pj._ClassInfo.get(v)
     for f in sorted(v.functions, key=lambda f: f.start):
         table = info.exception_table(f)

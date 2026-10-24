@@ -6,6 +6,7 @@
 #   tests/bn_pseudo_java_compare_all.sh [DEV_PKG]     (no argument: the installed plugin)
 set -e
 JOBS=${JOBS:-4}   # parallel bnrun batches; above 4 needs scriptbridge.maxParallel >= JOBS
+TIMEOUT=${TIMEOUT:-2400}   # per batch, seconds (raise it when the BN instance is shared with heavy jobs)
 REPO=/Users/patrick/dev/binary-jvm
 OUT=$REPO/.scratch/compare_all
 mkdir -p "$OUT"
@@ -23,7 +24,7 @@ for i in $(seq 0 $((JOBS - 1))); do
   { [ -n "$1" ] && echo "DEV_PKG=\"$1\""; echo "ONLY_EXC=True"
     python3 -c "print('CLASSES=' + repr(open('$OUT/batch_$i.txt').read().split()))"
     cat "$REPO/tests/bn_pseudo_java_compare.py"; } > "$OUT/run_$i.py"
-  /Users/patrick/dev/bn-script-bridge/bnrun --parallel --timeout 2400 "$OUT/run_$i.py" > "$OUT/result_$i.txt" 2>&1 &
+  /Users/patrick/dev/bn-script-bridge/bnrun --parallel --timeout $TIMEOUT "$OUT/run_$i.py" > "$OUT/result_$i.txt" 2>&1 &
 done
 wait
 grep -h "TOTAL" "$OUT"/result_*.txt

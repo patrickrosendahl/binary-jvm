@@ -301,6 +301,44 @@ def common_supertype(types, supertypes=None):
     return out
 
 
+def class_enclosing_method(data):
+    """(class, method name, descriptor) from a class file's EnclosingMethod attribute -- name and descriptor None
+    outside a method (an initializer) -- else None (pure; jvm-81)"""
+    import struct
+    try:
+        if data[:4] != b"\xca\xfe\xba\xbe":
+            return None
+        utf8, classes, end = _class_pool(data)
+        nats, i, idx = {}, 10, 1
+        count = struct.unpack_from(">H", data, 8)[0]
+        while idx < count:  # the NameAndType entries (_class_pool does not keep them)
+            tag = data[i]
+            if tag == 12:
+                nats[idx] = struct.unpack_from(">HH", data, i + 1)
+            i += 3 + struct.unpack_from(">H", data, i + 1)[0] if tag == 1 else 1 + _CP_SIZES[tag]
+            idx += 2 if tag in (5, 6) else 1
+        i = end + 6
+        i += 2 + 2 * struct.unpack_from(">H", data, i)[0]
+        for _ in ("fields", "methods"):
+            n = struct.unpack_from(">H", data, i)[0]
+            i += 2
+            for _ in range(n):
+                attrs = struct.unpack_from(">H", data, i + 6)[0]
+                i += 8
+                for _ in range(attrs):
+                    i += 6 + struct.unpack_from(">I", data, i + 2)[0]
+        for _ in range(struct.unpack_from(">H", data, i)[0]):
+            name, length = struct.unpack_from(">HI", data, i + 2)
+            if utf8.get(name) == "EnclosingMethod":
+                cls, nat = struct.unpack_from(">HH", data, i + 8)
+                mname, mdesc = nats.get(nat, (None, None))
+                return utf8.get(classes.get(cls)), utf8.get(mname), utf8.get(mdesc)
+            i += 6 + length
+        return None
+    except Exception:
+        return None
+
+
 def class_method_flags(data):
     """{(name, descriptor): access flags} of a class file's methods (pure; None if it does not parse)"""
     import struct
@@ -1266,6 +1304,21 @@ if _HAVE_BN:
                 pass
             return None
 
+        def method_local_classes(self, name, desc):
+            """[(internal name, InnerClasses entry)] of the local classes declared in method name/desc of this class"""
+            out = []
+            try:
+                for e in (self.meta or {}).get("inner_classes", []) or []:
+                    owner = e["inner"].replace(".", "/")
+                    if self.local_class(owner) is None:
+                        continue
+                    em = class_enclosing_method(self.sibling_class(owner) or b"")
+                    if em is not None and em[1] == name and em[2] == desc:
+                        out.append((owner, e))
+            except Exception:
+                pass
+            return out
+
         def class_flags(self, owner):
             """method flags of another class of the same unpacked jar / directory (None if not found)"""
             if owner not in self._flags:
@@ -1545,7 +1598,7 @@ if _HAVE_BN:
             self.monitor_windows = []
             for h in self.monitor_handlers:
                 ends = [e for s, e, hh, _ in self.table if hh == h and s >= h]
-                self.monitor_windows.append((h, (max(ends) if ends else h + 4) + 3))
+                self.monitor_windows.append((h, self.monitor_window_end(max(ends) if ends else h + 4)))
             self._in_finally = False
             self.inline = {}        # folded single-use temporary -> its value (expr, or ('new', entry)) (jvm-46)
             self.active_syncs = []  # lock variables of the synchronized blocks being printed (jvm-47)
@@ -1553,6 +1606,7 @@ if _HAVE_BN:
             self.hidden_vars = set()  # lock variables whose definition moved into a synchronized header
             self.twr_labels = set()  # labels of folded try-with-resources tails (jvm-78)
             self.goto_continue = {}  # label id -> (loop label, expr_index of gotos in nested loops) (jvm-82)
+            self.goto_break = {}     # label id -> name of the labeled block a goto to it leaves (jvm-82)
             self.twr_open = []       # resources whose try-with-resources body is being printed
             self.loop_decls = {}     # loop expr_index -> [(var, def)] declared before it (assignment in its condition)
             self._def_counts = None
@@ -1914,6 +1968,20 @@ if _HAVE_BN:
         def covering_handlers(self, pc):
             """handler pcs of the exception-table entries whose range holds pc"""
             return {h for s, e, h, _ in self.table if s <= pc < e}
+
+        def monitor_window_end(self, pc):
+            """the pc after `aload x; athrow` at pc (the rethrow ending a synchronized-cleanup handler): aload_n is
+            one byte, aload n two, wide aload four -- a fixed +3 swallowed the return after `aload_3; athrow`
+            (TestSynchronizedLoop.test7 lost its loop exit)"""
+            try:
+                code = self.function.view.read(self.function.start + pc, 5)
+                n = 1 if 0x2a <= code[0] <= 0x2d else 2 if code[0] == 0x19 else \
+                    4 if code[0] == 0xc4 and code[1] == 0x19 else None
+                if n is not None and code[n] == 0xbf:
+                    return pc + n + 1
+            except Exception:
+                pass
+            return pc + 3
 
         def in_monitor_code(self, s):
             """s lies entirely in the code of a synchronized-cleanup handler (store; monitorexit; rethrow)"""
@@ -2557,6 +2625,7 @@ if _HAVE_BN:
                 self.hidden_vars = set()
                 self.twr_labels = set()
                 self.goto_continue = {}
+                self.goto_break = {}
                 self.twr_open = []
                 self.loop_decls = {}
                 if TRY_WITH_RESOURCES:
@@ -2586,7 +2655,35 @@ if _HAVE_BN:
                 for text in self.unreachable_tries():
                     self.note(tokens, text)
                     tokens.new_line()
-            self.emit_list(self.flatten(list(instr.body)), tokens, settings, instr, is_root)
+            unused = self.unused_local_classes() if is_root else []
+            void = is_root and (self.info.method_at(self.function.start) or ("", "()V"))[1].endswith(")V")
+            if unused and not void:
+                self.emit_local_classes(unused, tokens, False)
+            self.emit_list(self.flatten(self.stmts_of(instr)), tokens, settings, instr, is_root)
+            if unused and void:
+                self.emit_local_classes(unused, tokens, True)
+
+        def unused_local_classes(self):
+            """local classes of this method no statement creates (TestSingleMethod: `class Local { .. }` only
+            declared): Vineflower prints them at the end of a void method; before the body otherwise (jvm-81)"""
+            if not ANONYMOUS_CLASSES or getattr(_anon_local, "off", False):
+                return []
+            m = self.info.method_at(self.function.start)
+            if m is None:
+                return []
+            local = self.info.method_local_classes(m[0], m[1])
+            if not local:
+                return []
+            text = "\n".join(str(i) for i in self.hlil.instructions)  # `new(&pkg/Outer$1Local)`
+            return [x for x in local if "&" + x[0] + ")" not in text]
+
+        def emit_local_classes(self, local, tokens, at_end):
+            for owner, entry in local:
+                if any(t.type != TT.IndentationToken for t in tokens.current_tokens):
+                    tokens.new_line()
+                if at_end:
+                    tokens.scope_separator()
+                self.emit_local_class(owner, entry, tokens, trailing_blank=not at_end)
 
         def unreachable_tries(self):
             """notes for try statements none of whose handlers has code in the function: nothing in the try
@@ -2730,9 +2827,34 @@ if _HAVE_BN:
                     goto_loops = self.plan_goto_loops(body, lo, hi, run_at, sync_at, plan)
                 except Exception:
                     goto_loops = {}
+            goto_blocks = {}
+            if GOTO_LOOPS and block.as_ast:
+                try:
+                    goto_blocks = self.plan_goto_blocks(body, lo, hi, run_at, sync_at, plan, goto_loops)
+                except Exception:
+                    goto_blocks = {}
             need_separator = None  # None: nothing emitted yet in this range
             idx = lo
             while idx <= hi:
+                if idx in goto_blocks:
+                    if need_separator is not None:
+                        tokens.scope_separator()
+                    q, name, lid = goto_blocks[idx]
+                    try:
+                        self.txt(tokens, name + ":")
+                        tokens.begin_scope(ScopeType.BlockScopeType)
+                        self.goto_break[lid] = name
+                        try:
+                            self.emit_range(body, idx, q - 1, plan, tokens, settings, block)
+                        finally:
+                            tokens.end_scope(ScopeType.BlockScopeType)
+                        tokens.finalize_scope()
+                        tokens.new_line()
+                    except Exception as ex:
+                        self.emit_error(body[idx], ex, tokens)
+                    idx = q  # the label itself prints nothing
+                    need_separator = True
+                    continue
                 if idx in goto_loops:
                     if need_separator is not None:
                         tokens.scope_separator()
@@ -2824,6 +2946,11 @@ if _HAVE_BN:
                 uses = self.label_uses(lid)
                 q = next((m for m in range(hi, p, -1) if not self.hidden_item(body[m])), None)
                 g = body[q] if q is not None else None
+                if_loop = self.goto_if_loop(body, p, hi, lid, uses, run_at, sync_at, plan)
+                if if_loop is not None:
+                    out[p] = if_loop
+                    p += 2
+                    continue
                 if g is None or isinstance(g, _ExcBranch) or g.operation != Op.HLIL_GOTO or \
                         g.target.label_id != lid or uses < 1 or \
                         any(p <= a <= q or p <= b <= q for a, b, _ in run_at.values()) or \
@@ -2853,7 +2980,98 @@ if _HAVE_BN:
                 p = q + 1
             return out
 
+        def cleanup_rethrow(self, body, idx):
+            """the exception a `break` rethrows: `exc = e; break` where the assignment is an athrow (aload e;
+            athrow) inside the range of a synchronized block's cleanup handler -- the break only reaches that
+            handler (monitorexit; rethrow), else None"""
+            if idx < 1 or not self.monitor_handlers:
+                return None
+            a = body[idx - 1]
+            if isinstance(a, _ExcBranch) or a.operation != Op.HLIL_ASSIGN or a.dest.operation != Op.HLIL_VAR or \
+                    not self.is_exc_var(a.dest.var) or a.src.operation != Op.HLIL_VAR:
+                return None
+            pc = a.address - self.function.start
+            try:
+                code = self.function.view.read(a.address, 4)
+            except Exception:
+                return None
+            n = 1 if 0x2a <= code[0] <= 0x2d else 2 if code[0] == 0x19 else 0 if code[0] == 0xbf else None
+            if n is None or code[n] != 0xbf:
+                return None
+            if not any(s <= pc < e and h in self.monitor_handlers for s, e, h, _ in self.table):
+                return None
+            return a.src
+
+        def plan_goto_blocks(self, body, lo, hi, run_at, sync_at, plan, goto_loops):
+            """{j: (index q of label L, block label, L's id)} for `S_j..S_q-1; L: T` where every jump to L lies in
+            S_j..S_q-1 and one sits in a loop nested there (no plain break can reach L): printed as
+            `labelN: { S_j..S_q-1 }` with the gotos as `break labelN` (TestSwitchLoop.test6)"""
+            out = {}
+            for q in range(lo + 1, hi + 1):
+                lab = body[q]
+                if isinstance(lab, _ExcBranch) or lab.operation != Op.HLIL_LABEL:
+                    continue
+                lid = lab.target.label_id
+                uses = self.label_uses(lid)
+                if uses < 1 or lid in self.goto_continue or lid in self.goto_break:
+                    continue
+                n, nested, j = 0, False, None
+                for m in range(q - 1, lo - 1, -1):
+                    x = body[m]
+                    if isinstance(x, _ExcBranch):
+                        break
+                    for i, in_loop, in_sw in self.loop_jumps([x]):
+                        if i.operation == Op.HLIL_GOTO and i.target.label_id == lid:
+                            n += 1
+                            nested = nested or in_loop or in_sw
+                            j = m
+                    if n == uses:
+                        break
+                if n != uses or not nested or j is None:
+                    continue
+                if any(j <= a <= q or j <= b <= q for a, b, _ in run_at.values()) or \
+                        any(j <= a <= q or j <= v[0] <= q for a, v in sync_at.items()) or \
+                        any(j <= a <= q for a in goto_loops) or any(a <= q <= v[0] for a, v in goto_loops.items()) or \
+                        any(m in plan.get("folded", ()) or m in plan.get("done", ()) or m in plan["skip"]
+                            for m in range(j, q + 1)) or any(j <= a <= q for a in out):
+                    continue
+                out[j] = (q, "label%d" % (lab.address - self.function.start), lid)
+            return out
+
+        def goto_if_loop(self, body, p, hi, lid, uses, run_at, sync_at, plan):
+            """(index of the if, loop label or None, gotos needing it, the if) for `L: if (c) { B }` (no else)
+            where every jump to L lies in B: a loop whose exits fall out of B (TestSwitchLoop.test7)"""
+            k = p + 1
+            if k > hi or uses < 1:
+                return None
+            iff = body[k]
+            if isinstance(iff, _ExcBranch) or iff.operation != Op.HLIL_IF or self.exc_if_parts(iff) is not None or \
+                    (iff.false is not None and iff.false.operation not in (Op.HLIL_NOP,)) or \
+                    any(p <= a <= k or p <= b <= k for a, b, _ in run_at.values()) or \
+                    any(p <= a <= k or p <= v[0] <= k for a, v in sync_at.items()) or \
+                    any(m in plan.get("folded", ()) or m in plan.get("done", ()) or m in plan["skip"]
+                        for m in (p, k)):
+                return None
+            items = self.flatten(self.stmts_of(iff.true))
+            if any(isinstance(x, _ExcBranch) for x in items):
+                return None
+            n, nested = 0, set()
+            for i, in_loop, in_sw in self.loop_jumps([iff.true]):
+                if i.operation == Op.HLIL_GOTO:
+                    if i.target.label_id == lid:
+                        n += 1
+                        if in_loop:
+                            nested.add(i.expr_index)
+                elif not in_loop and (i.operation == Op.HLIL_CONTINUE or not in_sw):
+                    return None  # a break / continue of the enclosing loop would bind to the new one
+            if n != uses:
+                return None
+            name = "label%d" % (body[p].address - self.function.start) if nested else None
+            return (k, name, nested, iff)
+
         def emit_goto_loop(self, body, p, loop, plan, tokens, settings, block):
+            if len(loop) == 4:
+                return self.emit_goto_if_loop(body, p, loop, tokens, settings)
             q, name, nested = loop
             lid = body[p].target.label_id
             if name is not None:
@@ -2872,6 +3090,36 @@ if _HAVE_BN:
                 self.emit_range(body, p + 1, q - 1, plan, tokens, settings, block)
             finally:
                 plan["root"], plan["list_kind"] = saved
+                tokens.end_scope(ScopeType.BlockScopeType)
+            tokens.finalize_scope()
+            tokens.new_line()
+
+        def emit_goto_if_loop(self, body, p, loop, tokens, settings):
+            """`L: if (c) { B }` -> `[label:] while (c) { B break; }`: gotos to L continue the loop, the end of B
+            (when it can fall through) leaves it"""
+            _, name, nested, iff = loop
+            if name is not None:
+                self.txt(tokens, name + ":")
+                tokens.new_line()
+            self.kw(tokens, "while ")
+            self._loop_cond(iff.condition, tokens, settings)
+            tokens.begin_scope(ScopeType.BlockScopeType)
+            self.goto_continue[body[p].target.label_id] = (name, nested)
+            items = self.flatten(self.stmts_of(iff.true))
+            self._loop_depth += 1
+            self._loop_pending = True
+            try:
+                self.emit_list(items, tokens, settings, iff.true)
+                if not self.ends_flow(items):
+                    last = [x for x in items if not isinstance(x, _ExcBranch)][-1:]
+                    if last and last[0].operation in (Op.HLIL_IF, Op.HLIL_WHILE, Op.HLIL_DO_WHILE, Op.HLIL_FOR,
+                                                      Op.HLIL_SWITCH):
+                        tokens.scope_separator()
+                    self.kw(tokens, "break")
+                    tokens.append_semicolon()
+                    tokens.new_line()
+            finally:
+                self._loop_depth -= 1
                 tokens.end_scope(ScopeType.BlockScopeType)
             tokens.finalize_scope()
             tokens.new_line()
@@ -3323,7 +3571,7 @@ if _HAVE_BN:
                 return None
             s = body[j]
             if not any(a <= j and b >= k for a, b, _ in run_at.values()):
-                lp = self.sync_loop_shape(body, k, j, lock)
+                lp = self.sync_loop_shape(body, k, j, lock) or self.sync_wloop_shape(body, k, j, lock)
                 if lp is not None:
                     return lp
             if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_IF or \
@@ -3417,6 +3665,41 @@ if _HAVE_BN:
                 return ('loop', j, leave_true, q, bi, br[-1], pre, li[rel[0]:], li[rel[0]], leave, loop_b)
             return None
 
+        def sync_wloop_shape(self, body, k, j, lock):
+            """('loop', .., test): `enter; S; while (true) { if (c) { pre; exit; T } B }` -- the block's only release
+            leaves the loop -> synchronized { S; while (!c) { B } pre } T (TestSynchronizedLoop.test7, jvm-82)"""
+            w = body[j]
+            if isinstance(w, _ExcBranch) or w.operation not in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE) or \
+                    not w.as_ast or not self.infinite_loop(w) or self.block_exits(lock, body[k]) != 1 or \
+                    self.monitor_exits(body[k + 1:j], lock):
+                return None
+            items = self.flatten(self.stmts_of(w.body))
+            real = [m for m, x in enumerate(items) if not self.hidden_item(x)]
+            if len(real) < 2:
+                return None
+            s = items[real[0]]
+            if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_IF or self.exc_if_parts(s) is not None or \
+                    (s.false is not None and s.false.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE)):
+                return None
+            li = self.flatten(self.stmts_of(s.true))
+            rel = [m for m, x in enumerate(li) if not isinstance(x, _ExcBranch) and
+                   self.monitor_var(x, "monitorexit") == lock and not self.in_monitor_code(x)]
+            if len(rel) != 1 or self.monitor_exits(li, lock) != 1 or not self.exit_leaves(li[rel[0] + 1:]):
+                return None
+            pre = li[:rel[0]]
+            if any(isinstance(x, _ExcBranch) or x.operation in COMPOUND or
+                   x.operation in (Op.HLIL_RET, Op.HLIL_GOTO, Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_LABEL)
+                   for x in pre if not self.hidden_item(x)):
+                return None
+            bi = items[real[0] + 1:]
+            if any(isinstance(x, _ExcBranch) and not self.hidden_item(x) or not isinstance(x, _ExcBranch) and
+                   any(i.operation in (Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_RET, Op.HLIL_GOTO, Op.HLIL_LABEL)
+                       or self.monitor_var(i, "monitorenter") == lock or self.monitor_var(i, "monitorexit") == lock
+                       for i in _walk(x))
+                   for x in bi):
+                return None  # (B is the whole loop body: no jumps, no lock operations)
+            return ('loop', j, True, j, bi, None, pre, li[rel[0]:], li[rel[0]], s.true, w.body, s.condition)
+
         def emit_sync_split(self, body, k, shape, lock, value, plan, tokens, settings, block):
             j = shape[1]
             s = body[j]
@@ -3441,16 +3724,18 @@ if _HAVE_BN:
                     self.emit_range(body, k + 1, head_end, plan, tokens, settings, block)
                     tokens.scope_separator()
                 if shape[0] == 'loop':
-                    _, _, leave_true, _, bi, goto, pre, after, release, after_blk, loop_blk = shape
+                    _, _, leave_true, _, bi, goto, pre, after, release, after_blk, loop_blk = shape[:11]
+                    test = shape[11] if len(shape) > 11 else s.condition  # (sync_wloop_shape: the exit's if)
                     self.kw(tokens, "while ")
                     tokens.append_open_paren()
                     if leave_true:
-                        self.emit_negated(s.condition, tokens, settings)
+                        self.emit_negated(test, tokens, settings)
                     else:
-                        self.expr(s.condition, tokens, settings)
+                        self.expr(test, tokens, settings)
                     tokens.append_close_paren()
                     tokens.begin_scope(ScopeType.BlockScopeType)
-                    self.consumed.add(goto.expr_index)  # the jump back is the loop's
+                    if goto is not None:
+                        self.consumed.add(goto.expr_index)  # the jump back is the loop's
                     self.emit_list(bi, tokens, settings, loop_blk)
                     tokens.end_scope(ScopeType.BlockScopeType)
                     tokens.finalize_scope()
@@ -3496,11 +3781,13 @@ if _HAVE_BN:
                     not isinstance(real_after[-1], _ExcBranch) and real_after[-1].operation == Op.HLIL_CONTINUE and \
                     self.rest_hidden(body, j, plan):
                 self.consumed.add(real_after[-1].expr_index)  # ends the loop body: the loop's implicit continue
-            if [x for x in after if not self.hidden_item(x)]:
+            # at the method's end it is the method's end: a final `return;` is dropped there too
+            at_end = label is None and bool(plan.get("root")) and self.rest_hidden(body, j, plan)
+            shown = [x for x in after if not self.hidden_item(x) and not (
+                at_end and not isinstance(x, _ExcBranch) and x.operation == Op.HLIL_RET and len(x.src) == 0)]
+            if shown:
                 tokens.scope_separator()
-                # at the method's end it is the method's end: a final `return;` is dropped there too
-                self.emit_list(after, tokens, settings, after_blk,
-                               is_root=label is None and bool(plan.get("root")) and self.rest_hidden(body, j, plan))
+                self.emit_list(after, tokens, settings, after_blk, is_root=at_end)
             if label is not None:
                 tokens.end_scope(ScopeType.BlockScopeType)
                 tokens.finalize_scope()
@@ -4296,6 +4583,9 @@ if _HAVE_BN:
                 ry = [k for k, y in enumerate(y_items) if not self.hidden_item(y)]
                 if not ry:
                     continue
+                got = self.or_goto_shape(x_items, y_items, ry, x_true, s, body, idx)
+                if got is not None:
+                    return got
                 g = y_items[ry[-1]]
                 if isinstance(g, _ExcBranch) or g.operation != Op.HLIL_GOTO:
                     continue
@@ -4312,7 +4602,66 @@ if _HAVE_BN:
                 return ('split', head if x_true else other, other if x_true else head, tail)
             return None
 
+        def or_goto_shape(self, x_items, y_items, ry, x_true, s, body, idx):
+            """('or', T-condition, Y, T): `if (c1) { L: T } else { if (c2) goto L; Y }` -- T runs when
+            c1 || c2 (a condition graph javac left with a goto; TestTryWithResourcesReturn.testComplex1)"""
+            rx = [x for x in x_items if not self.hidden_item(x)]
+            if not rx or isinstance(rx[0], _ExcBranch) or rx[0].operation != Op.HLIL_LABEL:
+                return None
+            lid = rx[0].target.label_id
+            pre, k = [], 0  # single-use temporaries the second test reads (`T t = c2; if (t == 0) goto L`)
+            while k < len(ry) and not isinstance(y_items[ry[k]], _ExcBranch) and \
+                    y_items[ry[k]].operation == Op.HLIL_VAR_INIT and self.var_count(y_items[ry[k]].dest) == 1:
+                pre.append(y_items[ry[k]])
+                k += 1
+            if k >= len(ry):
+                return None
+            g = y_items[ry[k]]
+            if pre and (isinstance(g, _ExcBranch) or g.operation != Op.HLIL_IF or
+                        any(self.refs(g.condition, d.dest) != 1 for d in pre)):
+                return None
+            if isinstance(g, _ExcBranch) or g.operation != Op.HLIL_IF or self.label_uses(lid) != 1 or \
+                    self.exc_if_parts(g) is not None or \
+                    (g.false is not None and g.false.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE)):
+                return None
+            inner = [x for x in self.flatten(self.stmts_of(g.true)) if not self.hidden_item(x)]
+            if len(inner) != 1 or isinstance(inner[0], _ExcBranch) or inner[0].operation != Op.HLIL_GOTO or \
+                    inner[0].target.label_id != lid:
+                return None
+            tail = x_items[x_items.index(rx[0]) + 1:]
+            rest = y_items[ry[k] + 1:]
+            if not [x for x in tail if not self.hidden_item(x)] or self.mentions_exc(s.condition) or \
+                    self.mentions_exc(g.condition) or self.used_in(tail + body[idx + 1:], self.declared_in(rest)):
+                return None
+            c1 = s.condition if x_true else ('not', s.condition)
+            return ('or', ('or', c1, g.condition), rest, tail, pre)
+
         def emit_if_goto(self, s, shape, body, plan, tokens, settings, block, with_tail=True):
+            if shape[0] == 'or':
+                _, cond, rest, tail, pre = shape
+                for d in pre:
+                    self.inline[d.dest] = d.src
+                    self.consumed.add(d.expr_index)
+                ends = self.ends_flow([x for x in rest if not self.hidden_item(x)])
+                self.kw(tokens, "if ")
+                tokens.append_open_paren()
+                self.emit_bexpr(cond, tokens, settings, P.TopLevelOperatorPrecedence, negate=True)
+                tokens.append_close_paren()
+                tokens.begin_scope(ScopeType.BlockScopeType)
+                self.emit_list(rest, tokens, settings, s.false)
+                tokens.end_scope(ScopeType.BlockScopeType)
+                if not ends:
+                    tokens.scope_continuation(False)
+                    self.kw(tokens, "else")
+                    tokens.begin_scope(ScopeType.BlockScopeType)
+                    self.emit_list(tail, tokens, settings, s.true)
+                    tokens.end_scope(ScopeType.BlockScopeType)
+                tokens.finalize_scope()
+                tokens.new_line()
+                if ends:
+                    tokens.scope_separator()
+                    self.emit_list(tail, tokens, settings, s.true)
+                return
             if shape[0] == 'skip':
                 q, i0 = shape[1], shape[2]
                 self.kw(tokens, "if ")
@@ -4566,6 +4915,26 @@ if _HAVE_BN:
                 # `goto L` right before L (also at the end of a branch whose statement is followed by L)
                 self.hidden_gotos[s.target.label_id] = self.hidden_gotos.get(s.target.label_id, 0) + 1
                 return need_separator
+            if s.operation == Op.HLIL_BREAK and self.cleanup_rethrow(body, idx) is not None:
+                # `exc = e; break` into a synchronized block's cleanup handler: javac's `aload e; athrow`
+                if need_separator:
+                    tokens.scope_separator()
+                self.kw(tokens, "throw ")
+                # the caught exception: named by the clause printing it, `e` in a handler printed in place
+                tokens.append(_tok(TT.LocalVariableToken, self.exc_names[-1] if self.exc_names else "e"))
+                tokens.append_semicolon()
+                tokens.new_line()
+                return False
+            if s.operation == Op.HLIL_GOTO and s.target.label_id in self.goto_break:
+                if need_separator:
+                    tokens.scope_separator()
+                self.kw(tokens, "break")
+                self.txt(tokens, " " + self.goto_break[s.target.label_id])
+                tokens.append_semicolon()
+                tokens.new_line()
+                return False
+            if s.operation == Op.HLIL_LABEL and s.target.label_id in self.goto_break:
+                return need_separator  # the end of its labeled block (jvm-82)
             if s.operation == Op.HLIL_LABEL:
                 try:
                     uses = len(self.hlil.get_label_uses(s.target.label_id))
@@ -5380,13 +5749,14 @@ if _HAVE_BN:
             tail = self.twr_tail(body, last + 1, hi, r) or self.twr_bare_tail(body, last + 1, hi, r) or []
             # `return v;` right after the close was inside the body (javac closes before it)
             ret = None
-            if tail:
-                j = tail[-1] + 1
+            if tail or self.used_in(body[last + 1:hi + 1], self.declared_in(body[first:last + 1])):
+                j = tail[-1] + 1 if tail else last + 1
                 while j <= hi and (isinstance(body[j], _ExcBranch) or self.is_exc_plumbing(body[j]) or
                                    body[j].operation in (Op.HLIL_LABEL, Op.HLIL_NOP)):
                     j += 1
-                if j <= hi and body[j].operation == Op.HLIL_RET and self.refs(body[j], r):
-                    ret = j
+                if j <= hi and not isinstance(body[j], _ExcBranch) and body[j].operation == Op.HLIL_RET and \
+                        (self.refs(body[j], r) or self.used_in([body[j]], self.declared_in(body[first:last + 1]))):
+                    ret = j  # (also `T v = ..;` in the body, `return v;` after it: v is out of scope there)
             # the group travels with the mark: two try regions can share a start pc (jvm-78)
             plan.setdefault("twr", {})[(first, group[0], group[1])] = {"var": r, "init": init, "ret": ret}
             done = plan.setdefault("done", set())
@@ -5927,6 +6297,16 @@ if _HAVE_BN:
                     # stays where it is (an `on exception` block inside the loop), the clause is a stub
                     self._inline_handlers.add(hpc)
                     self.placed_handlers.discard(hpc)
+                elif fb is not None and self._try_in_loop[hpc] and self._finally_exit[hpc] is None and \
+                        hpc not in self._inline_handlers:
+                    kinds = self.exit_kinds(fb[0])
+                    if 'fall' in kinds and 'rethrow' not in kinds:
+                        # never rethrows and runs off its end inside a loop: javac jumps from there past the
+                        # inline copies after the try (TestSynchronizedLoop.test12, a finally leaving a
+                        # synchronized loop) -- as catch (Throwable) the copies would run after it again
+                        self._inline_handlers.add(hpc)
+                        self.placed_handlers.discard(hpc)
+                        self._finally_decided.pop(hpc, None)
                 if old != (self._finally_exit[hpc], self._try_in_loop[hpc]):
                     self._finally_decided.pop(hpc, None)
 
@@ -6282,10 +6662,23 @@ if _HAVE_BN:
             tokens.end_scope(ScopeType.BlockScopeType if scope is None else scope)
 
         def do_while_compute(self, w):
-            """(x, `x = e`) when a do-while's body only computes the value its test reads once, else None"""
+            """(x, `x = e`, {temporary: folded new}) when a do-while's body only computes the value its test reads once, else None"""
             if not LOOP_CONDITIONS or self.exc_test(w.condition) is not None:
                 return None
             items = [x for x in self.flatten(self.stmts_of(w.body)) if not self.hidden_item(x)]
+            news = {}
+            if len(items) > 1 and not any(isinstance(y, _ExcBranch) for y in items):
+                # `T t = new C(..); x = t.m(..)` with t used once (TestEmptyBlocks: new Random().nextBoolean())
+                bplan = self.plan_block(items)
+                rest = [i for i in range(len(items)) if i not in bplan["skip"]]
+                if len(rest) == 2 and rest[0] in bplan["new_at"]:
+                    entry = bplan["new_at"][rest[0]]
+                    t = entry[1]
+                    if entry[0].operation != Op.HLIL_VAR_INIT or self.var_count(t) != 2 or \
+                            self.def_count(t) != 1 or self.refs(items[rest[1]], t) != 1:
+                        return None
+                    news[t] = ('new', entry)
+                    items = [items[rest[1]]]
             if len(items) != 1 or isinstance(items[0], _ExcBranch) or \
                     items[0].operation not in (Op.HLIL_ASSIGN, Op.HLIL_VAR_INIT):
                 return None
@@ -6297,7 +6690,7 @@ if _HAVE_BN:
             before, found = self.eval_nodes(w.condition, x)
             if found is not True or any(self.side_effect(i) for i in before):
                 return None
-            return x, a
+            return x, a, news
 
         def do_while_break(self, w):
             """the `if (x) break;` that ends a do-while's body right before its test, marked consumed (it
@@ -6343,6 +6736,19 @@ if _HAVE_BN:
             o = instr.operation
             if o == Op.HLIL_BLOCK:
                 self.emit_block(instr, tokens, settings)
+            elif not getattr(self, "_framing_root", False) and self.hlil is not None and \
+                    self.hlil.root is not None and instr.expr_index == self.hlil.root.expr_index:
+                # a method whose body collapses to a single statement (e.g. dead code eliminated down to a
+                # bare `return`) has that statement as the HLIL root, not a block -- frame it through
+                # emit_block/stmts_of so it goes through the statement emitter (which drops a void `return`
+                # and terminates others with `;`), not the raw expression path that emits `return}`.
+                # _framing_root guards the re-entry: emit_stmt renders the statement's own expression by
+                # calling back here with the same (root) instr, which must take the plain expression path.
+                self._framing_root = True
+                try:
+                    self.emit_block(instr, tokens, settings)
+                finally:
+                    self._framing_root = False
             elif o == Op.HLIL_IF:
                 if instr.as_ast and self.exc_if_parts(instr) is not None:
                     # exception test as a single statement (not in a block): normal path in line, the
@@ -6383,7 +6789,8 @@ if _HAVE_BN:
                     self._scoped(instr, instr.body, tokens, settings)
                     tokens.finalize_scope()
                 elif instr.as_ast and self.do_while_compute(instr) is not None:
-                    x, asg = self.do_while_compute(instr)
+                    x, asg, news = self.do_while_compute(instr)
+                    self.inline.update(news)
                     self.inline[x] = asg.src  # `do { x = e; } while (x)` -> `while (e) { }` (jvm-82)
                     self.consumed.add(asg.expr_index)
                     self.kw(tokens, "while ")
@@ -6624,6 +7031,9 @@ if _HAVE_BN:
                 self.note(tokens, "/* jump -> ")
                 self.expr(instr.dest, tokens, settings)
                 self.note(tokens, " */")
+            elif o == Op.HLIL_GOTO and instr.target.label_id in self.goto_break:
+                self.kw(tokens, "break")
+                self.txt(tokens, " " + self.goto_break[instr.target.label_id])
             elif o == Op.HLIL_GOTO and instr.target.label_id in self.goto_continue:
                 name, nested = self.goto_continue[instr.target.label_id]  # a loop's continue (jvm-82)
                 self.kw(tokens, "continue")
@@ -6736,14 +7146,30 @@ if _HAVE_BN:
                 hint = self.expr_name_hint(d.src)
                 if hint:
                     return hint
-            return name_from_type(self.defs_java_type(var) or java_type_of(var.type))
+            return name_from_type(self.named_type(self.defs_java_type(var) or java_type_of(var.type)))
+
+        def named_type(self, t):
+            """an anonymous class (Outer$1) is named after its supertype: `new ArrayList<String>() {..}` -> arrayList"""
+            if t and re.search(r"\$\d+$", t):
+                own = self.info.class_name or ""
+                sup = None
+                for owner in (t.replace(".", "/"), own.rsplit("/", 1)[0] + "/" + t if "/" in own else t):
+                    try:
+                        sup = self.info.anonymous_supertype(owner)  # (a printed name lacks the package)
+                    except Exception:
+                        sup = None
+                    if sup:
+                        break
+                if sup:
+                    return sup
+            return t
 
         def expr_name_hint(self, e):
             o = e.operation
             if o == Op.HLIL_INTRINSIC:
                 n = e.intrinsic.name
                 if n in ("checkcast", "new", "newarray", "anewarray", "multianewarray"):
-                    return name_from_type(self.expr_java_type(e))
+                    return name_from_type(self.named_type(self.expr_java_type(e)))
                 if n == "getfield" and len(e.params) > 1:
                     m = re.search(r"[./]([A-Za-z_$][\w$]*)\W*$", str(e.params[1]))
                     return name_from_method(m.group(1)) if m else None
@@ -7643,7 +8069,7 @@ if _HAVE_BN:
             self.txt(tokens, rows[-1].strip())
             return True
 
-        def emit_local_class(self, owner, entry, tokens):
+        def emit_local_class(self, owner, entry, tokens, trailing_blank=True):
             """`class Local { .. }` on the lines before the statement that first creates the local class (jvm-81):
             the line being built is set aside while the declaration is emitted"""
             done = self.__dict__.setdefault("_local_declared", set())
@@ -7659,10 +8085,15 @@ if _HAVE_BN:
                 if t.type != TT.IndentationToken:
                     break
                 lead.append(t)
-            for row in local_class_declaration(lines, entry["name"]):
+            rows = local_class_declaration(lines, entry["name"])
+            while not trailing_blank and rows and not rows[-1].strip():
+                rows = rows[:-1]
+            for row in rows:
                 tokens.current_tokens = lead + [_tok(TT.TextToken, row)] if row.strip() else [_tok(TT.TextToken, "")]
                 tokens.new_line()
-            tokens.current_tokens = line
+            if len(lead) < len(line):
+                tokens.current_tokens = line  # (a line holding only its indentation starts afresh: the method's
+                #                                closing brace after a declaration at the end keeps its own indent)
 
         def emit_lambda(self, call, idx, args, tokens, settings, precedence):
             """an invokedynamic through LambdaMetafactory as `(a, b) -> body` (from the synthetic lambda$ method of
@@ -7805,6 +8236,13 @@ if _HAVE_BN:
             if lf is None or key in active:
                 return False
             hlil = lf.hlil_if_available
+            if hlil is None:
+                from binaryninja.mainthread import is_main_thread
+                if not is_main_thread():
+                    # not generated yet, or dropped from BN's IL cache (a busy instance): off the UI thread
+                    # it can be built here -- otherwise the lambda printed as the invokedynamic in some runs
+                    # and not in others (jvm-97)
+                    hlil = lf.hlil
             if hlil is None or hlil.root is None:
                 return False
             static = bool(flags & ACC_STATIC)
@@ -8402,8 +8840,9 @@ if _HAVE_BN:
             return None
         lines = None
         try:
+            from .view import analyze_now
             iv = BinaryViewType[view.view_type].create(BinaryView.open(other))
-            iv.update_analysis_and_wait()
+            analyze_now(iv)
             try:
                 lines = classui.render_class(iv, {"flags": entry["access_flags"], "anonymous": not entry["name"],
                                                   "outer": own}, set(), {})

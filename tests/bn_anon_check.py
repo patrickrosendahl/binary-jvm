@@ -25,6 +25,7 @@ failed = 0
 for build in BUILDS:
     v = vt.create(b.BinaryView.open(os.path.join(REPO, "tests/synthetic", build, "jvmtest/Anon.class")))
     v.update_analysis_and_wait()
+    getattr(sys.modules[PKG + ".view"], "analyze_now", lambda v: None)(v)  # LVT names before rendering (jvm-97)
     text = "\n".join(classui.render_class(v))
     v.file.close()
     missing = [e for e in EXPECTED if e not in text]

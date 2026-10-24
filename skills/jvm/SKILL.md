@@ -57,8 +57,9 @@ Universal view active — switch to "JVM Class" (GUI: view dropdown; bridge: `--
    `tests/bn_pseudo_java_compare_all.sh` (~15 min, background). Java 8 constructs: `tests/vineflower_suite.py prep`, `bn_dump_all.sh suite`,
    `vineflower_suite.py compare` (Vineflower's own tests, jvm-77). The dump scripts take `JOBS=N` (default 4 = bridge
    `scriptbridge.maxParallel`; more batches are slower, GIL-bound). Warn sessions sharing the BN instance
-   (binary-cpp) before a gate round — a heavy job alongside made compare_all time out. `lost_calls` in the suite
-   flips by about ±4 between runs (jvm-97). Run all of them before resolving a ticket
+   (binary-cpp) before a gate round — a heavy job alongside made compare_all time out; with the instance shared by
+   heavy jobs pass `TIMEOUT=7200` (per batch, dump scripts and compare_all; default 1800 / 2400). Two suite runs are
+   identical since jvm-97 (LVT names applied before rendering via `view.analyze_now`, lambda HLIL built on demand). Run all of them before resolving a ticket
    that touches `view.py`, `classfile.py`, `classui.py` or `pseudo_java.py`, not only the ones for the file you changed.
 3. Real install (**installed**): symlink the
    repo as `plugins/binary-jvm` and set the Universal exclusion; after changing
