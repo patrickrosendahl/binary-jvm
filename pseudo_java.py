@@ -1592,6 +1592,7 @@ if _HAVE_BN:
             self.hoisted = set()
             self.active_tries = []
             self.exc_names = []           # name `exc` prints as inside a catch body
+            self.exc_owners = []          # the exception variable of each exc_names entry's clause, or None
             self.hidden_gotos = {}        # label id -> gotos to it not printed
             self._follow = []             # label reached after the statement being printed (or None)
             self._sites = None
@@ -1614,6 +1615,8 @@ if _HAVE_BN:
             self._def_counts = None
             self.deferred = set()           # expr_index of handler code met in a try body, printed by its catch
             self.printed_handlers = set()   # handler pcs whose catch/finally clause was printed
+            self.own_open = []      # handler bodies being printed (emit_list own=True): [items, statements below]
+            self.claimed = set()    # statements of such a body a nested catch clause printed (jvm-102)
             self.var_subst = {}     # subroutine parameter -> caller expression (jsr finally bodies, jvm-51)
             self._finally_subs = None
             self._concat = {}       # expr_index of toString / indy call -> [(expr|str, is_string)]
@@ -2622,6 +2625,7 @@ if _HAVE_BN:
                 self.consumed = set()
                 self.hoisted = set()
                 self.exc_names = []
+                self.exc_owners = []
                 self.hidden_gotos = {}
                 self._follow = []
                 self.inline = {}
@@ -2645,6 +2649,8 @@ if _HAVE_BN:
                                 pass
                 self.deferred = set()
                 self.printed_handlers = set()
+                self.own_open = []
+                self.claimed = set()
                 self.count_discount = {}
                 self.break_subst = {}
                 self.break_used = set()
@@ -2733,7 +2739,13 @@ if _HAVE_BN:
             plan["copy_end_ok"] = not own and (is_root or self._loop_pending)
             plan["list_kind"] = None if own else 'root' if is_root else 'loop' if self._loop_pending else None
             self._loop_pending = False
-            self.emit_range(body, 0, len(body) - 1, plan, tokens, settings, block)
+            if own:
+                self.own_open.append([body, None])
+            try:
+                self.emit_range(body, 0, len(body) - 1, plan, tokens, settings, block)
+            finally:
+                if own:
+                    self.own_open.pop()
 
         def emit_range(self, body, lo, hi, plan, tokens, settings, block):
             """emit body[lo..hi], wrapping the try regions that fit (not already open further out)"""
@@ -2962,6 +2974,25 @@ if _HAVE_BN:
                 if lo <= head < hi and any(lo <= p < hi for p in body_pcs):
                     keep.update(p for p in back if not lo <= p < hi)
             return sorted(keep)
+
+        def cond_throws_in_try(self, w, exprs):
+            """the loop test of w (exprs: its definitions and condition) can throw and lies in a try range that is
+            printed inside the body (loop_try_pcs): moved into the loop header it would leave the try, and an
+            exception it throws would propagate instead of being caught (TestTryLoop.hasNext, jvm-101); reading a
+            field of `this` or a local cannot throw"""
+            if not self.loop_try_pcs(w):
+                return False
+            for e in exprs:
+                for i in _walk(e):
+                    if self.side_effect(i):
+                        return True
+                    if self.reads_memory(i):
+                        if i.operation == Op.HLIL_INTRINSIC and i.intrinsic.name == "getfield" and i.params and \
+                                i.params[0].operation == Op.HLIL_VAR and self.this_var is not None and \
+                                i.params[0].var == self.this_var:
+                            continue
+                        return True
+            return False
 
         # --- loops left as `L: ...; goto L;` (jvm-82) -------------------------------------------------
         def loop_jumps(self, items):
@@ -4052,6 +4083,8 @@ if _HAVE_BN:
             if k >= len(items) or isinstance(items[k], _ExcBranch) or items[k].operation != Op.HLIL_IF:
                 return None
             iff = items[k]
+            if self.cond_throws_in_try(w, [d.src for d in defs] + [iff.condition]):
+                return None
             if CONDITION_GRAPHS and not defs and do_cond is None:
                 cg = self.loop_cg_exit(items, k)
                 if cg is not None:  # `while (true) { if (<graph>) break; rest }` (jvm-80/82)
@@ -4775,7 +4808,8 @@ if _HAVE_BN:
 
         def emit_statement(self, body, idx, plan, tokens, settings, block, need_separator):
             s = body[idx]
-            if idx in plan["skip"] or (s.expr_index in self.consumed and s.expr_index not in plan.get("own", ())):
+            if idx in plan["skip"] or (s.expr_index in self.consumed or s.expr_index in self.claimed) and \
+                    s.expr_index not in plan.get("own", ()):
                 return need_separator
             if s.expr_index in self.deferred and s.expr_index not in plan.get("own", ()):
                 return need_separator  # handler code: printed in its catch clause
@@ -5138,6 +5172,13 @@ if _HAVE_BN:
             tokens.finalize_scope()
             tokens.new_line()
             return True
+
+        def own_below(self, own):
+            """expr_index of every statement in or below an own list of self.own_open"""
+            if own[1] is None:
+                roots = [r for s in own[0] for r in ((s.instr, s.branch) if isinstance(s, _ExcBranch) else (s,))]
+                own[1] = {x.expr_index for r in roots if r is not None for _, _, x in _stmts_preorder(r)}
+            return own[1]
 
         def consume(self, region, items):
             for s in list(region) + list(items):
@@ -6087,10 +6128,17 @@ if _HAVE_BN:
             `T v = exc` store): (items, caught-exception variable or None, raw block); (None, None, None) if
             the handler's code is not found or was printed already"""
             region = self.handler_region(h)
-            if not region or region[0].expr_index in self.consumed:
+            if not region or region[0].expr_index in self.claimed:
+                return None, None, None
+            nested = any(region[0].expr_index in self.own_below(own) for own in self.own_open)
+            if region[0].expr_index in self.consumed and not nested:
                 return None, None, None
             items = self.flatten(region)
             self.consume(region, items)
+            if nested:
+                # a catch nested in a handler body printed from its own list: that body consumed this code
+                # too; printed here, the enclosing list skips it (TestLoopFinally.test9, jvm-102)
+                self.claimed.update(x.expr_index for x in list(region) + list(items))
             blk, _, whole = self.sites()[h]
             if whole:
                 self.consumed.add(blk.expr_index)
@@ -6116,6 +6164,8 @@ if _HAVE_BN:
             self.type_tok(tokens, catch_type_str(ctype))
             self.txt(tokens, " ")
             name = self.display_name(var) if var is not None else "e"
+            if var is None and name in self.exc_names:  # a catch inside a catch body (jvm-102)
+                name = next("e%d" % n for n in range(2, 100) if "e%d" % n not in self.exc_names)
             if var is not None:
                 tokens.append(_tok(TT.LocalVariableToken, name, value=var.identifier,
                                    context=InstructionTextTokenContext.LocalVariableTokenContext))
@@ -6126,10 +6176,30 @@ if _HAVE_BN:
 
         def emit_handler_body(self, items, name, blk, tokens, settings, hpc=None):
             self.exc_names.append(name)
+            self.exc_owners.append(self.handler_exc_var(items))
             try:
                 self.emit_list(items, tokens, settings, blk, own=True, own_hpc=hpc)
             finally:
                 self.exc_names.pop()
+                self.exc_owners.pop()
+
+        def handler_exc_var(self, items):
+            """the exception variable a handler body's type test reads (`if (instanceof(exc_5, E) == 0)`), else None"""
+            for s in items[:3]:
+                if isinstance(s, _ExcBranch):
+                    for x in _walk(s.instr.condition):
+                        if x.operation == Op.HLIL_VAR and self.is_exc_var(x.var):
+                            return x.var
+            return None
+
+        def exc_name(self, var):
+            """name of exception variable var in the catch bodies being printed: the innermost clause whose type
+            test reads it, or that has none -- a catch nested in a handler body rethrows the outer exception by
+            its own name (TestLoopFinally.test9, jvm-102)"""
+            for name, owner in zip(reversed(self.exc_names), reversed(self.exc_owners)):
+                if owner is None or owner == var:
+                    return name
+            return self.exc_names[-1]
 
         def emit_catch(self, hpc, ctype, tokens, settings):
             items, var, blk = self.region_items(hpc)
@@ -6187,6 +6257,7 @@ if _HAVE_BN:
                     self.kw(tokens, "finally")
                     tokens.begin_scope(ScopeType.BlockScopeType)
                     self.exc_names.append(self.display_name(var) if var else "t")
+                    self.exc_owners.append(None)
                     saved = self._finally_clause
                     saved_hide = self._tail_ret_hide
                     self._finally_clause = True
@@ -6197,6 +6268,7 @@ if _HAVE_BN:
                         self._finally_clause = saved
                         self._tail_ret_hide = saved_hide
                         self.exc_names.pop()
+                        self.exc_owners.pop()
                 else:
                     name = self.catch_header("catch", "java/lang/Throwable", var, tokens)
                     tokens.begin_scope(ScopeType.BlockScopeType)
@@ -7346,7 +7418,7 @@ if _HAVE_BN:
             if self.is_exc_var(var):
                 # outside a catch body the lifter's exception register has no Java name: print it as `exc`, so a
                 # leak of the plumbing is visible (and caught by the checks) instead of passing as `e`
-                tokens.append(_tok(TT.LocalVariableToken, self.exc_names[-1] if self.exc_names else "exc", context=InstructionTextTokenContext.LocalVariableTokenContext,
+                tokens.append(_tok(TT.LocalVariableToken, self.exc_name(var) if self.exc_names else "exc", context=InstructionTextTokenContext.LocalVariableTokenContext,
                                    address=instr.expr_index, value=var.identifier, size=instr.size))
                 return
             tokens.append(_tok(TT.LocalVariableToken, self.display_name(var), address=instr.expr_index,

@@ -21,7 +21,9 @@ Dump scripts take `JOBS=N` (and `TIMEOUT=S` per batch); second remote `github` (
 classes), jvm-82 round 5 (test7/test6/TestEmptyBlocks/sync while(true)), jvm-83 (or-goto condition graphs, TWR return
 scope) -> 6264 statements, gotos 7, labels 4. 2026-10-24 (MacBook): jvm-98 (synchronized around an endless loop), jvm-88
 (try placed inside a loop it only starts: back edges in try_runs; `finally { if (c) J }` copies) -> 6260; jvm-89 part (tries
-nested in a handler body print; +10 statements of real structure -> 6270). Open: jvm-89 rest (finally whose body holds a try:
+nested in a handler body print; +10 statements of real structure -> 6270); jvm-102 (catch nested in a handler body
+printed from its own list, exc vars named per clause), jvm-101 (no throwing loop test lifted out of an inner try) -> 6275,
+while_true 60; jvm-104 filed (loop break left in a catch). Open: jvm-89 rest (finally whose body holds a try:
 copy matching), jvm-90 (handler with a condition graph; ticket has the diagnosis), jvm-99 (unreachable finally, test4/5),
 jvm-83 rest left on purpose (testFinallyNested; Vineflower fails too). On the Intel MacBook a full gate round takes ~1.5 h and
 overlapping bnrun jobs slow each other ~10x (classes then hit BN's analysis time limit: `analysis skipped` in a dump is load,
