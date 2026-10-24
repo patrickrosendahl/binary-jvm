@@ -1058,6 +1058,8 @@ if _HAVE_BN:
                    Op.HLIL_CMP_ULT: Op.HLIL_CMP_UGE, Op.HLIL_CMP_UGE: Op.HLIL_CMP_ULT,
                    Op.HLIL_CMP_ULE: Op.HLIL_CMP_UGT, Op.HLIL_CMP_UGT: Op.HLIL_CMP_ULE}
 
+    _NEG_NAMES = {a.name: b.name for a, b in NEGATED_CMP.items()}
+
     COMPOUND = None  # filled below
 
     def _tok(kind, text, **kw):
@@ -2139,7 +2141,9 @@ if _HAVE_BN:
                 if name is None or not name.startswith("astore"):
                     return False
                 nxt, _, _, _ = decode_instruction(data[length:], 0)
-                return nxt in ("goto", "goto_w", "ret")
+                # (or the store runs straight into code also reached from elsewhere: an empty catch inside a
+                # finally body falling into the outer rethrow, TestLoopFinally.test6, jvm-89)
+                return nxt in ("goto", "goto_w", "ret") or self._join_between(h, h + length)
             except Exception:
                 return False
 
@@ -2739,8 +2743,8 @@ if _HAVE_BN:
                 pcs = []
                 for s in body[lo:hi + 1]:
                     if isinstance(s, _ExcBranch) or s.operation == Op.HLIL_LABEL or self.is_exc_plumbing(s) or \
-                            s.expr_index in self.consumed:
-                        pcs.append(None)
+                            s.expr_index in self.consumed and s.expr_index not in plan.get("own", ()):
+                        pcs.append(None)  # (a handler body printed here is consumed: its own tries still fit, jvm-89)
                     elif s.operation in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE, Op.HLIL_FOR):
                         # a loop lies in a try range only with its jumps back: javac's do-while whose try covers
                         # the start of the body only has its header in the range (TestLoopFinally.test3, jvm-88)
@@ -6393,12 +6397,20 @@ if _HAVE_BN:
             rest = items[k + 1:]
             self.consumed.add(s.expr_index)
             self.kw(tokens, "if ")
-            self._cond(s.condition, tokens, settings)
-            tokens.begin_scope(ScopeType.BlockScopeType)
-            self.emit_list(self.flatten(self.stmts_of(s.true)), tokens, settings, s.true, own=True, own_hpc=hpc)
-            tokens.end_scope(ScopeType.BlockScopeType)
-            tokens.scope_continuation(False)
-            self.kw(tokens, "else")
+            then = self.flatten(self.stmts_of(s.true))
+            if all(self.hidden_item(x) or not isinstance(x, _ExcBranch) and (
+                    self.rethrow_stmt(x) or x.operation in (Op.HLIL_NORET, Op.HLIL_UNREACHABLE)) for x in then):
+                # `if (c) { throw e; } B`: the then part is only the dropped rethrow -> `if (!c) { B }` (jvm-89)
+                tokens.append_open_paren()
+                self.emit_negated(s.condition, tokens, settings)
+                tokens.append_close_paren()
+            else:
+                self._cond(s.condition, tokens, settings)
+                tokens.begin_scope(ScopeType.BlockScopeType)
+                self.emit_list(then, tokens, settings, s.true, own=True, own_hpc=hpc)
+                tokens.end_scope(ScopeType.BlockScopeType)
+                tokens.scope_continuation(False)
+                self.kw(tokens, "else")
             tokens.begin_scope(ScopeType.BlockScopeType)
             self.emit_finally_items(rest, blk, exit_kw, tokens, settings, hpc)
             if exit_kw is not None and 'fall' in self.exit_kinds(rest) and self.split_rethrow_if(rest) is None:
@@ -6593,7 +6605,9 @@ if _HAVE_BN:
             return self.fold_keys(pairs)
 
         def fold_keys(self, pairs):
-            """the leftmost else-less `if` with a terminal then-branch owns the statements after it"""
+            """the leftmost else-less `if` with a terminal then-branch owns the statements after it; an `if` with an
+            empty then-branch is keyed as its negation -- `if (o == null) { throw e; } B` (rethrow dropped) equals the
+            copy `if (o != null) { B }` (TestLoopFinally.test6, jvm-89)"""
             pairs = list(pairs)
             for i in range(len(pairs) - 1):
                 k, then_terminal = pairs[i]
@@ -6601,7 +6615,12 @@ if _HAVE_BN:
                     tail = self.fold_keys(pairs[i + 1:])
                     pairs = pairs[:i] + [(('if', k[1], k[2], tail), False)]
                     return self.fold_keys(pairs)
-            return tuple(p[0] for p in pairs)
+            out = []
+            for k, _ in pairs:
+                if k[0] == 'if' and not k[2] and k[3] and isinstance(k[1], tuple) and k[1] and k[1][0] in _NEG_NAMES:
+                    k = ('if', (_NEG_NAMES[k[1][0]],) + k[1][1:], k[3], ())
+                out.append(k)
+            return tuple(out)
 
         def _then_terminal(self, branch, drop_rethrow):
             """branch's statements cannot fall through their end (an exit, or the rethrow a finally
