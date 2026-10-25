@@ -8,9 +8,12 @@ from binaryninja import (Architecture, BinaryView, Symbol, SymbolType, SegmentFl
                          CoreVariable, VariableSourceType, MetadataStoreFlag, NamedTypeReferenceClass, log_info,
                          FunctionAnalysisSkipOverride)
 
-from .constants import *
+from .constants import (ADDR_SIZE, ARCH_NAME, CLASSFILE_BASE, MAX_INSTR_LENGTH, METHOD_BASE, METHOD_STRIDE, NUM_ARG_REGS,
+                        NUM_LOCAL_REGS, PSEUDOMEMORY_PRIMITIVES, VIEW_NAME, method_address, pool_address)
 from .opcodes import decode_instruction
-from .classfile import *
+from .classfile import (CLASS_METADATA_KEY, JVMClassReader, JVMClassStructure, JVMFieldReference,
+                        JVMInterfaceMethodReference, JVMInvokeDynamic, JVMMethodReference, JVMStringReference,
+                        JVMUTF8Info, class_metadata, reader_for_view, register_reader)
 from .javatypes import dotted, java_version, split_method_descriptor, method_parameter_slots, slot_count
 from .methodinfo import method_info
 

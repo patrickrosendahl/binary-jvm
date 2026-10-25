@@ -16,7 +16,7 @@ vt = b.BinaryViewType[globals().get("VIEW", b._jvm_dev["ns"]["VIEW_NAME"])]  # V
 paths = sorted(os.path.join(d, f) for d, _, fs in os.walk(CLASS_DIR) for f in fs if f.endswith(".class"))
 paths = paths[START:START + LIMIT]
 if globals().get("FILES"):  # FILES = ["com/x/Y.class", ...] relative to CLASS_DIR instead of a slice
-    paths = [os.path.join(CLASS_DIR, f) for f in FILES]
+    paths = [os.path.join(CLASS_DIR, f) for f in globals()["FILES"]]
 tot = {"classes": 0, "functions": 0, "accessor_lines": 0, "accessor_classes": 0, "catch_funcs": 0, "time": 0.0, "hlil_fail": 0}
 for p in paths:
     t = time.time()

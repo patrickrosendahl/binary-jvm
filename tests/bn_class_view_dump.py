@@ -4,7 +4,7 @@
 # Writes the class view (`JVM\Show class`, classui.render_class) of each class to OUT_DIR/<pkg/Class>.java;
 # tests/class_view_compare.py compares its declarations with Vineflower's. Stamps and RESUME as in
 # bn_pseudo_java_dump.py (tests/gate_state.py, jvm-105/106).
-import os, sys, time
+import gc, os, sys, time
 import binaryninja as b
 
 REPO = "/Users/patrick/dev/binary-jvm"
@@ -49,6 +49,8 @@ for rel in CLASSES:
         fh.write("\n".join(out) + "\n")
     stamper.stamp(rel, os.path.join(CLASS_DIR, rel))
     print("%-60s %.1fs" % (rel, time.time() - t))
+    f = skipped = None  # no Function of this view left for a late finalizer (BN segfault in BNFreeFunction, jvm-110)
+    gc.collect()  # cycles holding its Functions / HLIL go now, while the view is open
     v.file.close()
 if resumed:
     print("RESUME: %d class(es) already current" % resumed)

@@ -23,7 +23,10 @@ scope) -> 6264 statements, gotos 7, labels 4. 2026-10-24 (MacBook): jvm-98 (sync
 (try placed inside a loop it only starts: back edges in try_runs; `finally { if (c) J }` copies) -> 6260; jvm-89 part (tries
 nested in a handler body print; +10 statements of real structure -> 6270); jvm-102 (catch nested in a handler body
 printed from its own list, exc vars named per clause), jvm-101 (no throwing loop test lifted out of an inner try) -> 6275,
-while_true 60; jvm-104 filed (loop break left in a catch). Open: jvm-89 rest (finally whose body holds a try:
+while_true 60; jvm-104 filed (loop break left in a catch). 2026-10-25 (MacBook): jvm-104 (loop break in a catch / break to __propagate), jvm-109 (boolean
+ternaries `c ? true : x` -> `c || x`), jvm-108 (`tests/lint.py`, run by the gates), jvm-103 (`skipped` counter) -> 6273;
+jvm-110 (two BN segfaults in BNFreeFunction during a suite dump: the dump scripts now drop Function refs + gc.collect()
+before closing a view; the rerun was clean). Open: jvm-89 rest (finally whose body holds a try:
 copy matching), jvm-90 (handler with a condition graph; ticket has the diagnosis), jvm-99 (unreachable finally, test4/5),
 jvm-83 rest left on purpose (testFinallyNested; Vineflower fails too). On the Intel MacBook a full gate round takes ~1.5 h and
 overlapping bnrun jobs slow each other ~10x (classes then hit BN's analysis time limit: `analysis skipped` in a dump is load,
@@ -93,6 +96,10 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
 
 ## Testing workflow (fast → slow)
 
+0. **Lint** (no BN, ~1 s): `python3 tests/lint.py` -- pyflakes over the plugin and `tests/` (bnrun's `bv`/`bvs`/`env`
+   are builtins there); 0 findings. `vineflower_compare.py` / `class_view_compare.py` run it with `--max` and fail on a
+   finding (jvm-108). A method BN skipped under load counts as `skipped` (gate 0), not as `lost_calls`; the dumps leave
+   such a class unstamped, so `RESUME=1` redumps just those (jvm-103).
 1. **Offline check first** (no BN, ~1 s): `python3 tests/offline_lift_check.py` stubs `binaryninja`,
    parses `mdg.jar`, decodes + lifts every instruction into a mock IL and checks decode tiling,
    no `unimplemented`, and the per-instruction stack effect against an independent table.
@@ -106,7 +113,7 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
    **Pseudo Java gates** (after any `pseudo_java.py` change; wiki `vineflower-comparison.md`):
    `python3 tests/vineflower_compare.py --decompile` (once: Vineflower, the decompiler Recaf uses, local fork),
  `tests/bn_dump_all.sh pj [jvm_devN]` (4 parallel batches, ~3 min; jvm-74), then
- `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=1 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0 ref_zero=0 double_casts=0 type_mismatch=0 if_else_assign=0 stmts=2014`
+ `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=1 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0 skipped=0 ref_zero=0 double_casts=0 type_mismatch=0 if_else_assign=0 stmts=2014`
  (exit 1 on a regression; `stmts` is the statement count, lower it as tickets land; `--excess N` lists where the
  extra statements against Vineflower come from); and `tests/bn_pseudo_java_compare_all.sh [jvm_devN]` (~18-25 min):
  every mdg method with an exception table against HLIL -- must stay 251/251 (~15 min on an idle machine); the

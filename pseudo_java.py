@@ -1036,14 +1036,12 @@ def hoist_field_initializers(owner, fields, ctors, clinit=None):
 # Binary Ninja part
 # ---------------------------------------------------------------------------------------------------
 try:
-    from binaryninja import (Architecture, BraceRequirement, DisassemblySettings, DisassemblyTextLine, Function,
-                             InstructionTextToken, InstructionTextTokenType, LanguageRepresentationFunction,
-                             LanguageRepresentationFunctionType, HighLevelILInstruction, HighLevelILFunction,
-                             HighLevelILTokenEmitter, HighLevelILOperation, OperatorPrecedence, ScopeType,
-                             SymbolDisplayType, SymbolDisplayResult, SymbolType, BoolType, VoidType, PointerType,
-                             NamedTypeReferenceType, StructureType, InstructionTextTokenContext, StructureMember,
-                             BinaryView, IntegerType, FloatType, VariableSourceType)
-    from typing import Optional
+    from binaryninja import (BraceRequirement, DisassemblyTextLine, InstructionTextToken, InstructionTextTokenType,
+                             LanguageRepresentationFunction, LanguageRepresentationFunctionType,
+                             HighLevelILInstruction, HighLevelILTokenEmitter, HighLevelILOperation,
+                             OperatorPrecedence, ScopeType, SymbolDisplayType, BoolType, VoidType, PointerType,
+                             NamedTypeReferenceType, StructureType, InstructionTextTokenContext, IntegerType,
+                             FloatType, VariableSourceType)
     _HAVE_BN = isinstance(HighLevelILOperation.HLIL_NOP.value, int)  # False under the offline-check stub
 except Exception:  # pragma: no cover
     _HAVE_BN = False
@@ -1596,6 +1594,8 @@ if _HAVE_BN:
             self.hidden_gotos = {}        # label id -> gotos to it not printed
             self._follow = []             # label reached after the statement being printed (or None)
             self._sites = None
+            self._break_loops = None
+            self._try_tail_loops = []   # per try being printed: expr_index of the loop its body ends with
             self.monitor_handlers = {h for _, _, h, t in self.table if not t and self.is_monitor_cleanup(h)}
             # code of those handlers: astore; aload; monitorexit (self-covered range); aload; athrow
             self.monitor_windows = []
@@ -2033,6 +2033,12 @@ if _HAVE_BN:
                     covering = self.covering_handlers(pc)
                     if covering and all(h in self.placed_handlers or h in self.monitor_handlers for h in covering):
                         return ('hide',)
+                if stmts[0].operation == Op.HLIL_BREAK:
+                    # the type dispatch of an uncaught type leaving the loop to the __propagate after it: the
+                    # rethrow path, like the __propagate form (TestTryLoop.hasNext, jvm-104)
+                    after = self.break_loop(stmts[0])[1]
+                    if after is not None and self.is_rethrow(after):
+                        return ('rethrow', [])
                 return ('goto', stmts[0])
             if stmts and self.is_rethrow(stmts[-1]) and not excs:
                 cleanup = stmts[:-1]
@@ -2063,6 +2069,24 @@ if _HAVE_BN:
             """__propagate(exc) / __propagate(caught exception variable)"""
             return s.operation == Op.HLIL_INTRINSIC and s.intrinsic.name == "__propagate" and \
                 len(s.params) == 1 and self.is_exc_value(s.params[0])
+
+        def break_loop(self, brk):
+            """(innermost loop, statement right after it in its block or None) of an HLIL_BREAK"""
+            if self._break_loops is None:
+                self._break_loops = {}
+                loops = (Op.HLIL_WHILE, Op.HLIL_DO_WHILE, Op.HLIL_FOR)
+                stack = [(self.hlil.root, (None, None), None)]  # (node, ctx of a break below it, next statement)
+                while stack:
+                    n, ctx, nxt = stack.pop()
+                    if n.operation == Op.HLIL_BREAK:
+                        self._break_loops[n.expr_index] = ctx
+                    elif n.operation == Op.HLIL_BLOCK:
+                        stack.extend((x, ctx, n.body[k + 1] if k + 1 < len(n.body) else None)
+                                     for k, x in enumerate(n.body))
+                    else:
+                        inner = (n, nxt) if n.operation in loops else ctx
+                        stack.extend((c, inner, None) for c in _children(n))
+            return self._break_loops.get(brk.expr_index, (None, None))
 
         def handler_of_label(self, label):
             for h, (blk, idx, whole) in self.sites().items():
@@ -4606,6 +4630,16 @@ if _HAVE_BN:
                 if parens:
                     tokens.append_close_paren()
                 return
+            if code == 'Z' and (consts[0] in (0, 1)) != (consts[1] in (0, 1)):
+                # c ? true : x -> c || x, c ? false : x -> !c && x, c ? x : true -> !c || x, c ? x : false -> c && x
+                # (binary-cpp _ternary_bool, jvm-109); the printed test is !c when flipped
+                k = 0 if consts[0] in (0, 1) else 1
+                self.emit_bool_arm(lambda neg, prec: self.emit_cond(iff.condition, neg != bool(flip), tokens,
+                                                                    settings, prec),
+                                   bool(consts[k]), k == 0, lambda prec: self.emit_typed(b if k == 0 else a, code,
+                                                                                         tokens, settings, prec),
+                                   tokens, precedence)
+                return
             parens = precedence > P.TernaryOperatorPrecedence
             if parens:
                 tokens.append_open_paren()
@@ -4617,6 +4651,19 @@ if _HAVE_BN:
             self.emit_typed(a, code, tokens, settings, P.LogicalOrOperatorPrecedence)
             self.op(tokens, " : ")
             self.emit_typed(b, code, tokens, settings, P.TernaryOperatorPrecedence)
+            if parens:
+                tokens.append_close_paren()
+
+        def emit_bool_arm(self, emit_test, const, const_first, emit_other, tokens, precedence):
+            """a boolean `t ? const : x` (const_first) / `t ? x : const` as || / &&: t || x, !t && x, !t || x, t && x;
+            emit_test(negate, precedence) prints t, emit_other(precedence) prints x"""
+            text, prec = (" || ", P.LogicalOrOperatorPrecedence) if const else (" && ", P.LogicalAndOperatorPrecedence)
+            parens = precedence > prec
+            if parens:
+                tokens.append_open_paren()
+            emit_test(const != const_first, prec)
+            self.op(tokens, text)
+            emit_other(prec + 1)
             if parens:
                 tokens.append_close_paren()
 
@@ -5558,6 +5605,16 @@ if _HAVE_BN:
                     cond, va, vb = ('not', cond), vb, va
                 self.emit_var(var, stmt, tokens)
                 self.op(tokens, " = ")
+                consts = [v.constant if v.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR) else None for v in (va, vb)]
+                if self.var_code(var) == 'Z' and (consts[0] in (0, 1)) != (consts[1] in (0, 1)):
+                    k = 0 if consts[0] in (0, 1) else 1  # c ? true : x -> c || x ... (jvm-109)
+                    self.emit_bool_arm(lambda neg, prec: self.emit_bexpr(cond, tokens, settings, prec, neg),
+                                       bool(consts[k]), k == 0,
+                                       lambda prec: self.emit_typed(vb if k == 0 else va, 'Z', tokens, settings, prec),
+                                       tokens, P.AssignmentOperatorPrecedence)
+                    tokens.append_semicolon()
+                    tokens.new_line()
+                    return
                 self.emit_bexpr(cond, tokens, settings, P.LogicalOrOperatorPrecedence)
                 self.op(tokens, " ? ")
                 self.emit_typed(va, self.var_code(var), tokens, settings, P.LogicalOrOperatorPrecedence)
@@ -6092,6 +6149,11 @@ if _HAVE_BN:
                         tokens.new_line()
             self.kw(tokens, "try")
             tokens.begin_scope(ScopeType.BlockScopeType)
+            tail = next((body[k] for k in range(last, first - 1, -1) if k not in plan["skip"] and
+                         not isinstance(body[k], _ExcBranch) and not self.is_exc_plumbing(body[k]) and
+                         body[k].operation != Op.HLIL_NOP), None)
+            self._try_tail_loops.append(tail.expr_index if tail is not None and
+                                        tail.operation in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE, Op.HLIL_FOR) else None)
             saved_end_ok = plan.get("copy_end_ok")
             plan["copy_end_ok"] = False  # the try body's end falls to the join, not an exit
             try:
@@ -6120,6 +6182,7 @@ if _HAVE_BN:
                         tokens.end_scope(ScopeType.BlockScopeType)
             finally:
                 self._tail_ret_hide.pop()
+                self._try_tail_loops.pop()
             tokens.finalize_scope()
             tokens.new_line()
 
@@ -6203,6 +6266,12 @@ if _HAVE_BN:
 
         def emit_catch(self, hpc, ctype, tokens, settings):
             items, var, blk = self.region_items(hpc)
+            if items and items[-1].operation == Op.HLIL_BREAK and self._try_tail_loops[-1] is not None and \
+                    self.break_loop(items[-1])[0] is not None and \
+                    self.break_loop(items[-1])[0].expr_index == self._try_tail_loops[-1]:
+                # HLIL put the handler inside the loop the try ends with: its break leaves that loop, i.e. falls
+                # out of the try statement -- what a catch does anyway (TestTryLoop.test, jvm-104)
+                items = items[:-1]
             name = self.catch_header("catch", ctype, var, tokens)
             tokens.begin_scope(ScopeType.BlockScopeType)
             if items is None:
@@ -8976,7 +9045,6 @@ if _HAVE_BN:
             if text is None:
                 return []
             tokens = []
-            words = text.split(" ")
             head, _, rest = text.partition("(")
             pre = head.rsplit(" ", 1)
             for w in (pre[0].split(" ") if len(pre) > 1 else []):
@@ -9080,7 +9148,7 @@ if _HAVE_BN:
         """classui.render_class lines of a local class as its declaration in a method body: under its source name,
         without the method addresses and without javac's outer-instance plumbing (a constructor that only stores
         this$0 goes away)"""
-        out, skip = [], False
+        out = []
         for l in lines:
             if l.startswith("//"):
                 continue

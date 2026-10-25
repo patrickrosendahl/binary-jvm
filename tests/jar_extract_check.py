@@ -1,5 +1,5 @@
 """Whole JAR unpacks .class entries beside the jar and refuses paths that leave that directory."""
-import importlib.util, io, os, sys, tempfile, zipfile
+import importlib.util, io, os, tempfile, zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 spec = importlib.util.spec_from_file_location("jarload", os.path.join(ROOT, "jarload.py"))
 jarload = importlib.util.module_from_spec(spec)

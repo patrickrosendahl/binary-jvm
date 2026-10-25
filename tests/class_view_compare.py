@@ -12,6 +12,7 @@ import argparse, json, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vineflower_compare as vc
 import gate_state
+import lint
 
 OUT = vc.OUT
 
@@ -134,6 +135,8 @@ def main():
               if totals.get(k, 0) > int(v)]
     if a.strict and warned:
         failed.append("%d stamp warning(s) (--strict)" % warned)
+    if a.max and lint.lint(quiet=True):
+        failed.append("lint (tests/lint.py)")
     if failed:
         print("FAIL", ", ".join(failed))
         return 1

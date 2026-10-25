@@ -38,6 +38,6 @@ for rel in CLASSES:
         try:
             for line in pj.render_method(f):
                 print("   JAVA |", line)
-        except Exception as e:
+        except Exception:
             import traceback; traceback.print_exc()
     v.file.close()

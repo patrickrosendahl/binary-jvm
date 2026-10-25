@@ -10,11 +10,12 @@
 #   * a method with an exception table has `try` (except javac's synchronized-only cleanup handlers)
 #   * no catch variable used outside its catch block, no jump right after a jump (`return; break;`) (jvm-45)
 # A method whose HLIL is missing gets its analysis forced once and then counts as a problem instead of
-# being silently skipped (jvm-95). Exits non-zero when any problem was found (jvm-94).
+# being silently skipped (jvm-95); one BN still skips counts as 'skipped' (load, not the code: RESUME=1 redoes it,
+# jvm-103). Exits non-zero when any problem was found (jvm-94).
 # RESULT_DIR = "..." keeps each class's problems and totals in RESULT_DIR/<pkg/Class>.txt with a stamp
 # (tests/gate_state.py, jvm-105); with RESUME = True a class whose result carries the current stamp is not
 # analysed again, its saved result is printed and counted instead (jvm-106).
-import os, re, sys, time
+import gc, os, re, sys, time
 import binaryninja as b
 sys.path.insert(0, "/Users/patrick/dev/binary-jvm/tests")
 import importlib, json, vineflower_compare as _vc, gate_state
@@ -35,7 +36,7 @@ SKIP_NAMES = {"<init>", "append", "toString", "valueOf", "intValue", "longValue"
               "floatValue", "shortValue", "byteValue", "charValue", "makeConcatWithConstants"}
 PLUMBING = [r"\bexc(_\d+)?\b", r"__exception", r"__propagate", r"\binstanceof\(", r"could not render"]
 
-totals = {"methods": 0, "with_table": 0, "ok": 0, "problems": 0}
+totals = {"methods": 0, "with_table": 0, "ok": 0, "problems": 0, "skipped": 0}
 stamper = RESULT_DIR and gate_state.Stamper("hlil", sys.modules[PKG].__path__[0], PKG, RESULT_DIR,
                                             {"only_exc": bool(ONLY_EXC), "show": bool(SHOW)})
 resumed = 0
@@ -75,7 +76,7 @@ for rel in CLASSES:
             f.analysis_skip_override = b.FunctionAnalysisSkipOverride.NeverSkipFunctionAnalysis
             v.update_analysis_and_wait()
         if f.hlil is None or f.hlil.root is None:
-            cls_totals["problems"] += 1
+            cls_totals["skipped" if f.analysis_skipped else "problems"] += 1
             say("%s %s: no HLIL (analysis_skip_reason %r)" % (rel.rsplit("/", 1)[-1], f.name, f.analysis_skip_reason))
             continue
         problems = []
@@ -138,6 +139,8 @@ for rel in CLASSES:
         else:
             cls_totals["ok"] += 1
     print("#### %s (%.1fs)" % (rel, time.time() - t))
+    f = skipped = info = lr = i = None  # no Function of this view left for a late finalizer (BN segfault in BNFreeFunction, jvm-110)
+    gc.collect()  # cycles holding its Functions / HLIL go now, while the view is open
     v.file.close()
     for k, n in cls_totals.items():
         totals[k] += n
@@ -149,5 +152,5 @@ for rel in CLASSES:
 if resumed:
     print("RESUME: %d class(es) already current" % resumed)
 print("TOTAL", totals)
-if totals["problems"]:
-    raise SystemExit("%d problem(s)" % totals["problems"])
+if totals["problems"] or totals["skipped"]:
+    raise SystemExit("%d problem(s), %d skipped (load: rerun with RESUME=1)" % (totals["problems"], totals["skipped"]))

@@ -4,8 +4,9 @@ import threading
 from binaryninja import (Architecture, CallingConvention, RegisterInfo, IntrinsicInfo, InstructionInfo,
                          InstructionTextToken, InstructionTextTokenType, BranchType, Endianness)
 
-from .constants import *
-from .opcodes import *
+from .constants import (ADDR_SIZE, ARCH_NAME, MAX_INSTR_LENGTH, NUM_ARG_REGS, NUM_LOCAL_REGS, NUM_STACK_REGS,
+                        PSEUDOMEMORY_PRIMITIVES, pool_address)
+from .opcodes import InstructionNames, decode_instruction
 from .lifter import lift_instruction, INTRINSICS, LiftContext, reader_for_il
 from .classfile import reader_for_view
 from .methodinfo import method_info, instruction_branches

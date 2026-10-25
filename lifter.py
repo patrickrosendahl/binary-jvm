@@ -9,7 +9,8 @@ are intrinsics or calls whose stack effects come from the constant-pool descript
 """
 from binaryninja import LLIL_TEMP, LowLevelILLabel, Type
 
-from .constants import *
+from .constants import (ADDR_SIZE, INVOKES_AS_CALLS, LOCALS_ADDR, NUM_ARG_REGS, NUM_LOCAL_REGS, NUM_STACK_REGS,
+                        PSEUDOMEMORY_PRIMITIVES, pool_address)
 from .opcodes import InstructionNames, slot_size, parse_method_descriptor
 from .classfile import (reader_for_view, JVMIntegerInfo, JVMFloatInfo, JVMLongInfo, JVMDoubleInfo)
 from .methodinfo import method_info

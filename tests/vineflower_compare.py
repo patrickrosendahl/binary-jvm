@@ -7,6 +7,8 @@ Two inputs, both under OUT (default .scratch/vfcmp/, git-ignored):
 Per method it reports readability counters (stack temporaries, gotos, labels, synchronized comments,
 `__offset` array stores, `while (true)` / `do` loops, leaked exception plumbing, dead code after return, lines) and what Pseudo Java lost
 against Vineflower: called method names and string literals that Vineflower has and Pseudo Java does not.
+A method BN skipped ('// analysis skipped: ..' in the dump, load) counts as 'skipped' instead of lost_calls /
+lost_strings; SKIPPED lists its classes to redump (jvm-103).
 Size is measured in statements (stmts / vf_stmts: comments dropped, wrapped lines joined, as both sides wrap
 differently); EXCESS splits the extra statements by a guessed cause (--excess N lists the worst methods).
 
@@ -16,6 +18,7 @@ usage:
   python3 tests/vineflower_compare.py [--show NAME] [--worst N] [--excess N] [--json FILE]
                                      [--pj DIR] [--max K=V ...]  # exit 1 if a total exceeds V (e.g. --max lost_calls=0)
                                      [--strict] [--ref NAME] [--save-ref NAME]
+With --max it also runs tests/lint.py (pyflakes; a finding fails the gate, jvm-108).
 WARNING lines: the Pseudo Java outputs carry no stamp, come from several plugin states or not from the working
 tree (tests/gate_state.py, jvm-105); --strict exits 1 on one. --save-ref NAME keeps this run's TOTAL, --ref NAME
 prints it (REF) and the differences (DELTA) under TOTAL: before / after numbers for a ticket (jvm-107).
@@ -23,6 +26,7 @@ prints it (REF) and the differences (DELTA) under TOTAL: before / after numbers 
 import argparse, glob, json, os, re, subprocess, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gate_state
+import lint
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIB = os.path.join(REPO, "sample/ActiveTraderDE_app/Contents/WorkingDir/current/lib")
@@ -57,6 +61,9 @@ DEFAULT_CLASSES = [
 CALL_IGNORE = {"append", "toString", "valueOf", "intValue", "longValue", "booleanValue", "doubleValue",
                "floatValue", "shortValue", "byteValue", "charValue", "makeConcatWithConstants", "super", "this",
                "if", "while", "for", "switch", "catch", "synchronized", "return", "new", "throw"}
+# the dump's marker for a method BN skipped (pseudo_java.render_method; binary-cpp shared/compare.py has the same,
+# bncpp-148): its output is no evidence either way, so it counts as 'skipped' (gate 0) and gets no lost_* lists
+SKIPPED = re.compile(r"//\s*analysis skipped\b")
 COUNTERS = {
     # stack temporaries, and copies of a static field that BN named Class_field_N (jvm-60)
     "temps": re.compile(r"\b(st\d+_lo(_\d+)?|st\d+_\d+|r_\d+|r64_\d+|r64|r|[A-Z][A-Za-z0-9$]*_[\w$]+_\d+)\b"),
@@ -345,16 +352,18 @@ def compare_method(pj_body, vf_body, hoisted=()):
     r["lines"] = sum(1 for l in pj_body if l.strip() and l.strip() not in "{}")
     pj_stmts = statements(pj_body)
     r["stmts"] = len(pj_stmts)
+    r["skipped"] = int(bool(SKIPPED.search(pj_text)))
     if vf_body is not None:
         vf_text = "\n".join(vf_body)
         r["vf_lines"] = sum(1 for l in vf_body if l.strip() and l.strip() not in "{}")
         vf_stmts = statements(vf_body)
         r["vf_stmts"] = len(vf_stmts)
         r["causes"] = excess_causes(pj_body, pj_stmts, vf_stmts, hoisted)
-        lost = called_names(vf_text) - called_names(pj_text)
+        lost = set() if r["skipped"] else called_names(vf_text) - called_names(pj_text)
         r["lost_calls"] = sorted(lost)
         pj_strings = {s.replace(" ", "") for s in string_literals(pj_text)}
-        r["lost_strings"] = sorted(s for s in string_literals(vf_text) if s.replace(" ", "") not in pj_strings)
+        r["lost_strings"] = [] if r["skipped"] else \
+            sorted(s for s in string_literals(vf_text) if s.replace(" ", "") not in pj_strings)
         # while (true) / do { beyond the ones Vineflower prints too (the plain counter counts every one)
         r["while_true_excess"] = max(0, r["while_true"] - len(COUNTERS["while_true"].findall(vf_text)))
     return r
@@ -410,6 +419,7 @@ def main():
                 vbody = []  # Vineflower dropped an empty / fully hoisted initialiser
             r = compare_method(body, vbody, hoisted if key.startswith(("<init>/", "<clinit>/")) else ())
             r["method"] = "%s.%s" % (simple, key)
+            r["class"] = rel
             rows.append(r)
             if a.show and a.show in r["method"]:
                 print("=" * 30, r["method"])
@@ -423,6 +433,7 @@ def main():
         totals[k] = sum(r.get(k, 0) for r in rows)
     totals["lost_calls"] = sum(len(r.get("lost_calls", [])) for r in rows)
     totals["lost_strings"] = sum(len(r.get("lost_strings", [])) for r in rows)
+    totals["skipped"] = sum(r["skipped"] for r in rows)
     totals["methods"] = len(rows)
     totals["unmatched"] = sum(1 for r in rows if "vf_lines" not in r)
     matched = [r for r in rows if "vf_stmts" in r]
@@ -433,6 +444,10 @@ def main():
         for k, v in r["causes"].items():
             causes[k] = causes.get(k, 0) + v
     print("TOTAL", json.dumps(totals))
+    if totals["skipped"]:  # BN's analysis time limit under load, not the code (jvm-103)
+        redump = sorted({r["class"] for r in rows if r["skipped"]})
+        print("SKIPPED %d method(s): analysis skipped in the dump; redump (RESUME=1 redoes them): %s"
+              % (totals["skipped"], " ".join(redump)))
     if a.ref:
         gate_state.print_ref(a.pj, a.ref, totals)
     print("EXCESS", json.dumps(dict(sorted(causes.items(), key=lambda kv: -kv[1]))))
@@ -466,6 +481,8 @@ def main():
             failed.append("%s=%d > %s" % (k, totals[k], v))
     if a.strict and warned:
         failed.append("%d stamp warning(s) (--strict)" % warned)
+    if a.max and lint.lint(quiet=True):
+        failed.append("lint (tests/lint.py)")
     if failed:
         print("FAIL", ", ".join(failed))
         return 1

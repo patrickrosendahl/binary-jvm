@@ -44,6 +44,8 @@ Universal view active — switch to "JVM Class" (GUI: view dropdown; bridge: `--
 `tests/offline_lift_check.py --all` skips such `foo/` dirs (their classes are checked via the jar).
 
 ## Test loop (fast → slow)
+0. `python3 tests/lint.py` (pyflakes, 0 findings; the compare gates run it too, jvm-108). A dump's
+   `// analysis skipped` method is `skipped` in the gates, not lost code: `RESUME=1` redumps it (jvm-103).
 1. `python3 tests/offline_lift_check.py` (~1–2 s, mdg.jar plus the rare-opcode class; `--all` = every
    sample jar). Must report 0 decode/lift/unimplemented/stack/tiling failures. Run it after every lifter
    change. `python3 tests/synthetic_opcode_check.py` requires nop, swap, goto_w, jsr_w and each wide form.

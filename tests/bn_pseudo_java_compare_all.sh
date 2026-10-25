@@ -45,5 +45,9 @@ for i in $(seq 0 $((JOBS - 1))); do
   if [ "$ok" != "$with_table" ]; then
     echo "gate: batch $i ok=$ok with_table=$with_table"; status=1
   fi
+  skipped=$(printf "%s" "$totals" | sed -n "s/.*'skipped': \([0-9][0-9]*\).*/\1/p")
+  if [ -n "$skipped" ] && [ "$skipped" != 0 ]; then  # jvm-103: BN's time limit under load, not the code
+    echo "gate: batch $i: $skipped method(s) analysis skipped -- rerun with RESUME=1 (only those classes)"
+  fi
 done
 exit $status
