@@ -26,9 +26,16 @@ printed from its own list, exc vars named per clause), jvm-101 (no throwing loop
 while_true 60; jvm-104 filed (loop break left in a catch). 2026-10-25 (MacBook): jvm-104 (loop break in a catch / break to __propagate), jvm-109 (boolean
 ternaries `c ? true : x` -> `c || x`), jvm-108 (`tests/lint.py`, run by the gates), jvm-103 (`skipped` counter) -> 6273;
 jvm-110 (two BN segfaults in BNFreeFunction during a suite dump: the dump scripts now drop Function refs + gc.collect()
-before closing a view; the rerun was clean). Open: jvm-89 rest (finally whose body holds a try:
-copy matching), jvm-90 (handler with a condition graph; ticket has the diagnosis), jvm-99 (unreachable finally, test4/5),
-jvm-83 rest left on purpose (testFinallyNested; Vineflower fails too). On the Intel MacBook a full gate round takes ~1.5 h and
+before closing a view; the rerun was clean). 2026-10-26 (MacBook; minitick/miniwiki/Gitea unreachable from this
+session -- macOS Local Network permission -- so the ticket comments in `.scratch/pending_ticket_notes_2026-10-26.md` still
+have to be posted): jvm-91 items 2/4
+(dead String-switch case numbers dropped from `||`, equals results in temporaries, static-field enum subjects), jvm-89
+(test6/7/8/9 as finally: empty / non-empty catch at a copy's tail keyed like the dropped rethrow, success-path jump
+keeps its call's try, break to __propagate = rethrow, finally exit jump moved into a trailing try), jvm-90 testComplex
+(`join` condition graph: `if (c) { L: T } else { ..goto L.. }` -> `if (!c) { .. } T`; now catch (Throwable) without
+gotos) -> suite 6226, gotos 4, labels 3; mdg 2014, compare_all 251/251. Open: jvm-91 item 3 (TestSwitchInTry: hash test + goto frame
+left), jvm-89 test12 (labeled break out of synchronized from a finally), jvm-90 loopInFinally (all paths end in an
+endless loop; jvm-99 territory), jvm-99 (unreachable finally, test4/5), jvm-83 rest left on purpose (testFinallyNested; Vineflower fails too). On the Intel MacBook a full gate round takes ~1.5 h and
 overlapping bnrun jobs slow each other ~10x (classes then hit BN's analysis time limit: `analysis skipped` in a dump is load,
 redump the class alone) -- run the gates one at a time. jvm-15 waits for Patrick's GUI
 click-through (BN restarted 2026-10-14 with the symlinked plugin, so jarload.py is loaded). jvm-68 still waits on binary-cpp. Use a dev load for live tests.
