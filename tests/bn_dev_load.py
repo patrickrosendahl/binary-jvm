@@ -20,6 +20,10 @@ os.makedirs(_dst)
 for _f in os.listdir(REPO):
     if _f.endswith(".py"):
         shutil.copy(os.path.join(REPO, _f), _dst)
+os.makedirs(os.path.join(_dst, "shared"))  # the parts shared with binary-cpp (jvm-68)
+for _f in os.listdir(os.path.join(REPO, "shared")):
+    if _f.endswith(".py"):
+        shutil.copy(os.path.join(REPO, "shared", _f), os.path.join(_dst, "shared"))
 _c = os.path.join(_dst, "constants.py")
 _src = open(_c).read()
 _src = _src.replace('ARCH_NAME = "JVM"', 'ARCH_NAME = "JVM-dev%d"' % _n).replace('VIEW_NAME = "JVM Class"', 'VIEW_NAME = "JVM Class dev%d"' % _n)

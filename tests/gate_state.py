@@ -42,6 +42,10 @@ def plugin_hash(root=REPO):
     for f in sorted(os.listdir(root)):
         if f.endswith(".py"):
             parts += [f, _DEV_NAMES.sub(rb"\1", open(os.path.join(root, f), "rb").read())]
+    shared = os.path.join(root, "shared")  # the parts shared with binary-cpp (jvm-68)
+    for f in sorted(os.listdir(shared)) if os.path.isdir(shared) else ():
+        if f.endswith(".py"):
+            parts += ["shared/" + f, open(os.path.join(shared, f), "rb").read()]
     return _sha(parts)
 
 

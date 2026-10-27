@@ -69,6 +69,7 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
 | `arch.py` | `JVM` Architecture (info/text/IL callbacks), registers, calling conventions `jvm` (method args in `l<n>`) and `jvm_call` (invoke call sites, args in `a<n>`) |
 | `view.py` | `ClassView` (segments/functions per method, catch handlers, pool symbols, static-field data vars, switch targets, same-class call refs) |
 | `plugin.json` | manifest |
+| `shared/` | language-neutral parts shared with binary-cpp (HLIL walk, tokens, folding, loop conditions, try regions, condition graphs, compare tooling; jvm-68, see "Code structure") |
 
 ## Environment (this machine)
 
@@ -173,22 +174,25 @@ legacy copy of mdg.jar.
 ## Code structure: parts shared with sister projects
 
 `../binary-cpp` (readable C++: try/catch from exception tables, HLIL readability passes; a later
-binary-dotnet would follow) re-uses this project's language-neutral parts by **copy-paste or with little
-translation** -- no shared package for now. Its README ("Code structure: reusable parts between the projects")
-has the full plan; the same rules apply here:
-- Language-neutral code belongs in `shared/` (to be split out, jvm-68): HLIL walking (`_walk`, `_children`,
-  statement lists), token helpers + `emit_error`, evaluation-order-safe folding (`eval_nodes`, `plan_folds`
-  core), the readability passes (ternary, boolean return, `x++` as a value, loop conditions, split
-  conditions), try-region layout (`group_try_entries`, `try_runs`), and the comparison tooling (statement
-  counting, counters, EXCESS causes, `--max` gates in `tests/vineflower_compare.py`).
-- `shared/` never imports the JVM modules; JVM specifics reach it through hook methods the language class
-  provides (`side_effect`, `reads_memory`, `is_plumbing`, `call_shape`, …), the shared passes being mixins
-  (`PseudoJavaFunction` is one class today, so a mixin is the smallest change).
-- Each shared file carries a provenance header (`# shared with binary-cpp/<path> (synced at <commit>)`) and an
-  entry in `SHARED.md`; a change on one side is ported in the same session or noted there. Shared passes come
-  with a small synthetic test case so the copy can be checked on the other side.
-- Until jvm-68 is done: when you add or change such a part in `pseudo_java.py`, keep the JVM specifics behind a
-  method of their own instead of inlining them into the general logic.
+binary-dotnet would follow) shares this project's language-neutral parts through a **`shared/` copy in each
+repo** (jvm-68) -- no shared package. The one table of shared files is the wiki page **bncpp `code-structure.md`,
+"Shared files"** (here | binary-jvm | last sync | differences); there is no SHARED.md. In `shared/` here:
+`hlil.py` (HLIL walking), `tokens.py` (TokenMixin: kw / txt / op / type_tok / note, `emit_error`), `folding.py`
+(FoldMixin: evaluation-order-safe folding, `x++` values, ternary candidates), `loops.py` (LoopMixin: loop
+conditions, `(x = e)` in conditions, split conditions), `regions.py` (`group_try_entries`, `try_runs`; pure),
+`condgraph.py` (`cg_reduce`, `cg_verify`; pure) and `compare.py` (statement counting, no-loss checks, gates; pure,
+used by `tests/vineflower_compare.py`).
+- `shared/` never imports the JVM modules; JVM specifics reach it through hook methods `PseudoJavaFunction`
+  overrides (`side_effect`, `reads_memory`, `foldable_var`, `fold_use_ok`, `eval_operands`, `value_parts`,
+  `opaque`, `items_of`, `movable`, `loop_exit_special`, …; each mixin's docstring lists its hooks).
+- Each shared file carries a provenance header (`# shared with binary-cpp/<path> (synced at <commit>)`); a change
+  on one side is ported in the same session or noted in the wiki table, and the other session is told (bncpp).
+  Shared passes come with a small synthetic test case where there is one (`tests/pseudo_java_check.py` covers
+  regions / condgraph).
+- `tests/bn_dev_load.py` copies `shared/` into the dev load, `tests/gate_state.py` hashes it into the stamps and
+  `tests/lint.py` checks it.
+- When you add or change a language-neutral part in `pseudo_java.py`, put it in `shared/` with a hook for the
+  JVM specifics instead of inlining them into the general logic.
 
 ## Conventions
 

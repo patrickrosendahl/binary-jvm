@@ -23,12 +23,17 @@ WARNING lines: the Pseudo Java outputs carry no stamp, come from several plugin 
 tree (tests/gate_state.py, jvm-105); --strict exits 1 on one. --save-ref NAME keeps this run's TOTAL, --ref NAME
 prints it (REF) and the differences (DELTA) under TOTAL: before / after numbers for a ticket (jvm-107).
 """
-import argparse, glob, json, os, re, subprocess, sys
+import argparse, glob, importlib.util, json, os, re, subprocess, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gate_state
 import lint
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# shared/compare.py (the helpers shared with binary-cpp, jvm-68), loaded by path: BN's interpreter, where the dump
+# scripts import this file, may hold binary-cpp's `shared` package under that name
+_spec = importlib.util.spec_from_file_location("binary_jvm_shared_compare", os.path.join(REPO, "shared", "compare.py"))
+shared = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(shared)
 LIB = os.path.join(REPO, "sample/ActiveTraderDE_app/Contents/WorkingDir/current/lib")
 CLASS_DIR = os.path.join(LIB, "mdg")
 OUT = os.path.join(REPO, ".scratch", "vfcmp")
@@ -61,9 +66,12 @@ DEFAULT_CLASSES = [
 CALL_IGNORE = {"append", "toString", "valueOf", "intValue", "longValue", "booleanValue", "doubleValue",
                "floatValue", "shortValue", "byteValue", "charValue", "makeConcatWithConstants", "super", "this",
                "if", "while", "for", "switch", "catch", "synchronized", "return", "new", "throw"}
-# the dump's marker for a method BN skipped (pseudo_java.render_method; binary-cpp shared/compare.py has the same,
-# bncpp-148): its output is no evidence either way, so it counts as 'skipped' (gate 0) and gets no lost_* lists
-SKIPPED = re.compile(r"//\s*analysis skipped\b")
+# names that may vanish (CALL_IGNORE) and constructor calls / class names (capitalised)
+CALL_IGNORE_RE = re.compile(r"[A-Z][\w$]*|" + "|".join(sorted(CALL_IGNORE)))
+# the dump's marker for a method BN skipped (pseudo_java.render_method): its output is no evidence either way, so it
+# counts as 'skipped' (gate 0) and gets no lost_* lists
+SKIPPED = shared.SKIPPED
+CATCH_VAR = r"catch \((?:[\w.$]+\s*\|\s*)*[\w.$]+ (\w+)\)"
 COUNTERS = {
     # stack temporaries, and copies of a static field that BN named Class_field_N (jvm-60)
     "temps": re.compile(r"\b(st\d+_lo(_\d+)?|st\d+_\d+|r_\d+|r64_\d+|r64|r|[A-Z][A-Za-z0-9$]*_[\w$]+_\d+)\b"),
@@ -155,50 +163,20 @@ def pj_methods(path, simple):
     return keyed
 
 
-def strip_strings(text):
-    return re.sub(r'"(\\.|[^"\\])*"', '""', text)
+strip_strings, statements, dead_after_return = shared.strip_strings, shared.statements, shared.dead_after_return
 
 
 def string_literals(text):
-    flat = re.sub(r'"\s*\n\s*\+?\s*"', "", text)
-    return {m.group(0) for m in re.finditer(r'"(\\.|[^"\\])*"', flat)}
+    return shared.string_literals(text)
 
 
 def called_names(text):
-    code = strip_strings(re.sub(r"//[^\n]*", "", text))
-    names = set(re.findall(r"(?<![\w$])([A-Za-z_$][\w$]*)\s*\(", code))
-    return {n for n in names if n not in CALL_IGNORE and not n[0].isupper()}
-
-
-def dead_after_return(lines):
-    n = 0
-    for a, b in zip(lines, lines[1:]):
-        if re.match(r"^\s*(return\b.*|throw\b.*|break|continue);\s*$", a.strip() and a or "x") and \
-                re.match(r"^\s*(return|break|continue|throw)\b", b) and \
-                len(a) - len(a.lstrip()) == len(b) - len(b.lstrip()):
-            n += 1
-    return n
+    return shared.called_names(re.sub(r"//[^\n]*", "", text), CALL_IGNORE_RE)
 
 
 def leaked_catch_var(lines):
     """A catch variable used outside its catch block (e.g. `if (e != 0 ...)` in the try body)."""
-    n, depth, stack = 0, 0, []
-    names = sorted({m.group(1) for l in lines
-                    for m in [re.search(r"catch \((?:[\w.$]+\s*\|\s*)*[\w.$]+ (\w+)\)", l)] if m})
-    for l in lines:
-        code = re.sub(r"\.\s*[\w$]+", ".", strip_strings(re.sub(r"//.*", "", l)))  # member names are not variables
-        m = re.search(r"catch \((?:[\w.$]+\s*\|\s*)*[\w.$]+ (\w+)\)", code)
-        if m:
-            stack.append((m.group(1), depth - code[:m.start()].count("}")))
-        for v in names:
-            declared = re.search(r"^\s*[\w.$<>\[\]]+ %s\b" % re.escape(v), code)
-            if re.search(r"\b%s\b" % re.escape(v), code) and not declared and not any(s[0] == v for s in stack):
-                n += 1
-                break
-        depth += code.count("{") - code.count("}")
-        while stack and depth <= stack[-1][1]:
-            stack.pop()
-    return n
+    return shared.leaked_catch_var(lines, CATCH_VAR)
 
 
 PRIMITIVE_TYPES = {"int", "long", "short", "byte", "char", "boolean", "float", "double"}
@@ -283,23 +261,6 @@ def if_else_assigns(lines):
                if " ? " not in strip_strings(m.group(0)))
 
 
-def statements(lines):
-    """logical lines: comments dropped, wrapped continuation lines joined (a line that does not end with
-    `;`, `{`, `}` or `:` continues on the next one), lines of only braces not counted"""
-    out, cur = [], ""
-    for l in lines:
-        code = re.sub(r'("(?:\\.|[^"\\])*")|//.*', lambda m: m.group(1) or "", l).strip()
-        if not code:
-            continue
-        cur = cur + " " + code if cur else code
-        if code[-1] in ";{}:":
-            out.append(cur)
-            cur = ""
-    if cur:
-        out.append(cur)
-    return [s for s in out if s.replace(" ", "") not in ("", "{", "}", "{}")]
-
-
 INC_COPY = re.compile(r"^(?:%s) ([\w$]+) = ([\w$.]+)( [+-] 1)?;\n\2 = (?:\1 [+-] 1|\1);" % JTYPE, re.M)
 FIELD_COPY = re.compile(r"^(?:%s) [A-Z][\w$]*_[\w$]+_\d+ = [\w$.]+;" % JTYPE, re.M)
 BARE_DECL = re.compile(r"^(?:final )?(%s) [\w$]+;$" % JTYPE)
@@ -361,9 +322,7 @@ def compare_method(pj_body, vf_body, hoisted=()):
         r["causes"] = excess_causes(pj_body, pj_stmts, vf_stmts, hoisted)
         lost = set() if r["skipped"] else called_names(vf_text) - called_names(pj_text)
         r["lost_calls"] = sorted(lost)
-        pj_strings = {s.replace(" ", "") for s in string_literals(pj_text)}
-        r["lost_strings"] = [] if r["skipped"] else \
-            sorted(s for s in string_literals(vf_text) if s.replace(" ", "") not in pj_strings)
+        r["lost_strings"] = [] if r["skipped"] else sorted(string_literals(vf_text) - string_literals(pj_text))
         # while (true) / do { beyond the ones Vineflower prints too (the plain counter counts every one)
         r["while_true_excess"] = max(0, r["while_true"] - len(COUNTERS["while_true"].findall(vf_text)))
     return r
@@ -474,11 +433,7 @@ def main():
     if a.save_ref:
         gate_state.save_ref(a.pj, a.save_ref, totals)
     warned = gate_state.warn_stamps(a.pj, "pj", classes)
-    failed = []
-    for kv in a.max:
-        k, v = kv.split("=")
-        if totals.get(k, 0) > int(v):
-            failed.append("%s=%d > %s" % (k, totals[k], v))
+    failed = shared.gate(totals, a.max)
     if a.strict and warned:
         failed.append("%d stamp warning(s) (--strict)" % warned)
     if a.max and lint.lint(quiet=True):

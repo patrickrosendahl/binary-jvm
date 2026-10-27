@@ -53,6 +53,8 @@ import threading
 from .constants import (ARCH_NAME, VIEW_NAME, PSEUDOMEMORY_TABLE, PSEUDOMEMORY_PRIMITIVES, POOL_STRIDE,
                         METHOD_BASE, METHOD_STRIDE)
 from .javatypes import split_method_descriptor
+from .shared.condgraph import cg_reduce, cg_verify
+from .shared.regions import group_try_entries, try_runs
 
 # ---------------------------------------------------------------------------------------------------
 # configuration
@@ -759,204 +761,6 @@ def concat_recipe_parts(recipe, args, constants=()):
     return parts
 
 
-# ---------------------------------------------------------------------------------------------------
-# condition graphs (jvm-80): language-neutral, so they can move to shared/ (jvm-68). A graph is
-# {id: ('dec', cond, t, f) | ('leaf', key, items)}; a condition is an HLIL condition or ('not' | 'and' |
-# 'or' | 'tern', ...). Conditions are told apart by str() (the same text is the same condition: every
-# decision runs before any statement, so it sees the same state).
-# ---------------------------------------------------------------------------------------------------
-def cg_reduce(nodes, root):
-    """collapse decisions into &&, || and ?: (in place); the reduced root"""
-    def preds():
-        count = {}
-        seen, todo = set(), [root]
-        while todo:
-            n = todo.pop()
-            if n in seen:
-                continue
-            seen.add(n)
-            if nodes[n][0] == 'dec':
-                for c in nodes[n][2:4]:
-                    count[c] = count.get(c, 0) + 1
-                    todo.append(c)
-        return count, seen
-    changed = True
-    while changed:
-        changed = False
-        count, live = preds()
-        for n in sorted(live):
-            e = nodes[n]
-            if e[0] != 'dec':
-                continue
-            _, c, t, f = e
-            te, fe = nodes[t], nodes[f]
-            if te[0] == 'dec' and count.get(t) == 1:
-                if te[3] == f:
-                    nodes[n] = ('dec', ('and', c, te[1]), te[2], f)
-                elif te[2] == f:
-                    nodes[n] = ('dec', ('and', c, ('not', te[1])), te[3], f)
-                if nodes[n] is not e:
-                    changed = True
-                    break
-            if fe[0] == 'dec' and count.get(f) == 1:
-                if fe[2] == t:
-                    nodes[n] = ('dec', ('or', c, fe[1]), t, fe[3])
-                elif fe[3] == t:
-                    nodes[n] = ('dec', ('or', c, ('not', fe[1])), t, fe[2])
-                if nodes[n] is not e:
-                    changed = True
-                    break
-            if te[0] == 'dec' and fe[0] == 'dec' and count.get(t) == 1 and count.get(f) == 1:
-                if (te[2], te[3]) == (fe[2], fe[3]):
-                    nodes[n] = ('dec', ('tern', c, te[1], fe[1]), te[2], te[3])
-                elif (te[2], te[3]) == (fe[3], fe[2]):
-                    nodes[n] = ('dec', ('tern', c, te[1], ('not', fe[1])), te[2], te[3])
-                if nodes[n] is not e:
-                    changed = True
-                    break
-    return nodes[root]
-
-
-def cg_verify(nodes, root, top):
-    """the reduced condition picks the same outcome as the decision graph for every truth assignment
-    of its basic conditions (all of them up to 10 conditions, else 512 random ones)"""
-    import itertools, random
-    conds = {}
-    for e in nodes.values():
-        if e[0] == 'dec':
-            conds.setdefault(str(e[1]), len(conds))
-
-    def walk(assign):
-        n = root
-        while nodes[n][0] == 'dec':
-            n = nodes[n][2] if assign[conds[str(nodes[n][1])]] else nodes[n][3]
-        return n
-
-    def value(e, assign):
-        if isinstance(e, tuple):
-            if e[0] == 'not':
-                return not value(e[1], assign)
-            if e[0] == 'and':
-                return value(e[1], assign) and value(e[2], assign)
-            if e[0] == 'or':
-                return value(e[1], assign) or value(e[2], assign)
-            return value(e[2], assign) if value(e[1], assign) else value(e[3], assign)
-        return assign[conds[str(e)]]
-
-    n = len(conds)
-    rng = random.Random(80)
-    cases = itertools.product((False, True), repeat=n) if n <= 10 else \
-        ([rng.random() < 0.5 for _ in range(n)] for _ in range(512))
-    for assign in cases:
-        if walk(assign) != (top[2] if value(top[1], assign) else top[3]):
-            return False
-    return True
-
-
-def group_try_entries(table):
-    """Exception-table entries [[start, end, handler, type], ...] -> [(start, end, [(handler, type), ...])],
-    one entry per Java try statement, sorted by start (outer first on ties).
-
-    javac's try/catch/finally shapes are folded back into one statement:
-      * a catch-all handler F (finally) protects the try range, every catch body (a range starting exactly at
-        the catch handler) and its own store/rethrow code (a range starting at F); only the ranges before the
-        first handler are the try body. Catches with the same first start whose body F covers (or with the
-        same range) become the catch clauses of that try: try { } catch (T e) { } finally { }
-      * a range split by inlined finally code (return inside try) is one region from the first start to
-        the last end
-      * typed handlers sharing the same ranges are the clauses of one try; a catch-all without a range before
-        its own code (javac's self-covering entry) is not a try of its own.
-      * one handler pc with several exception-table types is javac's catch (A | B e): the clause keeps
-        them all (a tuple) and prints `catch (A | B e)` (jvm-84).
-    """
-    by_handler = {}  # handler pc -> ([catch types...], [(start, end), ...])
-    order = []
-    for start, end, handler, ctype in table:
-        if handler not in by_handler:
-            by_handler[handler] = [[], []]
-            order.append(handler)
-        if ctype and ctype not in by_handler[handler][0]:  # multi-catch: several types, one pc
-            by_handler[handler][0].append(ctype)
-        by_handler[handler][1].append((start, end))
-
-    def clause_type(h):
-        types = by_handler[h][0]
-        return tuple(types) if len(types) > 1 else (types[0] if types else "")
-
-    groups = []
-    used = set()
-    for f in order:
-        types, ranges = by_handler[f]
-        if any(types):  # a typed handler; catch-alls ("" only) are the finally candidates
-            continue
-        used.add(f)
-        prim = [r for r in ranges if r[0] < f]
-        if not prim:
-            continue
-        s0 = min(r[0] for r in prim)
-        f_starts = {r[0] for r in ranges}
-        catches = []
-        for h in order:
-            t, hr = by_handler[h]
-            if not t or h in used or h > f or min(r[0] for r in hr) != s0:
-                continue
-            if h in f_starts or sorted(hr) == sorted(prim):
-                catches.append(h)
-        limit = min(catches + [f])
-        prim = [r for r in prim if r[0] < limit] or prim
-        used.update(catches)
-        groups.append((s0, max(r[1] for r in prim), [(h, clause_type(h)) for h in catches] + [(f, "")]))
-    rest = {}
-    for h in order:
-        if h in used:
-            continue
-        t, hr = by_handler[h]
-        rest.setdefault(tuple(sorted(hr)), []).append((h, clause_type(h)))
-    for hr, handlers in rest.items():
-        groups.append((min(r[0] for r in hr), max(r[1] for r in hr), handlers))
-    groups.sort(key=lambda g: (g[0], -g[1]))
-    return groups
-
-
-def try_runs(stmt_pcs, groups, active=()):
-    """Place try ranges on one block's statements.
-
-    stmt_pcs: per statement the list of pcs it covers (its own pc first), or None if unknown/neutral
-    (labels, exception checks): those join a run between two inside statements but never start or end one.
-    groups: from group_try_entries. Returns [(first, last, group)] for maximal runs of consecutive
-    statements whose pcs all lie in the group's range and none of which is a handler of that group,
-    largest ranges first, non-overlapping; groups in `active` (already open in an enclosing block) are skipped.
-    """
-    runs = []
-    taken = set()
-    for g in sorted(groups, key=lambda g: g[0] - g[1]):  # widest range first
-        start, end, handlers = g
-        if (start, end) in active:
-            continue
-        handler_pcs = {h for h, _ in handlers}
-        inside = []  # True / False / None (neutral)
-        for pcs in stmt_pcs:
-            inside.append(None if not pcs else
-                          all(start <= pc < end for pc in pcs) and pcs[0] not in handler_pcs)
-        i = 0
-        while i < len(inside):
-            if inside[i] is not True:
-                i += 1
-                continue
-            j = i
-            k = i + 1
-            while k < len(inside) and inside[k] is not False:
-                if inside[k]:
-                    j = k
-                k += 1
-            if not any(k in taken for k in range(i, j+1)):
-                runs.append((i, j, g))
-                taken.update(range(i, j+1))
-            break  # one run per group: a try range is one region
-        # (a second run of the same group would duplicate the catch clause)
-    return sorted(runs, key=lambda r: r[0])
-
-
 _LIT = r'(?:-?\d+(?:\.\d+)?[LlFfDd]?|"(?:\\.|[^"\\])*"|' + r"'(?:\\.|[^'\\])+'|true|false|null|-?0x[0-9a-fA-F]+L?)"
 _SIMPLE_INIT = __import__("re").compile(
     r'^(?:%s|new [\w.$]+\((?:%s(?:, %s)*)?\)|new [\w.$]+\[\d+\]|[A-Z][\w$]*(?:\.[\w$]+)+'
@@ -1036,7 +840,7 @@ def hoist_field_initializers(owner, fields, ctors, clinit=None):
 # Binary Ninja part
 # ---------------------------------------------------------------------------------------------------
 try:
-    from binaryninja import (BraceRequirement, DisassemblyTextLine, InstructionTextToken, InstructionTextTokenType,
+    from binaryninja import (BraceRequirement, DisassemblyTextLine, InstructionTextTokenType,
                              LanguageRepresentationFunction, LanguageRepresentationFunctionType,
                              HighLevelILInstruction, HighLevelILTokenEmitter, HighLevelILOperation,
                              OperatorPrecedence, ScopeType, SymbolDisplayType, BoolType, VoidType, PointerType,
@@ -1047,59 +851,19 @@ except Exception:  # pragma: no cover
     _HAVE_BN = False
 
 if _HAVE_BN:
+    from .shared.hlil import children as _children, walk as _walk, stmts_preorder as _stmts_preorder
+    from .shared.tokens import TokenMixin, tok as _tok
+    from .shared.folding import FoldMixin
+    from .shared.loops import LoopMixin, NEGATED_CMP
+
+if _HAVE_BN:
     Op = HighLevelILOperation
     TT = InstructionTextTokenType
     P = OperatorPrecedence
-    NEGATED_CMP = {Op.HLIL_CMP_E: Op.HLIL_CMP_NE, Op.HLIL_CMP_NE: Op.HLIL_CMP_E,
-                   Op.HLIL_CMP_SLT: Op.HLIL_CMP_SGE, Op.HLIL_CMP_SGE: Op.HLIL_CMP_SLT,
-                   Op.HLIL_CMP_SLE: Op.HLIL_CMP_SGT, Op.HLIL_CMP_SGT: Op.HLIL_CMP_SLE,
-                   Op.HLIL_CMP_ULT: Op.HLIL_CMP_UGE, Op.HLIL_CMP_UGE: Op.HLIL_CMP_ULT,
-                   Op.HLIL_CMP_ULE: Op.HLIL_CMP_UGT, Op.HLIL_CMP_UGT: Op.HLIL_CMP_ULE}
 
     _NEG_NAMES = {a.name: b.name for a, b in NEGATED_CMP.items()}
 
     COMPOUND = None  # filled below
-
-    def _tok(kind, text, **kw):
-        return InstructionTextToken(kind, text, **kw)
-
-    def _children(instr):
-        for o in instr.operands:
-            if isinstance(o, HighLevelILInstruction):
-                yield o
-            elif isinstance(o, list):
-                for x in o:
-                    if isinstance(x, HighLevelILInstruction):
-                        yield x
-
-    def _walk(instr):
-        stack = [instr]
-        while stack:
-            i = stack.pop()
-            yield i
-            stack.extend(reversed(list(_children(i))))
-
-    def _child_blocks(instr):
-        """the outermost HLIL_BLOCKs below instr (not below those)"""
-        stack = list(reversed(list(_children(instr))))
-        while stack:
-            i = stack.pop()
-            if i.operation == Op.HLIL_BLOCK:
-                yield i
-                continue
-            stack.extend(reversed(list(_children(i))))
-
-    def _stmts_preorder(block):
-        """(block, index, statement) for every statement of every block below `block`, in source order"""
-        if block.operation != Op.HLIL_BLOCK:
-            yield block, 0, block
-            for b in _child_blocks(block):
-                yield from _stmts_preorder(b)
-            return
-        for idx, s in enumerate(block.body):
-            yield block, idx, s
-            for b in ([s] if s.operation == Op.HLIL_BLOCK else _child_blocks(s)):
-                yield from _stmts_preorder(b)
 
     _EXC_BRANCH = "EXC_BRANCH"
     _JUMPS_OUT = ("goto", "goto_w", "ret", "return", "ireturn", "lreturn", "freturn", "dreturn", "areturn",
@@ -1543,7 +1307,11 @@ if _HAVE_BN:
     def recv_none_valueof(shape):
         return shape[4] is None and shape[2] == "valueOf"
 
-    class PseudoJavaFunction(LanguageRepresentationFunction):
+    class PseudoJavaFunction(TokenMixin, LoopMixin, FoldMixin, LanguageRepresentationFunction):
+        language_label = "Pseudo Java"
+        fold_declared = False  # shared/folding.py: `T x; .. x = v; use(x)` stays as it is
+        split_conditions = SPLIT_CONDITIONS          # shared/loops.py
+        assign_in_conditions = ASSIGN_IN_CONDITIONS
         comment_start_string = "// "
         annotation_start_string = "/* "
         annotation_end_string = " */"
@@ -1613,7 +1381,7 @@ if _HAVE_BN:
             self.goto_break = {}     # label id -> name of the labeled block a goto to it leaves (jvm-82)
             self.twr_open = []       # resources whose try-with-resources body is being printed
             self.loop_decls = {}     # loop expr_index -> [(var, def)] declared before it (assignment in its condition)
-            self._def_counts = None
+            self._fold_counts = None  # FoldMixin's def counts (shared/folding.py)
             self.deferred = set()           # expr_index of handler code met in a try body, printed by its catch
             self.printed_handlers = set()   # handler pcs whose catch/finally clause was printed
             self.own_open = []      # handler bodies being printed (emit_list own=True): [items, statements below]
@@ -1688,22 +1456,7 @@ if _HAVE_BN:
             tokens.append_close_brace()
             tokens.new_line()
 
-        # --- small token helpers ------------------------------------------------------------------
-        def kw(self, tokens, text):
-            tokens.append(_tok(TT.KeywordToken, text))
-
-        def txt(self, tokens, text):
-            tokens.append(_tok(TT.TextToken, text))
-
-        def op(self, tokens, text):
-            tokens.append(_tok(TT.OperationToken, text))
-
-        def type_tok(self, tokens, text):
-            tokens.append(_tok(TT.TypeNameToken, text))
-
-        def note(self, tokens, text):
-            tokens.append(_tok(TT.CommentToken, text))
-
+        # --- small token helpers (kw / txt / op / type_tok / note: shared/tokens.py) -------------------
         def args(self, tokens, settings, params):
             tokens.append_open_paren()
             for i, p in enumerate(params):
@@ -2627,7 +2380,7 @@ if _HAVE_BN:
             plan["new_at"].pop(j, None)
             self._concat[e.expr_index] = operands
             plan.setdefault("evaluated_at", []).extend(evaluated_at)
-            plan.setdefault("append_of", {}).update((a, k) for a in appends)  # append -> the concatenation's statement
+            plan.setdefault("part_of", {}).update((a, k) for a in appends)  # append -> the concatenation's statement
 
         def append_chain(self, instr, var, top=False):
             """append(append(var, a), b) -> ([(a, is_str), (b, is_str)], None); top-level statement form when
@@ -3264,50 +3017,45 @@ if _HAVE_BN:
             tokens.new_line()
 
         # --- folding single-use temporaries (jvm-46) -------------------------------------------------
-        def def_count(self, var):
-            if self._def_counts is None:
-                counts = {}
-                try:
-                    for i in _walk(self.hlil.root):
-                        if i.operation == Op.HLIL_VAR_INIT:
-                            counts[i.dest] = counts.get(i.dest, 0) + 1
-                        elif i.operation == Op.HLIL_VAR_DECLARE:
-                            counts[i.var] = counts.get(i.var, 0) + 2  # declared apart: assigned elsewhere
-                except Exception:
-                    pass
-                self._def_counts = counts
-            return self._def_counts.get(var, 0)
-
+        # --- folding (shared/folding.py FoldMixin; the JVM hooks) -------------------------------------
         def fold_candidate(self, body, k, plan):
             """(var, value, value is free of side effects) when body[k] defines a temporary that is read once"""
             s = body[k]
-            if isinstance(s, _ExcBranch):
+            if isinstance(s, _ExcBranch) or s.expr_index in self.fold_sites():
                 return None
             if k in plan["new_at"]:
                 s0, var = plan["new_at"][k][0], plan["new_at"][k][1]
                 if s0.operation != Op.HLIL_VAR_INIT or self.var_count(var) != 2 or self.def_count(var) != 1:
                     return None
                 return var, ('new', plan["new_at"][k]), False
-            if k in plan.get("ternary", {}):
-                var, value = plan["ternary"][k]
-                if self.var_count(var) - self.refs(s, var) != 1:
-                    return None
-                return var, value, all(self.pure(v) for v in (s.condition, value[4], value[5]))
-            if k in plan.get("incdec", {}):
-                var, value = plan["incdec"][k]
-                return var, value, False
-            if k in plan["skip"] or s.operation != Op.HLIL_VAR_INIT:
-                return None
-            var = s.dest
-            if var in self.array_lits:
+            if k not in plan.get("ternary", {}) and k not in plan.get("incdec", {}) and k not in plan["skip"] and \
+                    s.operation == Op.HLIL_VAR_INIT and s.dest in self.array_lits:
+                var = s.dest
                 if self.array_lits[var][2] != 1 or var in self.hoisted:
                     return None
                 return var, ('arr', s.src, self.array_lits[var][1]), all(self.pure(x) for x in self.array_lits[var][1])
-            if self.var_count(var) != 1 or self.def_count(var) != 1 or self.is_exc_var(var) or \
-                    var == self.this_var or var in self.hoisted or self.is_exc_value(s.src) or \
-                    self.mentions_exc(s.src) or var in self.lambda_captured():
-                return None
-            return var, s.src, self.pure(s.src)
+            return FoldMixin.fold_candidate(self, body, k, plan)
+
+        def foldable_var(self, var):
+            return not self.is_exc_var(var) and var != self.this_var and var not in self.hoisted and \
+                var not in self.lambda_captured()
+
+        def foldable_value(self, value):
+            return not self.is_exc_value(value) and not self.mentions_exc(value)
+
+        def fold_sites(self):
+            """expr_index of statements where a handler's code starts inside a block: never a fold's definition
+            or use"""
+            if getattr(self, "_fold_sites", None) is None:
+                self._fold_sites = {self.stmts_of(blk)[i].expr_index for blk, i, whole in self.sites().values()
+                                    if not whole and i < len(self.stmts_of(blk))}
+            return self._fold_sites
+
+        def fold_use_ok(self, body, j, plan):
+            u = body[j]
+            return not isinstance(u, _ExcBranch) and u.expr_index not in self.fold_sites() and \
+                not self.is_exc_plumbing(u) and self.jsr_target(u) is None and \
+                not (u.expr_index in self.consumed and u.expr_index not in plan.get("own", ()))
 
         def lambda_captured(self):
             """variables a lambda captures (arguments of an invokedynamic whose body is printed inline): the lambda
@@ -3330,13 +3078,6 @@ if _HAVE_BN:
                 self._captured = out
             return self._captured
 
-        def pure(self, e):
-            """no side effects (calls, stores, allocation with a constructor) when evaluated"""
-            for i in self.eval_nodes(e)[0]:
-                if self.side_effect(i):
-                    return False
-            return True
-
         def side_effect(self, i):
             o = i.operation
             if o in (Op.HLIL_CALL, Op.HLIL_TAILCALL, Op.HLIL_ASSIGN, Op.HLIL_VAR_INIT, Op.HLIL_ASSIGN_UNPACK):
@@ -3352,75 +3093,15 @@ if _HAVE_BN:
                 return True
             return o == Op.HLIL_INTRINSIC and i.intrinsic.name in ("getfield", "arraylength")
 
-        def eval_nodes(self, e, stop_var=None, out=None):
-            """the nodes of e in Java evaluation order (operands before the operation); folded temporaries are
-            expanded to their values, a concatenation to its operands. With stop_var: stops at its read and
-            returns (nodes before it, True); a read in a conditionally evaluated operand returns (.., None)"""
-            if out is None:
-                out = []
-            o = e.operation
-            if o in (Op.HLIL_VAR, Op.HLIL_VAR_SSA):
-                if stop_var is not None and e.var == stop_var:
-                    return out, True
-                value = self.inline.get(e.var)
-                if value is not None:
-                    if isinstance(value, tuple) and value[0] == 'incdec':
-                        r = self.eval_nodes(value[1], stop_var, out)
-                        if r[1] is not False:
-                            return r
-                        out.append(value[4])  # the store
-                        out.append(e)
-                        return out, False
-                    if isinstance(value, tuple) and value[0] == 'ternary':
-                        # the condition, then one of the values: a read in them is only evaluated sometimes
-                        r = self.eval_nodes(value[2].condition, stop_var, out)
-                        if r[1] is not False:
-                            return r
-                        if stop_var is not None and any(self.refs(v, stop_var) for v in value[4:]):
-                            return out, None
-                        for v in value[4:]:
-                            self.eval_nodes(v, None, out)
-                        out.append(e)
-                        return out, False
-                    if isinstance(value, tuple):  # ('new', entry): the constructor arguments; ('arr', ..): elements
-                        for a in (value[2] if value[0] == 'arr' else value[1][3][5]):
-                            r = self.eval_nodes(a, stop_var, out)
-                            if r[1] is not False:
-                                return r
-                        out.append(e)
-                        return out, False
-                    return self.eval_nodes(value, stop_var, out)
-                out.append(e)
-                return out, False
-            if o in (Op.HLIL_CALL, Op.HLIL_INTRINSIC) and e.expr_index in self._concat:
-                kids = [op[0] for op in self._concat[e.expr_index] if not isinstance(op[0], str)]
-            elif o in (Op.HLIL_AND, Op.HLIL_OR) and e.size == 0:
-                r = self.eval_nodes(e.left, stop_var, out)
-                if r[1] is not False:
-                    return r
-                if stop_var is not None and any(i.operation == Op.HLIL_VAR and i.var == stop_var
-                                                for i in _walk(e.right)):
-                    return out, None  # only evaluated sometimes
-                kids = [e.right]
-            elif o == Op.HLIL_ASSIGN:
-                d = e.dest
-                kids = ([] if d.operation == Op.HLIL_VAR else list(_children(d))) + [e.src]
-            elif o == Op.HLIL_VAR_INIT:
-                kids = [e.src]
-            elif o in (Op.HLIL_IF, Op.HLIL_SWITCH):
-                kids = [e.condition]
-            elif o in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE, Op.HLIL_FOR, Op.HLIL_BLOCK):
-                if stop_var is not None:
-                    return out, None
-                kids = []
-            else:
-                kids = list(_children(e))
-            for c in kids:
-                r = self.eval_nodes(c, stop_var, out)
-                if r[1] is not False:
-                    return r
-            out.append(e)
-            return out, False
+        def eval_operands(self, e):
+            # a concatenation evaluates its operands (their HLIL sits in skipped append statements)
+            if e.operation in (Op.HLIL_CALL, Op.HLIL_INTRINSIC) and e.expr_index in self._concat:
+                return [op[0] for op in self._concat[e.expr_index] if not isinstance(op[0], str)]
+            return None
+
+        def value_parts(self, value):
+            # ('new', entry): the constructor arguments; ('arr', ..): the elements
+            return value[2] if value[0] == 'arr' else value[1][3][5]
 
         def fold_transparent(self, body, k, plan):
             """body[k] is not printed between a definition and its use, and has no effect that matters"""
@@ -3446,110 +3127,36 @@ if _HAVE_BN:
             return False
 
         def plan_folds(self, body, lo, hi, run_at, plan):
-            folded = plan.setdefault("folded", set())
+            """FoldMixin.plan_folds with the statements of try runs as the barrier: nothing folds into, out of or
+            across a try range"""
             inside_runs = set()
             for first, last, _ in run_at.values():
                 inside_runs.update(range(first, last + 1))
-            site_stmts = {self.stmts_of(blk)[i].expr_index for blk, i, whole in self.sites().values()
-                          if not whole and i < len(self.stmts_of(blk))}
-            for k in range(hi, lo - 1, -1):
-                if k in inside_runs or k in folded:
-                    continue
-                try:
-                    self.plan_fold(body, k, hi, run_at, inside_runs, site_stmts, plan, folded)
-                except Exception:
-                    pass  # this statement stays as it is
-
-        def plan_fold(self, body, k, hi, run_at, inside_runs, site_stmts, plan, folded):
-            """fold body[k] into the next printed statement when that is safe (see plan_folds)"""
-            c = self.fold_candidate(body, k, plan)
-            if c is None or body[k].expr_index in site_stmts:
-                return
-            var, value, value_pure = c
-            store = value[5] if isinstance(value, tuple) and value[0] == 'incdec' else None
-            # appends of a concatenation in the use itself: their operands are checked in its evaluation order
-            appends, append_of = [], plan.get("append_of", {})
-            j = k + 1
-            while j <= hi and j not in run_at and j not in inside_runs:
-                if j == store or self.fold_transparent(body, j, plan):
-                    j += 1
-                elif j in append_of:
-                    appends.append(j)
-                    j += 1
-                else:
-                    break
-            if j > hi or j in run_at or j in inside_runs or any(append_of[a] != j for a in appends):
-                return
-            u = body[j]
-            if isinstance(value, tuple) and value[0] == 'ternary' and j in plan.get("ternary", {}):
-                return  # no conditional expression inside another one
-            if isinstance(u, _ExcBranch) or u.operation in (Op.HLIL_LABEL, Op.HLIL_GOTO, Op.HLIL_WHILE,
-                                                           Op.HLIL_DO_WHILE, Op.HLIL_FOR) or \
-                    u.expr_index in site_stmts or self.is_exc_plumbing(u) or \
-                    (j in plan["skip"]) or self.jsr_target(u) is not None or \
-                    (u.expr_index in self.consumed and u.expr_index not in plan.get("own", ())):
-                return
-            uses = sum(1 for i in self.eval_nodes(u)[0] if i.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and i.var == var)
-            if uses != 1:  # (a concatenation's operands count: their HLIL sits in skipped append statements)
-                return
-            before, found = self.eval_nodes(u, var)
-            if found is not True:
-                return
-            # concatenation operands appended before body[k] are computed before it, not at their use
-            earlier = {i.expr_index for at, op in plan.get("evaluated_at", ()) if at < k for i in _walk(op)}
-            before = [i for i in before if i.expr_index not in earlier]
-            if any(self.side_effect(i) for i in before):
-                return
-            if not value_pure and any(self.reads_memory(i) for i in before):
-                return
-            self.inline[var] = value
-            folded.add(k)
-            if store is not None:
-                folded.add(store)
+            FoldMixin.plan_folds(self, body, lo, hi, plan, inside_runs)
 
         def plan_incdec(self, body, k, plan):
             """`int t = f; f = t + 1; use(t)` (post) / `int t = f + 1; f = t; use(t)` (pre), f a local, static or
-            instance field: plan["incdec"][k] = (t, ('incdec', load of f, "+" / "-", pre, store, store index));
-            plan_fold folds it into the use as f++ / ++f, the store with it"""
+            instance field: FoldMixin.plan_incdec; plan["incdec"][k] = (t, ('incdec', load of f, "+" / "-", pre,
+            store index, store)), folded into the use as f++ / ++f, the store with it"""
             s, st = body[k], body[k + 1]
             if isinstance(s, _ExcBranch) or isinstance(st, _ExcBranch) or s.operation != Op.HLIL_VAR_INIT or \
-                    k in plan["skip"] or k + 1 in plan["skip"]:
+                    self.var_count(s.dest) != 2:
                 return
-            t = s.dest
-            if self.def_count(t) != 1 or self.var_count(t) != 2 or self.is_exc_var(t) or t in self.hoisted or \
-                    t == self.this_var:
-                return
-            if st.operation == Op.HLIL_ASSIGN:
-                dest, val = st.dest, st.src
-                same = lambda e: self.same_lvalue(dest, e)
-            elif st.operation == Op.HLIL_INTRINSIC and st.intrinsic.name == "putfield" and len(st.params) == 3:
-                obj, fld, val = st.params
-                same = lambda e: self.same_field(obj, fld, e)
-            else:
-                return
-            is_t = lambda e: e.operation == Op.HLIL_VAR and e.var == t
-            step = self.unit_step(val, is_t)
-            if step is not None and same(s.src):
-                load, pre = s.src, False
-            else:
-                step = self.unit_step(s.src, same)
-                if step is None or not is_t(val):
-                    return
-                load, pre = s.src.left, True
-            plan.setdefault("incdec", {})[k] = (t, ('incdec', load, step, pre, st, k + 1))
+            FoldMixin.plan_incdec(self, body, k, plan)
 
-        @staticmethod
-        def unit_step(e, is_base):
-            """"+" / "-" when e is `base + 1` / `base - 1` (also `base + -1`) and is_base(base), else None"""
-            if e.operation not in (Op.HLIL_ADD, Op.HLIL_SUB) or e.right.operation != Op.HLIL_CONST or \
-                    not is_base(e.left) or e.right.size not in (1, 2, 4, 8):
-                return None
-            c = e.right.constant & ((1 << (8 * e.right.size)) - 1)
-            if c >= 1 << (8 * e.right.size - 1):
-                c -= 1 << (8 * e.right.size)
-            if c not in (1, -1):
-                return None
-            return "+" if (c == 1) == (e.operation == Op.HLIL_ADD) else "-"
+        def strip(self, e):
+            return e  # JVM HLIL has no native wraps to look through
+
+        def incdec_store(self, st):
+            if st.operation == Op.HLIL_ASSIGN:
+                return st.src, lambda e: self.same_lvalue(st.dest, e)
+            if st.operation == Op.HLIL_INTRINSIC and st.intrinsic.name == "putfield" and len(st.params) == 3:
+                obj, fld, val = st.params
+                return val, lambda e: self.same_field(obj, fld, e)
+            return None
+
+        def incdec_target(self, st, load):
+            return load  # printed as f in f++: a getfield has no store destination to print
 
         def emit_inlined(self, value, tokens, settings, precedence):
             if isinstance(value, tuple) and value[0] == 'assignx':
@@ -4154,7 +3761,7 @@ if _HAVE_BN:
             tokens.finalize_scope()
             tokens.new_line()
 
-        # --- loop conditions (jvm-50) ---------------------------------------------------------------
+        # --- loop conditions (jvm-50; the analysis is shared/loops.py) ------------------------------------
         def loop_breaks(self, items):
             """break / continue statements of the loop these items belong to (not of nested loops/switches),
             outside exceptional branches"""
@@ -4206,124 +3813,40 @@ if _HAVE_BN:
                 return true and all(x.operation == Op.HLIL_NOP or self.is_exc_plumbing(x) for x in (w.init, w.update))
             return true
 
-        def loop_cond_shape(self, w, after=(), block=None):
-            """(defs, if statement, tail items, rest items, moved) for
-            `while (true) { defs; if (c) { tail; break; } rest }`; moved: indexes of the code after the loop that
-            is printed at the loop's single other break (`if (x) break; ... } return y;` -> `if (x) { return y; }`)"""
-            do_cond = None
-            if not self.infinite_loop(w):
-                if w.operation != Op.HLIL_DO_WHILE or self.exc_test(w.condition) is not None:
-                    return None
-                do_cond = w.condition  # do { body } while (d) == while (true) { body; if (!d) break; }
-            items = self.flatten(self.stmts_of(w.body))
-            if SPLIT_CONDITIONS:
-                for k in range(len(items)):
-                    try:
-                        self.merge_split_cond(items, k, len(items) - 1)
-                    except Exception:
-                        pass
-            k = 0
-            defs = []
-            while k < len(items) and (self.hidden_item(items[k]) or
-                                      (not isinstance(items[k], _ExcBranch) and
-                                       (items[k].operation == Op.HLIL_VAR_INIT or
-                                        (ASSIGN_IN_CONDITIONS and items[k].operation == Op.HLIL_ASSIGN and
-                                         items[k].dest.operation == Op.HLIL_VAR)))):
-                if not self.hidden_item(items[k]):
-                    defs.append(items[k])
-                k += 1
-            if k >= len(items) or isinstance(items[k], _ExcBranch) or items[k].operation != Op.HLIL_IF:
-                return None
+        # loop_cond_shape, assign_defs, merge_split_cond, ...: shared/loops.py LoopMixin; the JVM hooks
+        def items_of(self, instr):
+            return self.flatten(self.stmts_of(instr))
+
+        def opaque(self, x):
+            return isinstance(x, _ExcBranch)
+
+        def opaque_if(self, s):
+            return self.exc_if_parts(s) is not None
+
+        def item_instr(self, x):
+            return x.instr if isinstance(x, _ExcBranch) else x
+
+        def movable(self, e):
+            return not self.mentions_exc(e)
+
+        def fixed_var(self, var):
+            return self.is_exc_var(var)
+
+        def plain_condition(self, c):
+            return self.exc_test(c) is None
+
+        def cond_movable(self, w, exprs):
+            return not self.cond_throws_in_try(w, exprs)
+
+        def loop_exit_special(self, items, k, defs, do_cond):
             iff = items[k]
-            if self.cond_throws_in_try(w, [d.src for d in defs] + [iff.condition]):
-                return None
             if ASSERTS and not isinstance(iff, _ExcBranch) and iff.as_ast and self.assert_shape(items, k) is not None:
-                return None  # `assert c;` at the start of the body, not `while ($assertionsDisabled || c)` (jvm-92)
+                return False  # `assert c;` at the start of the body, not `while ($assertionsDisabled || c)` (jvm-92)
             if CONDITION_GRAPHS and not defs and do_cond is None:
                 cg = self.loop_cg_exit(items, k)
                 if cg is not None:  # `while (true) { if (<graph>) break; rest }` (jvm-80/82)
                     return [], cg[0], [], cg[1], None
-            if self.exc_if_parts(iff) is not None or \
-                    not (iff.false is None or iff.false.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE)):
-                return None
-            t_items = self.flatten(self.stmts_of(iff.true))
-            real = [x for x in t_items if not self.hidden_item(x)]
-            if not real or isinstance(real[-1], _ExcBranch):
-                return None
-            if real[-1].operation == Op.HLIL_BREAK:
-                tail = t_items[:t_items.index(real[-1])]
-            elif real[-1].operation not in (Op.HLIL_CONTINUE, Op.HLIL_GOTO) and self.ends_flow([real[-1]]):
-                tail = t_items  # `if (c) { ...; return x; }`: the loop is only left there
-            else:
-                return None
-            rest = items[k + 1:]
-            moved = []
-            if self.loop_breaks(tail):
-                return None
-            rest_breaks = [b for b in self.loop_breaks(rest) if b.operation == Op.HLIL_BREAK]
-            if do_cond is not None:
-                if rest_breaks or self.loop_breaks(rest):
-                    return None  # (a continue would skip the moved `if (!d)` test)
-                moved = self.search_loop_tail([None], tail, after)
-                last = [x for x in rest if not self.hidden_item(x)]
-                if moved is None or not last or isinstance(last[-1], _ExcBranch) or \
-                        last[-1].operation != Op.HLIL_ASSIGN or last[-1].dest.operation != Op.HLIL_VAR:
-                    return None
-                x, asg = last[-1].dest.var, last[-1]
-                if self.var_count(x) - self.refs(asg, x) != 1 or self.refs(do_cond, x) != 1 or \
-                        self.def_count(x) != 2 or self.mentions_exc(asg.src) or \
-                        self.eval_nodes(do_cond, x)[1] is not True or \
-                        any(self.side_effect(i) or self.reads_memory(i) for i in self.eval_nodes(do_cond, x)[0]):
-                    return None
-            elif rest_breaks:
-                moved = self.search_loop_tail(rest_breaks, tail, after)
-                if moved is None:
-                    return None
-            if not self.labels_internal(tail):
-                return None  # (rest stays in the loop body: its labels keep their place)
-            # every def is read once, in the condition, where it can be evaluated; a def whose value is also
-            # needed later becomes an assignment in the condition (`while ((line = r.readLine()) != null)`, jvm-82)
-            saved = dict(self.inline)
-            decls = []
-            assigned = self.assign_defs(defs, iff.condition)
-            if assigned is None:
-                self.inline = saved
-                return None
-            for d in reversed(defs):
-                if d.expr_index in assigned:
-                    continue
-                var = d.dest
-                if d.operation != Op.HLIL_VAR_INIT or self.var_count(var) != 1 or self.def_count(var) != 1 or \
-                        self.mentions_exc(d.src):
-                    self.inline = saved
-                    return None
-                before, found = self.eval_nodes(iff.condition, var)
-                if found is not True or any(self.side_effect(i) for i in before) or \
-                        (not self.pure(d.src) and any(self.reads_memory(i) for i in before)):
-                    self.inline = saved
-                    return None
-                self.inline[var] = d.src
-            for d in defs:
-                if d.expr_index in assigned:
-                    target, value, declare = assigned[d.expr_index]
-                    key = d.dest if d.operation == Op.HLIL_VAR_INIT else d.dest.var
-                    if isinstance(value, tuple) and value[0] == 'incdec':
-                        self.inline[key] = value
-                    elif value is not None:
-                        self.inline[key] = ('assignx', target, value, d)
-                    if declare:
-                        decls.append((target, d))
-            self.loop_decls[w.expr_index] = decls
-            if do_cond is not None:
-                # `x = v; } while (x)`: the test moves to the end of the body as `if (!v) { <code after> }`
-                self.inline[x] = asg.src
-                self.hidden_vars.add(x)
-                self.consumed.add(asg.expr_index)
-                self.break_subst[w.expr_index] = ([y for _, y in after], block)
-                return defs, iff, tail, rest, ([j for j, _ in after], w.expr_index, do_cond)
-            if moved:
-                self.break_subst[rest_breaks[0].expr_index] = ([x for _, x in after], block)
-            return defs, iff, tail, rest, ([j for j, _ in after], rest_breaks[0].expr_index) if moved else None
+            return None
 
         def loop_cg_exit(self, items, k):
             """(_CgIf, rest) when items[k..] starts with a condition region whose outcomes are `break` and
@@ -4342,176 +3865,6 @@ if _HAVE_BN:
             if not (len(a) == 1 and a[0].operation == Op.HLIL_BREAK and not b):
                 return None
             return _CgIf(cond), items[end + 1:]
-
-        def step_of(self, s, x):
-            """'+' / '-' when statement s is `v = v + 1` / `v = v - 1` of the variable expression x, else None"""
-            if s is None or isinstance(s, _ExcBranch) or s.operation != Op.HLIL_ASSIGN or \
-                    s.dest.operation != Op.HLIL_VAR or x.operation != Op.HLIL_VAR or s.dest.var != x.var:
-                return None
-            v = s.src
-            if v.operation not in (Op.HLIL_ADD, Op.HLIL_SUB) or v.left.operation != Op.HLIL_VAR or \
-                    v.left.var != x.var or v.right.operation != Op.HLIL_CONST:
-                return None
-            c, bits = v.right.constant, 8 * (v.right.size or 4)
-            if c >= 1 << (bits - 1):
-                c -= 1 << bits  # BN writes a decrement as `x + -1` (0xffffffff)
-            if c not in (1, -1):
-                return None
-            return '+' if (c == 1) == (v.operation == Op.HLIL_ADD) else '-' 
-
-        def assign_defs(self, defs, cond):
-            """{expr_index of a def: (variable assigned, value or None if folded into another def, declare it
-            before the loop)} for the defs before a loop's exit test that become `(x = e)` in its condition:
-            `T x = e;` / `x = e;` whose x the condition reads once and the body reads again, and javac's
-            `T t = e; x = t;` with t read only by that store and the condition (-> `(x = e)` where t was).
-            Plain single-use defs are left to the caller. None when a def can't move into the condition."""
-            out = {}
-            if not ASSIGN_IN_CONDITIONS:
-                return out
-            for n, d in enumerate(defs):
-                var = d.dest if d.operation == Op.HLIL_VAR_INIT else d.dest.var
-                nxt = defs[n + 1] if n + 1 < len(defs) else None
-                step = self.step_of(nxt, d.src) if nxt is not None and d.operation == Op.HLIL_VAR_INIT else None
-                if step is not None and self.var_count(var) == 1 and self.refs(cond, var) == 1 and \
-                        self.def_count(var) == 1:
-                    # `t = x; x = x + 1; if (t ..)` -> `x++` where t was (javac's postfix in a loop test)
-                    out[d.expr_index] = (var, ('incdec', d.src, step, False, None, None), False)
-                    out[nxt.expr_index] = (var, None, False)
-                    continue
-                if d.expr_index in out:
-                    continue
-                step = self.step_of(d, d.dest) if d.operation == Op.HLIL_ASSIGN else None
-                if step is not None and self.refs(cond, var) == 1:
-                    out[d.expr_index] = (var, ('incdec', d.dest, step, True, None, None), False)  # ++x
-                    continue
-                if d.operation == Op.HLIL_VAR_INIT and self.var_count(var) == 1:
-                    continue  # read only by the condition: inlined as it is
-                nxt = defs[n + 1] if n + 1 < len(defs) else None
-                if d.operation == Op.HLIL_VAR_INIT and nxt is not None and nxt.operation == Op.HLIL_ASSIGN and \
-                        nxt.src.operation == Op.HLIL_VAR and nxt.src.var == var and self.var_count(var) == 2 and \
-                        self.refs(cond, var) == 1 and self.def_count(var) == 1:
-                    out[d.expr_index] = (nxt.dest.var, d.src, False)  # t = e; x = t; if (t ..)
-                    out[nxt.expr_index] = (nxt.dest.var, None, False)
-                    continue
-                if nxt is not None and nxt.expr_index in out:
-                    continue
-                if d.expr_index in out:
-                    continue
-                if self.refs(cond, var) != 1 or self.mentions_exc(d.src):
-                    return None
-                if d.operation == Op.HLIL_VAR_INIT and self.def_count(var) != 1:
-                    return None
-                out[d.expr_index] = (var, d.src, d.operation == Op.HLIL_VAR_INIT and var not in self.hoisted)
-            for d in defs:  # the moved value is evaluated where the condition reads it: nothing with effects first
-                if d.expr_index not in out or out[d.expr_index][1] is None:
-                    continue
-                if isinstance(out[d.expr_index][1], tuple):
-                    key = d.dest if d.operation == Op.HLIL_VAR_INIT else d.dest.var
-                    before, found = self.eval_nodes(cond, key)
-                    if found is not True or any(self.side_effect(i) for i in before):
-                        return None
-                    continue
-                key = d.dest if d.operation == Op.HLIL_VAR_INIT else d.dest.var
-                before, found = self.eval_nodes(cond, key)
-                if found is not True or any(self.side_effect(i) for i in before) or \
-                        (not self.pure(d.src) and any(self.reads_memory(i) for i in before)):
-                    return None
-            return out
-
-        def labels_internal(self, items):
-            """every label in items is only jumped to from items (they can move as a whole, e.g. out of a loop)"""
-            labels, gotos = set(), {}
-            for x in items:
-                for i in _walk(x.instr if isinstance(x, _ExcBranch) else x):
-                    if i.operation == Op.HLIL_LABEL:
-                        labels.add(i.target.label_id)
-                    elif i.operation == Op.HLIL_GOTO:
-                        gotos[i.target.label_id] = gotos.get(i.target.label_id, 0) + 1
-            return all(gotos.get(lid, 0) == self.label_uses(lid) for lid in labels)
-
-        def search_loop_tail(self, breaks, tail, after):
-            """the code after a loop can be printed at its single break instead (Vineflower's MergeHelper):
-            the loop is only left there and by `tail`, which must not fall through; the code is short, ends the
-            method (return / throw) and has no label"""
-            if len(breaks) != 1 or not self.ends_flow(tail):
-                return None  # (`if (c) { tail; break; }`: tail falls through to that code too)
-            items = [x for _, x in after]
-            real = [x for x in items if not self.hidden_item(x)]
-            if not real or len(real) > 4 or not self.ends_flow(items):
-                return None
-            for x in items:
-                if isinstance(x, _ExcBranch):
-                    continue
-                if any(i.operation == Op.HLIL_LABEL for i in _walk(x)) or \
-                        (x.operation == Op.HLIL_VAR_INIT and x.dest in self.inline):
-                    return None
-            return items
-
-        # --- split short-circuit conditions (jvm-54) ----------------------------------------------------
-        def negation_of(self, a, b):
-            """b is the condition !a (integer compare flipped, or a NOT)"""
-            if b.operation == Op.HLIL_NOT:
-                return str(b.src) == str(a)
-            if a.operation == Op.HLIL_NOT:
-                return str(a.src) == str(b)
-            flip = NEGATED_CMP.get(a.operation)
-            return flip is not None and b.operation == flip and str(a.left) == str(b.left) and \
-                str(a.right) == str(b.right)
-
-        def merge_split_cond(self, items, k, hi):
-            """BN splits `if (!a || p(e))` into `T x; if (a) { x = e; } if (!a || p(x))` (same with `a && p(x)`).
-            Print the second test with e in place of x and drop the first: e is still only evaluated when a holds,
-            in the same order"""
-            s = items[k]
-            if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_IF or s.expr_index in self.consumed or \
-                    self.exc_if_parts(s) is not None or \
-                    not (s.false is None or s.false.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE)):
-                return False
-            a = s.condition
-            if self.mentions_exc(a) or not self.pure(a):
-                return False
-            assigns = [x for x in self.flatten(self.stmts_of(s.true)) if not self.hidden_item(x)]
-            if not assigns or any(isinstance(x, _ExcBranch) or x.operation != Op.HLIL_ASSIGN or
-                                  x.dest.operation != Op.HLIL_VAR for x in assigns):
-                return False
-            xs = [x.dest.var for x in assigns]
-            if len(set(xs)) != len(xs):
-                return False
-            j = k + 1
-            while j <= hi and self.hidden_item(items[j]):
-                j += 1
-            if j > hi or isinstance(items[j], _ExcBranch) or items[j].operation != Op.HLIL_IF:
-                return False
-            c = items[j].condition
-            if c.operation not in (Op.HLIL_OR, Op.HLIL_AND) or c.size != 0:
-                return False
-            if not (self.negation_of(a, c.left) if c.operation == Op.HLIL_OR else str(c.left) == str(a)):
-                return False
-            r = c.right
-            for x, asg in zip(xs, assigns):
-                if self.is_exc_var(x) or self.mentions_exc(asg.src) or self.refs(c.left, x) or self.refs(r, x) != 1 \
-                        or self.var_count(x) - self.refs(s, x) != 1:
-                    return False
-            # Java order: the values are evaluated in assignment order, nothing with an effect before them
-            order = [i.var for i in self.eval_nodes(r)[0] if i.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and i.var in xs]
-            if order != xs:
-                return False
-            for x, asg in zip(xs, assigns):
-                before, found = self.eval_nodes(r, x)
-                if found is not True:
-                    return False
-                others = [i for i in before if not (i.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and i.var in xs)]
-                if any(self.side_effect(i) for i in others) or \
-                        (not self.pure(asg.src) and any(self.reads_memory(i) for i in others)):
-                    return False
-            for x, asg in zip(xs, assigns):
-                self.inline[x] = asg.src
-                self.hidden_vars.add(x)
-            self.consumed.add(s.expr_index)
-            for i in _walk(a):
-                if i.operation == Op.HLIL_VAR:
-                    self.count_discount[i.var] = self.count_discount.get(i.var, 0) + 1
-            return True
 
         def emit_loop_cond(self, w, shape, tokens, settings):
             defs, iff, tail, rest, moved = shape
@@ -4567,7 +3920,7 @@ if _HAVE_BN:
         def plan_ternary(self, body, k, hi, run_at, plan):
             """`T x; if (c) { x = a; } else { x = b; }` -> `T x = c ? a : b;` when body[k] is that declaration,
             both branches only set x (from a value without side effects, or a single call) and x is set nowhere
-            else. plan["ternary"][index of the if] = (x, ('ternary', x, if, flip, a, b)); folded into x's single
+            else. plan["ternary"][index of the if] = (x, ('ternary', x, if, a, b, flip)); folded into x's single
             use like a temporary (fold_candidate)"""
             ternary = plan.setdefault("ternary", {})
             s = body[k]
@@ -4617,7 +3970,7 @@ if _HAVE_BN:
             flip = c.operation == Op.HLIL_NOT or (
                 c.operation == Op.HLIL_CMP_E and c.right.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR) and
                 c.right.constant == 0 and (self.code_of(c.left) or "") in "L[Z" and self.code_of(c.left))
-            ternary[j] = (x, ('ternary', x, iff, bool(flip), values[0], values[1]))
+            ternary[j] = (x, ('ternary', x, iff, values[0], values[1], bool(flip)))
             self.hidden_vars.add(x)
             self.inline.update(news)
 
@@ -4742,7 +4095,7 @@ if _HAVE_BN:
             return False
 
         def emit_ternary(self, value, code, tokens, settings, precedence):
-            _, x, iff, flip, a, b = value
+            _, x, iff, a, b, flip = value
             if flip:
                 a, b = b, a
             if code is None:
@@ -4798,12 +4151,6 @@ if _HAVE_BN:
                 tokens.append_close_paren()
 
         # --- gotos of if/else shapes (jvm-48) ---------------------------------------------------------
-        def label_uses(self, label_id):
-            try:
-                return len(self.hlil.get_label_uses(label_id))
-            except Exception:
-                return -1
-
         def declared_in(self, items):
             out = set()
             for s in items:
@@ -5042,24 +4389,9 @@ if _HAVE_BN:
                 tokens.scope_separator()
                 self.emit_list(tail, tokens, settings, s.true)
 
-        def emit_error(self, s, ex, tokens):
-            """never lose a statement: if rendering fails, print its HLIL as a comment"""
-            try:
-                import binaryninja
-                binaryninja.log_warn("Pseudo Java: %s at %#x: %r" % (type(ex).__name__, s.address, ex))
-            except Exception:
-                pass
-            tokens.new_line()
-            self.note(tokens, "// [Pseudo Java could not render this statement: %s]" % type(ex).__name__)
-            tokens.new_line()
-            instr = s.instr if isinstance(s, _ExcBranch) else s
-            try:
-                text = [str(l) for l in instr.lines] if hasattr(instr, "lines") else str(instr).split("\n")
-            except Exception:
-                text = [str(instr)]
-            for line in text:
-                self.note(tokens, "// " + line)
-                tokens.new_line()
+        def hlil_lines(self, s):
+            # emit_error (shared/tokens.py) prints the HLIL of a statement that failed to render
+            return TokenMixin.hlil_lines(self, s.instr if isinstance(s, _ExcBranch) else s)
 
         def emit_statement(self, body, idx, plan, tokens, settings, block, need_separator):
             s = body[idx]

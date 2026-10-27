@@ -10,7 +10,7 @@ usage: python3 tests/lint.py     # exit 1 on a finding
 import os, shutil, subprocess, sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LINT = [(["."], ""), (["tests"], "bv,bvs,env")]  # (paths, builtins); "." = the plugin package (top-level *.py)
+LINT = [([".", "shared"], ""), (["tests"], "bv,bvs,env")]  # (paths, builtins); "." = the plugin package (top-level *.py)
 
 
 def lint(quiet=False):
