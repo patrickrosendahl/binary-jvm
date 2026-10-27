@@ -31,9 +31,13 @@ before closing a view; the rerun was clean). 2026-10-26 (MacBook; ticket comment
 (test6/7/8/9 as finally: empty / non-empty catch at a copy's tail keyed like the dropped rethrow, success-path jump
 keeps its call's try, break to __propagate = rethrow, finally exit jump moved into a trailing try), jvm-90 testComplex
 (`join` condition graph: `if (c) { L: T } else { ..goto L.. }` -> `if (!c) { .. } T`; now catch (Throwable) without
-gotos) -> suite 6226, gotos 4, labels 3; mdg 2014, compare_all 251/251. Open: jvm-91 item 3 (TestSwitchInTry: hash test + goto frame
-left), jvm-89 test12 (labeled break out of synchronized from a finally), jvm-90 loopInFinally (all paths end in an
-endless loop; jvm-99 territory), jvm-99 (unreachable finally, test4/5), jvm-83 rest left on purpose (testFinallyNested; Vineflower fails too). On the Intel MacBook a full gate round takes ~1.5 h and
+gotos) -> suite 6226, gotos 4, labels 3; mdg 2014, compare_all 251/251. 2026-10-27 (MacBook): housekeeping (jvm-103/108/110
+resolved, jvm-90 rest moved to jvm-99), jvm-89 test12 (synchronized whose tail HLIL put at the loop's end: releases print as
+`break`), jvm-91 item 3 (String-switch hash test left apart in a try), jvm-100 (`do { .. } while (c)` from a trailing `if (c)
+break;`), jvm-92 part (assert at a loop body's start, concatenated message) -> suite 6215, gotos 3, labels 2, sync_comments 0;
+mdg 2014, compare_all 251/251. Open: jvm-112 (finally copy in a trailing if of the root list), jvm-111 (no else after a
+terminal branch), jvm-92 rest (AssertionError thrown in a try range), jvm-99 (unreachable finally, test4/5, and
+loopInFinally from jvm-90: all paths end in an endless loop), jvm-83 rest left on purpose (testFinallyNested; Vineflower fails too). On the Intel MacBook a full gate round takes ~1.5 h and
 overlapping bnrun jobs slow each other ~10x (classes then hit BN's analysis time limit: `analysis skipped` in a dump is load,
 redump the class alone) -- run the gates one at a time. jvm-15 waits for Patrick's GUI
 click-through (BN restarted 2026-10-14 with the symlinked plugin, so jarload.py is loaded). jvm-68 still waits on binary-cpp. Use a dev load for live tests.

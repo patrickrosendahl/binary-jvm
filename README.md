@@ -51,15 +51,8 @@ Ninja. A `.class` file opens as **JVM Class Format**.
 ## Roadmap / TODO
 
 Tickets are tracked in minitick project `jvm` (`jvm-N`). Done: Python 3 port, full opcode coverage,
-invokes as calls, JAR loading, Pseudo Java, class view. Patching (nop, invert branch, assemble) is
-**not a goal** and was removed.
-
-### Analysis DB (`.bndb`) must persist renames + notes ⬜
-Renaming a function/symbol/variable and adding comments must survive save → close → reopen.
-- Method symbols are `define_auto_symbol`; re-analysis may overwrite user renames — switch to user
-  symbols or make sure the loader doesn't clobber them on reopen.
-- `init()` re-runs on DB load; guard it so it doesn't re-`define_*` over user edits.
-- Acceptance test: function/variable renames and `set_comment_at` notes round-trip through a saved `.bndb`.
+invokes as calls, JAR loading, Pseudo Java, class view, renames and comments surviving a saved `.bndb`
+(jvm-17..20). Patching (nop, invert branch, assemble) is **not a goal** and was removed.
 
 ### Open questions
 - How should constant-pool references render inline — `pool_N` pseudo-pointers, or resolved names?

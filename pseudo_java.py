@@ -1605,6 +1605,7 @@ if _HAVE_BN:
             self._in_finally = False
             self.inline = {}        # folded single-use temporary -> its value (expr, or ('new', entry)) (jvm-46)
             self.active_syncs = []  # lock variables of the synchronized blocks being printed (jvm-47)
+            self.release_breaks = set()  # expr_index of releases printed as `break` (sync_wtail_shape, jvm-89)
             self.array_lits = {}    # array variable -> (new instr, element values, other uses) (jvm-49)
             self.hidden_vars = set()  # lock variables whose definition moved into a synchronized header
             self.twr_labels = set()  # labels of folded try-with-resources tails (jvm-78)
@@ -1626,6 +1627,7 @@ if _HAVE_BN:
             self._copy_keys = {}     # window expr_index tuple -> norm_keys, see copy_window (jvm-86)
             self._case_labels = []      # switch_key of the switches being printed (case labels, jvm-44)
             self._switch_keys = None
+            self._hash_skip = {}        # expr_index of a String switch's leftover hash test -> its label (jvm-91)
             self._hoisted_caps = set()  # lambda invokedynamics whose computed captures print as declarations (jvm-79)
             self._names = None        # auto-named variable -> printed name (jvm-55)
             self.count_discount = {}  # var -> reads that no longer print (merged split conditions, jvm-54)
@@ -1637,6 +1639,7 @@ if _HAVE_BN:
             self._loop_depth = 0         # >0 while a loop's body is being printed (jvm-85)
             self._tail_ret_hide = []     # try statements whose catch clauses may hide the implicit final return (jvm-86)
             self._loop_pending = False   # the next emit_list is that loop's body list
+            self._tail_blocks = set()    # branch blocks of an if that ends a loop body list (copy_end_ok, jvm-89)
             self._finally_exit = {}      # catch-all handler pc -> 'continue' / 'return' after its try
             self._try_in_loop = {}       # catch-all handler pc -> its try statement is inside a printed loop
             self._finally_clause = False  # printing a `finally { }` body: its rethrow is implicit
@@ -2657,6 +2660,7 @@ if _HAVE_BN:
                 self._follow = []
                 self.inline = {}
                 self.active_syncs = []
+                self.release_breaks = set()
                 self.array_lits = {}
                 self.hidden_vars = set()
                 self.twr_labels = set()
@@ -2690,6 +2694,7 @@ if _HAVE_BN:
                 self._tail_ret_hide = []
                 self._var_occ_stmt = {}
                 self._copy_keys = {}
+                self._tail_blocks = set()
                 for text in self.unreachable_tries():
                     self.note(tokens, text)
                     tokens.new_line()
@@ -2763,7 +2768,15 @@ if _HAVE_BN:
             # a copy of a finally ending this list is javac's duplication before an implicit
             # continue (this list is a loop body) or return (the root) -- never inside a try body
             # or a handler, and not a list that merely falls through to following statements
-            plan["copy_end_ok"] = not own and (is_root or self._loop_pending)
+            plan["copy_end_ok"] = not own and (is_root or self._loop_pending or
+                                               block is not None and block.expr_index in self._tail_blocks)
+            if plan["copy_end_ok"] and not is_root:
+                # the branches of a trailing if end where this list ends: before the loop's implicit continue
+                # (TestSynchronizedLoop.test12, jvm-89)
+                last = next((x for x in reversed(body) if not isinstance(x, _ExcBranch) and
+                             not self.hidden_item(x) and not self.is_exc_plumbing(x)), None)
+                if last is not None and last.operation == Op.HLIL_IF and last.as_ast:
+                    self._tail_blocks.update(b.expr_index for b in (last.true, last.false) if b is not None)
             plan["list_kind"] = None if own else 'root' if is_root else 'loop' if self._loop_pending else None
             self._loop_pending = False
             if own:
@@ -3707,7 +3720,8 @@ if _HAVE_BN:
                 return None
             s = body[j]
             if not any(a <= j and b >= k for a, b, _ in run_at.values()):
-                lp = self.sync_loop_shape(body, k, j, lock) or self.sync_wloop_shape(body, k, j, lock)
+                lp = self.sync_loop_shape(body, k, j, lock) or self.sync_wloop_shape(body, k, j, lock) or \
+                    self.sync_wtail_shape(body, k, j, lock)
                 if lp is not None:
                     return lp
             if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_IF or \
@@ -3836,7 +3850,95 @@ if _HAVE_BN:
                 return None  # (B is the whole loop body: no jumps, no lock operations)
             return ('loop', j, True, j, bi, None, pre, li[rel[0]:], li[rel[0]], s.true, w.body, s.condition)
 
+        def sync_wtail_shape(self, body, k, j, lock):
+            """('wtail', j, B, T, releases): `enter; S; while (true) { B; T }` where every path of B that falls into
+            T releases the lock first (HLIL put the code after the block at the end of the loop body: a break out of
+            the loop leaves the block) -> synchronized { S; while (true) { B } } T, each release printed as
+            `break` (TestSynchronizedLoop.test12, jvm-89)"""
+            w = body[j]
+            if isinstance(w, _ExcBranch) or w.operation not in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE) or \
+                    not w.as_ast or not self.infinite_loop(w) or self.monitor_exits(body[k + 1:j], lock):
+                return None
+            items = self.flatten(self.stmts_of(w.body))
+            last = max((m for m, x in enumerate(items) if self.monitor_exits([x], lock)), default=None)
+            if last is None:
+                return None
+            b_items, t_items = items[:last + 1], items[last + 1:]
+            tr = [x for x in t_items if not self.hidden_item(x)]
+            if not tr or any(isinstance(x, _ExcBranch) for x in tr) or not self.ends_flow(tr) or \
+                    self.loop_breaks(t_items) or self.has_labels(t_items):
+                return None
+            if any(x.operation == Op.HLIL_BREAK for x in self.loop_breaks(b_items)) or \
+                    self.used_in(t_items, self.declared_in(body[k + 1:j] + b_items)):
+                return None  # (a break of B would skip T; T runs outside the block's scope)
+            releases = []
+
+            def ends(xs):
+                """every fall-through end of xs is a release (collected), else False"""
+                for x in xs:
+                    if isinstance(x, _ExcBranch) and self.monitor_exits([x], lock):
+                        if not ends(self.flatten(self.stmts_of(x.branch))):
+                            return False
+                real = [x for x in xs if not isinstance(x, _ExcBranch) and not self.hidden_item(x)]
+                if not real:
+                    return False
+                x = real[-1]
+                if self.monitor_var(x, "monitorexit") == lock and not self.in_monitor_code(x):
+                    releases.append(x)
+                    return True
+                if x.operation == Op.HLIL_IF and x.as_ast and self.exc_if_parts(x) is None and \
+                        x.false is not None and x.false.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
+                    return all(ends(self.flatten(self.stmts_of(b))) for b in (x.true, x.false))
+                return self.ends_flow([x])
+
+            if not ends(b_items) or len(releases) != self.block_exits(lock, body[k]) or \
+                    len(releases) != self.monitor_exits(b_items, lock):
+                return None
+            return ('wtail', j, b_items, t_items, releases)
+
         def emit_sync_split(self, body, k, shape, lock, value, plan, tokens, settings, block):
+            if shape[0] == 'wtail':
+                _, j, b_items, t_items, releases = shape
+                w = body[j]
+                self.kw(tokens, "synchronized ")
+                tokens.append_open_paren()
+                if value is not None:
+                    self.emit_typed(value, 'L', tokens, settings)
+                else:
+                    self.emit_var(lock, body[k], tokens)
+                tokens.append_close_paren()
+                tokens.begin_scope(ScopeType.BlockScopeType)
+                self.active_syncs.append(lock)
+                self.release_breaks.update(r.expr_index for r in releases)
+                try:
+                    if [m for m in range(k + 1, j) if not self.hidden_item(body[m]) and
+                            m not in plan.get("folded", ()) and m not in plan.get("done", ())]:
+                        self.emit_range(body, k + 1, j - 1, plan, tokens, settings, block)
+                        tokens.scope_separator()
+                    self.kw(tokens, "while ")
+                    tokens.append_open_paren()
+                    self.kw(tokens, "true")
+                    tokens.append_close_paren()
+                    tokens.begin_scope(ScopeType.BlockScopeType)
+                    self._loop_depth += 1
+                    self._loop_pending = True
+                    try:
+                        self.emit_list(b_items, tokens, settings, w.body)
+                    finally:
+                        self._loop_depth -= 1
+                    tokens.end_scope(ScopeType.BlockScopeType)
+                    tokens.finalize_scope()
+                    tokens.new_line()
+                finally:
+                    self.active_syncs.pop()
+                    tokens.end_scope(ScopeType.BlockScopeType)
+                tokens.finalize_scope()
+                tokens.new_line()
+                tokens.scope_separator()
+                self._loop_pending = False
+                self.emit_list(t_items, tokens, settings, w.body, is_root=bool(plan.get("root")))
+                plan.setdefault("folded", set()).add(j)
+                return
             j = shape[1]
             s = body[j]
             label = None
@@ -4135,6 +4237,8 @@ if _HAVE_BN:
             iff = items[k]
             if self.cond_throws_in_try(w, [d.src for d in defs] + [iff.condition]):
                 return None
+            if ASSERTS and not isinstance(iff, _ExcBranch) and iff.as_ast and self.assert_shape(items, k) is not None:
+                return None  # `assert c;` at the start of the body, not `while ($assertionsDisabled || c)` (jvm-92)
             if CONDITION_GRAPHS and not defs and do_cond is None:
                 cg = self.loop_cg_exit(items, k)
                 if cg is not None:  # `while (true) { if (<graph>) break; rest }` (jvm-80/82)
@@ -5055,6 +5159,23 @@ if _HAVE_BN:
                 return need_separator
             if SWITCH_KEYS and s.expr_index in self.switch_keys()[1]:
                 return need_separator  # the key computation of a switch on an enum / String
+            if SWITCH_KEYS and not isinstance(s, _ExcBranch) and s.operation == Op.HLIL_IF and self.switch_keys() and \
+                    s.expr_index in self._hash_skip:
+                got = self.hash_skip_shape(body, idx, self.switch_keys()[1])
+                if got is not None:
+                    # a String switch's leftover hash test (jvm-91): only its then part prints
+                    lid, m = got
+                    self.hidden_gotos[lid] = self.hidden_gotos.get(lid, 0) + self.label_uses(lid)
+                    plan.setdefault("done", set()).update(range(idx + 1, m + 1))
+                    t = self.flatten(self.stmts_of(s.true))
+                    tail = t[next(k for k, x in enumerate(t) if not isinstance(x, _ExcBranch) and
+                                  x.operation == Op.HLIL_LABEL) + 1:]
+                    if not [x for x in tail if not self.hidden_item(x)]:
+                        return need_separator
+                    if need_separator:
+                        tokens.scope_separator()
+                    self.emit_list(tail, tokens, settings, s.true)
+                    return False
             if ASSERTS and s.operation == Op.HLIL_IF and s.as_ast and not isinstance(s, _ExcBranch):
                 shape = self.assert_shape(body, idx)
                 if shape is not None:
@@ -5064,6 +5185,13 @@ if _HAVE_BN:
                     return bool(shape[1]) and shape[0] == 'throw'
             lock = self.monitor_var(s, "monitorexit")
             if lock is not None and lock in self.active_syncs:
+                if s.expr_index in self.release_breaks:  # leaving the loop leaves the block (jvm-89)
+                    if need_separator:
+                        tokens.scope_separator()
+                    self.kw(tokens, "break")
+                    tokens.append_semicolon()
+                    tokens.new_line()
+                    return False
                 return need_separator  # leaving the synchronized block
             if s.operation == Op.HLIL_VAR_DECLARE and (s.var in self.hidden_vars or s.var in self.lock_only_vars()
                                                        or s.var in self.twr_resources()):
@@ -5102,7 +5230,7 @@ if _HAVE_BN:
                 tokens.append_semicolon()
                 tokens.new_line()
                 return False
-            if self._finally_clause and self.break_rethrows(s):
+            if self._finally_clause and (self.break_rethrows(s) or self.cleanup_break(s)):
                 return need_separator  # the loop is left for the rethrow: the finally clause's own end (jvm-89)
             if self.is_rethrow(s) and s.params[0].operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and \
                     (not self.exc_names or self._finally_clause) and self.is_exc_value(s.params[0]):
@@ -6551,8 +6679,8 @@ if _HAVE_BN:
                     out.append('rethrow')
                     return out
                 if s.operation in (Op.HLIL_RET, Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_GOTO, Op.HLIL_NORET,
-                                   Op.HLIL_TAILCALL):
-                    out.append('abrupt')
+                                   Op.HLIL_TAILCALL) or s.expr_index in self.release_breaks:
+                    out.append('abrupt')  # (a release printed as `break` leaves the loop, jvm-89)
                     return out
                 if s.operation == Op.HLIL_INTRINSIC and s.intrinsic.name in ("athrow", "__propagate"):
                     out.append('abrupt')
@@ -6853,11 +6981,21 @@ if _HAVE_BN:
             after = self.break_loop(s)[1]
             return after is not None and not isinstance(after, _ExcBranch) and self.is_rethrow(after)
 
+        def cleanup_break(self, s):
+            """s is the `break` of `exc = e; break` into a synchronized block's cleanup handler (cleanup_rethrow): a
+            rethrow of e (TestSynchronizedLoop.test12, jvm-89)"""
+            p = s.parent
+            if s.operation != Op.HLIL_BREAK or p is None or p.operation != Op.HLIL_BLOCK:
+                return False
+            body = list(p.body)
+            idx = next((k for k, x in enumerate(body) if x.expr_index == s.expr_index), None)
+            return idx is not None and self.cleanup_rethrow(body, idx) is not None
+
         def rethrow_stmt(self, s):
             """a statement whose whole purpose is rethrowing the caught exception"""
             if isinstance(s, _ExcBranch):
                 return False
-            if self.break_rethrows(s):
+            if self.break_rethrows(s) or self.cleanup_break(s):
                 return True
             if s.operation == Op.HLIL_INTRINSIC and s.intrinsic.name in ("athrow", "__propagate"):
                 return not s.params or self.is_exc_value(s.params[0])
@@ -7003,10 +7141,17 @@ if _HAVE_BN:
             """length m of body[idx:idx+m] whose normalized keys equal a finally body's, followed by an
             abrupt exit (or by the end of the list when end_ok) -- the shapes of the copy and the
             handler can differ in statement count (`if (c) {A; throw} B` against `if (c) A else B`)"""
-            for m in range(1, min(len(body) - idx, len(keys) + 3) + 1):
+            real = 0
+            for m in range(1, len(body) - idx + 1):
                 window = body[idx:idx + m]
-                if any(isinstance(x, _ExcBranch) for x in window):
-                    return None
+                x = window[-1]
+                if isinstance(x, _ExcBranch):
+                    if not self.monitor_branch(x):
+                        return None  # (a synchronized block's cleanup branches inside the copy are no exit)
+                elif not self.is_exc_plumbing(x):
+                    real += 1
+                    if real > len(keys) + 3:
+                        return None
                 after = body[idx + m] if idx + m < len(body) else None
                 if after is None:
                     if not end_ok:
@@ -7021,9 +7166,33 @@ if _HAVE_BN:
                 wk = self._copy_keys.get(ident)
                 if wk is None:
                     wk = self._copy_keys[ident] = self.norm_keys(window, False)
-                if wk == keys:
+                if wk == keys or after is None and self.strip_tail_continue(wk) == keys:
                     return m
             return None
+
+        def monitor_branch(self, x):
+            """x is an exceptional branch only to synchronized-cleanup handlers"""
+            covering = self.covering_handlers(x.address - self.function.start) if self.monitor_handlers else None
+            return bool(covering) and all(h in self.monitor_handlers for h in covering)
+
+        def strip_tail_continue(self, keys):
+            """keys of a copy that ends its loop body with a `continue` in a tail position dropped: there it is the
+            end of the finally, where the handler copy's dropped rethrow goes -- `if (c) continue; break` equals the
+            handler's `if (c) throw e; break` (TestSynchronizedLoop.test12, jvm-89)"""
+            if not keys:
+                return keys
+            k = keys[-1]
+            if k == ('continue',):
+                return keys[:-1]
+            if k[0] == 'if':
+                tk, fk = self.strip_tail_continue(k[2]), self.strip_tail_continue(k[3])
+                if (tk, fk) != (k[2], k[3]):
+                    if not tk and fk and isinstance(k[1], tuple) and k[1] and k[1][0] in _NEG_NAMES:
+                        k = ('if', (_NEG_NAMES[k[1][0]],) + k[1][1:], fk, ())
+                    else:
+                        k = ('if', k[1], tk, fk)
+                    return keys[:-1] + (k,)
+            return keys
 
         def has_finally_duplicate(self, hpc, items):
             """the handler's body also runs inline somewhere (javac's finally duplication): a run of
@@ -7152,6 +7321,62 @@ if _HAVE_BN:
             self.emit_body(body, tokens, settings, newline=False)
             tokens.end_scope(ScopeType.BlockScopeType if scope is None else scope)
 
+        def do_while_tail(self, w):
+            """(break condition, items to hide) when an endless loop's body ends in `if (c) break;` (a condition
+            graph of breaks, maybe followed by `continue;`) and has no other continue: `do { .. } while (!c)`
+            (TestLoopFinally.test3, TestWhileTernary6, TestNextGaussian; jvm-100)"""
+            if not LOOP_CONDITIONS or w.operation == Op.HLIL_FOR or not self.infinite_loop(w) or \
+                    self.exc_test(w.condition) is not None:
+                return None
+            items = self.flatten(self.stmts_of(w.body))
+            real = [k for k, x in enumerate(items) if not isinstance(x, _ExcBranch) and not self.hidden_item(x)]
+            hide = []
+            if real and items[real[-1]].operation == Op.HLIL_CONTINUE:
+                hide.append(items[real.pop()])
+            if len(real) < 2 or items[real[-1]].operation != Op.HLIL_IF or not items[real[-1]].as_ast:
+                return None
+            k = real[-1]
+            # the loop's own continues (also in a switch or an exceptional branch) would run the test in a do-while;
+            # gotos may print as labelled continues
+            stack = [x.branch if isinstance(x, _ExcBranch) else x for x in items]
+            while stack:
+                i = stack.pop()
+                if isinstance(i, _ExcBranch):
+                    stack.append(i.branch)
+                    continue
+                if i.operation == Op.HLIL_GOTO or i.operation == Op.HLIL_CONTINUE and \
+                        i.expr_index not in {h.expr_index for h in hide}:
+                    return None
+                if i.operation in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE, Op.HLIL_FOR):
+                    continue
+                stack.extend(self.stmts_of(i) if isinstance(i, _StmtList) else _children(i))
+            try:
+                built = self.cg_build(items, k, k)
+            except (self._CgAbort, RecursionError):
+                return None  # (exception code in the test: cg_build's indexing raises)
+            if built is None:
+                return None
+            nodes, root = built
+            original = dict(nodes)
+            top = self.cg_reduce(nodes, root)
+            if top[0] != 'dec' or nodes[top[2]][0] != 'leaf' or nodes[top[3]][0] != 'leaf' or \
+                    not self.cg_verify(original, root, top):
+                return None
+            a, b = nodes[top[2]][2], nodes[top[3]][2]
+            is_break = lambda xs: len(xs) == 1 and xs[0].operation == Op.HLIL_BREAK
+            goes_on = lambda xs: not xs or len(xs) == 1 and xs[0].operation == Op.HLIL_CONTINUE
+            if is_break(a) and goes_on(b):
+                cond = top[1]
+            elif is_break(b) and goes_on(a):
+                cond = ('not', top[1])
+            else:
+                return None
+            # the test sits after the body's scope: no variable it reads may be declared in the body
+            declared = self.declared_in(items[:k])
+            if any(i.operation in (Op.HLIL_VAR, Op.HLIL_VAR_SSA) and i.var in declared for i in _walk(items[k])):
+                return None
+            return cond, [items[k]] + hide
+
         def do_while_compute(self, w):
             """(x, `x = e`, {temporary: folded new}) when a do-while's body only computes the value its test reads once, else None"""
             if not LOOP_CONDITIONS or self.exc_test(w.condition) is not None:
@@ -7266,6 +7491,18 @@ if _HAVE_BN:
                         self.kw(tokens, "else")
                         self._scoped(instr, chain, tokens, settings, index=n)
                         break
+                tokens.finalize_scope()
+            elif o in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE) and instr.as_ast and self.do_while_tail(instr) is not None:
+                cond, hide = self.do_while_tail(instr)
+                self.consumed.update(x.expr_index for x in hide)
+                self.kw(tokens, "do")
+                self._scoped(instr, instr.body, tokens, settings)
+                tokens.scope_continuation(True)
+                self.kw(tokens, "while ")
+                tokens.append_open_paren()
+                self.emit_bexpr(cond, tokens, settings, P.TopLevelOperatorPrecedence, negate=True)
+                tokens.append_close_paren()
+                tokens.append_semicolon()
                 tokens.finalize_scope()
             elif o == Op.HLIL_WHILE:
                 self.kw(tokens, "while ")
@@ -8288,10 +8525,70 @@ if _HAVE_BN:
                         continue  # the subject would be evaluated at every use instead of once, at the key
                     keys[var] = key
                     hidden.update(st.expr_index for st in stmts)
+                    if key[0] == 'string':
+                        self.hash_skips(key[1].var, hidden)
             except Exception:
                 keys.clear()
                 hidden.clear()
+                self._hash_skip = {}
             return self._switch_keys
+
+        def hash_skips(self, subject, hidden):
+            """`h = s.hashCode()` read only by hash tests javac's dispatch left apart from the key computation
+            (`if (h != 0x61) { L: T } r = s.equals("a"); if (r) n = 0; goto L` inside a try in a loop,
+            TestSwitchInTry; jvm-91): the equals test decides alone, so such an if prints as T and h is hidden"""
+            for d in _walk(self.hlil.root):
+                if d.operation != Op.HLIL_VAR_INIT or d.expr_index in hidden or \
+                        d.src.operation not in (Op.HLIL_CALL, Op.HLIL_INTRINSIC):
+                    continue
+                sh = self.call_shape(d.src)
+                if sh is None or sh[2] != "hashCode" or sh[4] is None or sh[4].operation != Op.HLIL_VAR or \
+                        sh[4].var != subject:
+                    continue
+                reads = [i for i in _walk(self.hlil.root) if i.operation == Op.HLIL_VAR and i.var == d.dest]
+                ifs = {}
+                for u in reads:
+                    c, s = u.parent, u.parent.parent if u.parent is not None else None
+                    if c is None or c.operation not in (Op.HLIL_CMP_E, Op.HLIL_CMP_NE) or \
+                            c.right.operation != Op.HLIL_CONST or s is None or s.operation != Op.HLIL_IF or \
+                            s.condition.expr_index != c.expr_index or s.parent is None or \
+                            s.parent.operation != Op.HLIL_BLOCK:
+                        break
+                    items = self.flatten(self.stmts_of(s.parent))
+                    k = next((k for k, x in enumerate(items) if x is s or
+                              (not isinstance(x, _ExcBranch) and x.expr_index == s.expr_index)), None)
+                    got = self.hash_skip_shape(items, k, hidden) if k is not None else None
+                    if got is None:
+                        break
+                    ifs[s.expr_index] = got[0]
+                else:
+                    if reads:
+                        self._hash_skip.update(ifs)
+                        hidden.add(d.expr_index)
+
+        def hash_skip_shape(self, items, k, hidden):
+            """(label, index of its last goto) when items[k] is `if (h ...) { L: T }` and items[k+1..] up to the
+            last goto to L only compute the key (hidden statements, exception plumbing) -- see hash_skips"""
+            s = items[k]
+            if s.operation != Op.HLIL_IF or s.false is not None and \
+                    s.false.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
+                return None
+            t = [x for x in self.flatten(self.stmts_of(s.true)) if isinstance(x, _ExcBranch) or
+                 not self.is_exc_plumbing(x)]
+            if not t or isinstance(t[0], _ExcBranch) or t[0].operation != Op.HLIL_LABEL:
+                return None
+            lid = t[0].target.label_id
+            uses, seen = self.label_uses(lid), 0
+            for m in range(k + 1, len(items)):
+                x = items[m]
+                if isinstance(x, _ExcBranch) or self.is_exc_plumbing(x) or x.expr_index in hidden:
+                    continue
+                if x.operation != Op.HLIL_GOTO or x.target.label_id != lid:
+                    return None
+                seen += 1
+                if seen == uses:
+                    return lid, m
+            return None
 
         def key_use_ok(self, u, key):
             p = u.parent
@@ -8413,11 +8710,26 @@ if _HAVE_BN:
             if len(items) == 1:
                 call = v  # new folded into its constructor call
                 recv_ok = lambda r: r.operation == Op.HLIL_INTRINSIC and r.intrinsic.name == "new"
-            elif len(items) == 3 and v.operation == Op.HLIL_VAR:
+            elif len(items) >= 3 and v.operation == Op.HLIL_VAR:
                 nv = self.new_assignment(items[0])
                 if nv is None or nv[0] != v.var or self.info.class_ref(nv[1]) != "java/lang/AssertionError":
                     return None
-                call = self.stmt_call(items[1])
+                call = self.stmt_call(items[-2])
+                # `new StringBuilder()` + its <init> of a message built by concatenation (TestLocalsNames, jvm-92)
+                for x in items[1:-2]:
+                    sb = self.new_assignment(x)
+                    if sb is None:
+                        c = self.stmt_call(x)
+                        sh = self.call_shape(c) if c is not None and \
+                            c.operation in (Op.HLIL_CALL, Op.HLIL_INTRINSIC) else None
+                        if sh is None or sh[2] != "<init>" or sh[1] != "java/lang/StringBuilder" or sh[4] is None or \
+                                sh[4].operation != Op.HLIL_VAR:
+                            return None
+                        sb = (sh[4].var, None)
+                    elif self.info.class_ref(sb[1]) != "java/lang/StringBuilder":
+                        return None
+                    if call is None or self.refs(call, sb[0]) != 1 or self.var_count(sb[0]) != 2:
+                        return None
                 recv_ok = lambda r: r.operation == Op.HLIL_VAR and r.var == v.var
             else:
                 return None
@@ -8490,6 +8802,9 @@ if _HAVE_BN:
                         self.op(tokens, " || ")
                     self.expr(c, tokens, settings, P.LogicalOrOperatorPrecedence)
             if args:
+                # a concatenated message: its StringBuilder statements sit in the throw code (jvm-92)
+                self.plan_block([x for x in (self.flatten(self.stmts_of(body[idx].true)) if kind == 'throw'
+                                             else body[idx + 1:]) if not isinstance(x, _ExcBranch)])
                 self.op(tokens, " : ")
                 self.emit_typed(args[0], descriptor_arg_codes(desc)[0] if desc else None, tokens, settings,
                                 P.TernaryOperatorPrecedence)
