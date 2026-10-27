@@ -5,8 +5,8 @@ description: Project skill for the binary-jvm Binary Ninja plugin (Java .class A
 
 # binary-jvm project workflow
 
-**Resumed 2026-10-06** (after a short pause, jvm-28) — plugin installed. Current work (2026-10-14): Pseudo Java
-quality against Vineflower — jvm-82 rest, then jvm-81, jvm-83, jvm-88..90 (CLAUDE.md handoff has the order).
+**Resumed 2026-10-06** (after a short pause, jvm-28) — plugin installed. Current work (2026-10-27): Pseudo Java
+quality against Vineflower — jvm-93, jvm-99, jvm-82 leftovers, jvm-92 and the open rests of jvm-89/90/91 (CLAUDE.md handoff).
 
 **Two machines:** MusicMac.local (original; ticket + wiki servers) and MacBook-Pro.local (clone
 since 2026-10-12; `/opt/anaconda3/bin/minitick|miniwiki` work as configured). The
