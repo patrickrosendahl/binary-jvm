@@ -1,5 +1,5 @@
-# shared with binary-cpp/shared/folding.py (merged at binary-cpp ad73a10 / binary-jvm jvm-68: the folding core of
-# jvm-46/60 and bncpp-11/13/106); keep language-neutral
+# shared with binary-cpp/shared/folding.py (the folding core of jvm-46/60 and bncpp-11/13/106; synced at
+# binary-cpp 906947c); keep language-neutral
 """Evaluation-order-safe folding of single-use temporaries (bncpp-13, jvm-46).
 
 A temporary that a function assigns once and reads once can be printed at its single use instead of on its own
@@ -31,6 +31,8 @@ Optional hooks (the defaults keep the mixin usable on its own):
                                     loops never do)
   fold_transparent(body, j, plan)   body[j] prints nothing between a definition and its use (default: NOPs,
                                     folded statements, plan["hidden_decls"])
+  fold_skip(body, j, var, value, value_pure) -> bool   var's value may move past body[j], a printed statement
+                                    that is not its use (default False: a fold goes into the next statement)
   strip(e)                          e without the wraps a load / temporary may carry (default: zx / sx /
                                     low_part / offset-0 field of a variable, as native HLIL prints them)
   incdec_store(st)     -> (value stored, same(e)) | None   st stores to a variable / memory and same(e) tells
@@ -89,6 +91,9 @@ class FoldMixin:
 
     def fold_use_ok(self, body, j, plan):
         return True
+
+    def fold_skip(self, body, j, var, value, value_pure):
+        return False
 
     def strip(self, e):
         return _strip(e)
@@ -303,7 +308,8 @@ class FoldMixin:
         parts, part_of = [], plan.get("part_of", {})
         j = k + 1
         while j <= hi and j not in barrier:
-            if j == store or self.fold_transparent(body, j, plan):
+            if j == store or self.fold_transparent(body, j, plan) or \
+                    self.fold_skip(body, j, var, value, value_pure):
                 j += 1
             elif j in part_of:
                 parts.append(j)
