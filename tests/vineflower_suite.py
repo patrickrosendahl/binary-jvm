@@ -23,8 +23,8 @@ OUT = os.path.join(REPO, ".scratch", "vfsuite")
 TESTS = os.path.join(OUT, "tests.txt")
 # the current totals: a regression gate like the mdg one (lower them as tickets land)
 MAX = ["temps=34", "gotos=3", "labels=2", "sync_comments=0", "offset_stores=0", "while_true=61", "while_true_excess=6", "plumbing=0",
-       "dead_code=0", "leaked_catch_var=0", "ref_zero=0", "double_casts=0", "type_mismatch=0", "if_else_assign=3",
-       "lost_calls=9", "lost_strings=23", "skipped=0", "stmts=6200"]
+       "dead_code=0", "leaked_catch_var=0", "ref_zero=0", "double_casts=0", "type_mismatch=0", "if_else_assign=2",
+       "lost_calls=8", "lost_strings=23", "skipped=0", "stmts=6160"]
 
 
 def java8_tests():

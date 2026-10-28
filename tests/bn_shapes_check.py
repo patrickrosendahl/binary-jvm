@@ -28,8 +28,17 @@ CHECKS = {
     # jvm-93: the bound reference's null check is part of `o::toString`, also inside a try
     "boundRefInTry": (["o::toString;"], ["getClass", "requireNonNull", "invokedynamic"]),
     # jvm-92: an assert whose AssertionError is thrown inside a try range (to the handler, not __propagate)
-    "assertInTry": (['assert i > 0 : "positive";\nwork(i);'], ["AssertionError", "goto", "__propagate", "exc"]),
-    "assertInTryAll": (["assert i > 0;\nwork(i);"], ["AssertionError", "goto", "__propagate", "exc"]),
+    # (jvm-119: the try body's end is not a `return;`)
+    "assertInTry": (['assert i > 0 : "positive";\nwork(i);\n} catch'], ["AssertionError", "goto", "__propagate", "exc",
+                                                                      "return;"]),
+    "assertInTryAll": (["assert i > 0;\nwork(i);\n} catch"], ["AssertionError", "goto", "__propagate", "exc", "return;"]),
+    # jvm-119: javac's jump past the handlers to the method's end prints nothing, in the try body or after the catch
+    "tryEndsMethod": (["try {\nwork(i);\n} catch (Exception e) {\ne.printStackTrace();\n}\n}"],
+                      ["return;", "on exception"]),
+    # jvm-117 / jvm-118: `T x; if (c) x = a; else x = b; return x;` HLIL joined after the resource's close is one
+    # return; the resource is named from the LocalVariableTable, not after the returned value
+    "twrTernary": (["try (Scanner scanner = new Scanner(f)) {\nreturn scanner != null ? new Scanner(System.in) : scanner;"],
+                   ["result", "if (scanner"]),
     # jvm-115: the try-with-resources is the loop body; the break path's close HLIL put behind the loop is implicit
     "twrLoopBreak": (["while (true) {\ntry (FileReader r = new FileReader(f)) {\nif (r.read() < 0) {\nbreak;\n}\nwork(1);\n}\n}"],
                      ["close", "catch", "Throwable"]),

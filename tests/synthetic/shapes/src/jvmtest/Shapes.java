@@ -234,4 +234,23 @@ public class Shapes {
             }
         }
     }
+
+    // jvm-119: a try / catch ending a void method: no `return;` at the end of the try body, none after the catch
+    static void tryEndsMethod(int i) {
+        try {
+            work(i);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    // jvm-117 / jvm-118: one conditional return in a try-with-resources; the resource keeps its own name
+    static java.util.Scanner twrTernary(java.io.File f) {
+        try (java.util.Scanner scanner = new java.util.Scanner(f)) {
+            return scanner != null ? new java.util.Scanner(System.in) : scanner;
+        } catch (java.io.IOException e) {
+            work(-1);
+            return null;
+        }
+    }
 }

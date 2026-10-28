@@ -623,6 +623,7 @@ def java_var_name(name):
 # names BN gives the lifter's stack registers and unnamed locals; anything else (LocalVariableTable names, user
 # renames, BN's own `i` / `result`) is printed as it is
 AUTO_VAR_NAME = re.compile(r"^(st\d+(_lo)?|r|r64|rh|l\d+(_lo)?)(_\d+)?$")
+BN_RESULT_NAME = re.compile(r"^result(_\d+)?$")  # BN's name for a returned value: an LVT name wins (jvm-118)
 JAVA_KEYWORDS = {
     "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class", "const", "continue",
     "default", "do", "double", "else", "enum", "extends", "final", "finally", "float", "for", "goto", "if",
@@ -2555,14 +2556,16 @@ if _HAVE_BN:
                              % (clauses, lo, hi))
             return notes
 
-        def emit_list(self, body, tokens, settings, block, is_root=False, own=False, own_hpc=None):
+        def emit_list(self, body, tokens, settings, block, is_root=False, own=False, own_hpc=None, ends_method=False):
             """emit a flattened statement list (see flatten); own: the statements are a handler body that is
             printed here (they are marked consumed, so their original place skips them); own_hpc: that
-            handler's pc -- its body may hold javac's copy of *another* handler's finally, never of its own"""
+            handler's pc -- its body may hold javac's copy of *another* handler's finally, never of its own;
+            ends_method: the list is not the root, but the method ends with it (its final `return;` drops)"""
             if not body:
                 return
             plan = self.plan_block(body)
             plan["root"] = is_root
+            plan["ends_method"] = ends_method or is_root
             plan["own"] = {s.expr_index for s in body} if own else ()
             plan["own_hpc"] = own_hpc
             plan["follow"] = self._follow[-1] if self._follow else None
@@ -2682,6 +2685,12 @@ if _HAVE_BN:
                 for k in range(lo, hi + 1):
                     try:
                         if self.plan_return_value(body, k, hi, run_at, sync_at, plan):
+                            break
+                    except Exception:
+                        pass
+                for k in range(lo, hi + 1):
+                    try:
+                        if self.plan_split_return(body, k, hi, run_at, sync_at, plan):
                             break
                     except Exception:
                         pass
@@ -3042,12 +3051,13 @@ if _HAVE_BN:
             tokens.begin_scope(ScopeType.BlockScopeType)
             self.goto_continue[lid] = (name, nested)
             self.consumed.add(body[q].expr_index)  # the jump back: the loop's end
-            saved = (plan.get("root"), plan.get("list_kind"))
-            plan["root"], plan["list_kind"] = False, 'loop'  # (a final return is not the method's end here)
+            saved = (plan.get("root"), plan.get("list_kind"), plan.get("ends_method"))
+            # (a final return is not the method's end here)
+            plan["root"], plan["list_kind"], plan["ends_method"] = False, 'loop', False
             try:
                 self.emit_range(body, p + 1, q - 1, plan, tokens, settings, block)
             finally:
-                plan["root"], plan["list_kind"] = saved
+                plan["root"], plan["list_kind"], plan["ends_method"] = saved
                 tokens.end_scope(ScopeType.BlockScopeType)
             tokens.finalize_scope()
             tokens.new_line()
@@ -3938,7 +3948,7 @@ if _HAVE_BN:
                 return None
             return _CgIf(cond), items[end + 1:]
 
-        def emit_loop_cond(self, w, shape, tokens, settings):
+        def emit_loop_cond(self, w, shape, tokens, settings, ends_method=False):
             defs, iff, tail, rest, moved = shape
             for d in defs:
                 self.consumed.add(d.expr_index)
@@ -3984,9 +3994,10 @@ if _HAVE_BN:
                 self.note(tokens, "// code after the loop, reached by its break:")
                 tokens.new_line()
                 self.emit_list(items, tokens, settings, blk)
-            if [x for x in tail if not self.prints_nothing(x)]:
+            if [x for x in tail if not self.prints_nothing(x) and not (ends_method and x.operation == Op.HLIL_RET and
+                                                                        len(x.src) == 0)]:
                 tokens.scope_separator()
-                self.emit_list(tail, tokens, settings, iff.true)
+                self.emit_list(tail, tokens, settings, iff.true, ends_method=ends_method)
 
         # --- conditional expressions (jvm-59) ----------------------------------------------------------
         def plan_ternary(self, body, k, hi, run_at, plan):
@@ -4013,28 +4024,11 @@ if _HAVE_BN:
                 return
             values, assigns, news = [], set(), {}
             for branch in (iff.true, iff.false):
-                items = [y for y in self.flatten(self.stmts_of(branch)) if not self.hidden_item(y)]
-                if len(items) > 1 and not any(isinstance(y, _ExcBranch) for y in items):
-                    # a concatenation's appends, or `T t = new C(..); x = t.m(..)` with t used once
-                    bplan = self.plan_block(items)
-                    rest = [i for i in range(len(items)) if i not in bplan["skip"]]
-                    if len(rest) == 2 and rest[0] in bplan["new_at"]:
-                        entry = bplan["new_at"][rest[0]]
-                        t = entry[1]
-                        if entry[0].operation != Op.HLIL_VAR_INIT or self.var_count(t) != 2 or \
-                                self.def_count(t) != 1 or self.refs(items[rest[1]], t) != 1:
-                            return
-                        news[t] = ('new', entry)
-                        rest = rest[1:]
-                    items = [items[i] for i in rest]
-                if len(items) != 1 or isinstance(items[0], _ExcBranch) or items[0].operation != Op.HLIL_ASSIGN or \
-                        items[0].dest.operation != Op.HLIL_VAR or items[0].dest.var != x:
+                got = self.branch_value(self.flatten(self.stmts_of(branch)), x, news)
+                if got is None:
                     return
-                v = items[0].src
-                if self.mentions_exc(v) or self.refs(v, x) or not self.ternary_value(v):
-                    return
-                values.append(v)
-                assigns.add(items[0].expr_index)
+                values.append(got[0])
+                assigns.add(got[1])
             if {d.expr_index for d in self.hlil.get_var_definitions(x)} != assigns:
                 return
             c = iff.condition
@@ -4045,6 +4039,39 @@ if _HAVE_BN:
             ternary[j] = (x, ('ternary', x, iff, values[0], values[1], bool(flip)))
             self.hidden_vars.add(x)
             self.inline.update(news)
+
+        def branch_value(self, items, x, news, new_ok=False):
+            """(value, index of its assignment) when the statement list items only sets x (plan_ternary); a
+            `new` whose object x takes goes into news. new_ok: `x = new C(..)` itself gives ('new', entry)"""
+            items = [y for y in items if not self.hidden_item(y)]
+            if new_ok:
+                items = [y for y in items if isinstance(y, _ExcBranch) or y.operation != Op.HLIL_ASSIGN or
+                         y.dest.operation != Op.HLIL_VAR or not self.is_exc_var(y.dest.var)]
+                if len(items) == 2 and not any(isinstance(y, _ExcBranch) for y in items):
+                    entry = self.plan_block(items)["new_at"].get(1)
+                    if entry is not None and entry[1] == x and entry[0].operation == Op.HLIL_ASSIGN and \
+                            all(self.pure(a) for a in entry[3][5]):
+                        return ('new', entry), entry[0].expr_index
+            if len(items) > 1 and not any(isinstance(y, _ExcBranch) for y in items):
+                # a concatenation's appends, or `T t = new C(..); x = t.m(..)` with t used once
+                bplan = self.plan_block(items)
+                rest = [i for i in range(len(items)) if i not in bplan["skip"]]
+                if len(rest) == 2 and rest[0] in bplan["new_at"]:
+                    entry = bplan["new_at"][rest[0]]
+                    t = entry[1]
+                    if entry[0].operation != Op.HLIL_VAR_INIT or self.var_count(t) != 2 or \
+                            self.def_count(t) != 1 or self.refs(items[rest[1]], t) != 1:
+                        return None
+                    news[t] = ('new', entry)
+                    rest = rest[1:]
+                items = [items[i] for i in rest]
+            if len(items) != 1 or isinstance(items[0], _ExcBranch) or items[0].operation != Op.HLIL_ASSIGN or \
+                    items[0].dest.operation != Op.HLIL_VAR or items[0].dest.var != x:
+                return None
+            v = items[0].src
+            if self.mentions_exc(v) or self.refs(v, x) or not self.ternary_value(v):
+                return None
+            return v, items[0].expr_index
 
         # --- one return for if/return chains (jvm-67) --------------------------------------------------
         def plan_return_value(self, body, k, hi, run_at, sync_at, plan):
@@ -4060,6 +4087,47 @@ if _HAVE_BN:
                 return False
             plan.setdefault("ret_value", {})[k] = value
             plan.setdefault("done", set()).update(range(k + 1, hi + 1))
+            return True
+
+        def plan_split_return(self, body, k, hi, run_at, sync_at, plan):
+            """`T x; if (c) { x = a; L: <hidden>; return x; } else { x = b; goto L; }` (a split if/goto shape:
+            the returned value set in both branches, the return after a join) -> `return c ? a : b;`
+            (TestTryWithResourcesReturn.test6, jvm-117)"""
+            s = body[k]
+            if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_VAR_DECLARE or self.returns_void or \
+                    s.var in self.hidden_vars or self.is_exc_var(s.var) or s.var in self.lock_only_vars():
+                return False
+            x = s.var
+            j = k + 1
+            while j <= hi and self.fold_transparent(body, j, plan):
+                j += 1
+            iff = body[j] if j <= hi else None
+            if iff is None or isinstance(iff, _ExcBranch) or iff.operation != Op.HLIL_IF or not iff.as_ast or \
+                    j in plan.get("ternary", {}) or j in plan.get("ret_value", {}) or j in plan.get("cgraph", {}) or \
+                    any(k <= q <= hi for q in list(run_at) + list(sync_at)) or \
+                    iff.expr_index in self.consumed or self.mentions_exc(iff.condition) or \
+                    [b for b in body[j + 1:hi + 1] if not self.hidden_item(b)]:
+                return False
+            shape = self.if_goto_shape(body, j, plan)
+            if shape is None or shape[0] != 'split':
+                return False
+            _, t_part, f_part, tail = shape
+            news = {}
+            a, b = self.branch_value(t_part, x, news, True), self.branch_value(f_part, x, news, True)
+            if a is None or b is None or \
+                    {d.expr_index for d in self.hlil.get_var_definitions(x)} != {a[1], b[1]}:
+                return False
+            # (the resource's close before the return prints nothing: the try-with-resources header closes it)
+            real = [t for q, t in enumerate(tail) if not self.hidden_item(t) and
+                    not (self.twr_open and self.twr_hidden_close(tail, q))]
+            inits = sum(isinstance(v[0], tuple) for v in (a, b))  # `C.<init>(x, ..)` reads x too
+            if len(real) != 1 or isinstance(real[0], _ExcBranch) or real[0].operation != Op.HLIL_RET or \
+                    len(real[0].src) != 1 or real[0].src[0].operation != Op.HLIL_VAR or real[0].src[0].var != x or \
+                    len(self.hlil.get_var_uses(x)) != 1 + inits:
+                return False
+            plan.setdefault("ret_value", {})[j] = ('cond', iff.condition, a[0], b[0])
+            self.hidden_vars.add(x)
+            self.inline.update(news)
             return True
 
         def return_value(self, items):
@@ -4095,7 +4163,7 @@ if _HAVE_BN:
 
         def ternary_depth(self, v):
             """conditional expressions nested on the deepest path when v is printed (booleans fold away)"""
-            if not isinstance(v, tuple):
+            if not isinstance(v, tuple) or v[0] != 'cond':
                 return 0
             _, c, a, b = v
             inner = max(self.ternary_depth(a), self.ternary_depth(b))
@@ -4106,6 +4174,9 @@ if _HAVE_BN:
         def emit_return_value(self, v, tokens, settings, precedence):
             if not isinstance(v, tuple):
                 self.emit_typed(v, self.return_code, tokens, settings, precedence)
+                return
+            if v[0] == 'new':
+                self.emit_inlined(v, tokens, settings, precedence)
                 return
             _, c, a, b = v
             ba, bb = self.bool_const(a), self.bool_const(b)
@@ -4479,6 +4550,8 @@ if _HAVE_BN:
                     self.deferred.update(x.expr_index for x in self.handler_region(h) or [])
                     return need_separator
             if isinstance(s, _ExcBranch):
+                if self.exc_rest_returns(s, plan) and self.rest_hidden(body, idx, plan):
+                    return need_separator  # the catch clauses printed it; then the method ends (jvm-119)
                 return self.emit_exc_branch(s, tokens, settings, need_separator)
             if s.operation == Op.HLIL_CONTINUE and plan.get("list_kind") == 'loop' and \
                     all(k in plan["skip"] or k in plan.get("done", ()) or self.hidden_item(body[k])
@@ -4555,9 +4628,9 @@ if _HAVE_BN:
                     need_separator = False
                     break
             if (block.as_ast and s.operation == Op.HLIL_RET and
-                    (plan.get("root") or (self._tail_ret_hide and self._tail_ret_hide[-1])) and
+                    (plan.get("ends_method") or (self._tail_ret_hide and self._tail_ret_hide[-1])) and
                     (len(s.src) == 0 or (self.returns_void and not self.void_return_call(s))) and
-                    self.rest_hidden(body, idx, plan)):
+                    self.rest_hidden(body, idx, plan, past_handlers=bool(plan.get("ends_method")))):
                 return need_separator
             if self.is_implicit_super(s) or s.operation == Op.HLIL_NORET:
                 return need_separator
@@ -4680,7 +4753,9 @@ if _HAVE_BN:
                         plan["done"].update(shape[4][0])  # moved to the loop's break (search loop)
                     if need_separator is not None:
                         tokens.scope_separator()
-                    self.emit_loop_cond(s, shape, tokens, settings)
+                    # the code after the loop ends the method when nothing but the try's handlers follows (jvm-119)
+                    ends = bool(plan.get("ends_method")) and self.rest_hidden(body, idx, plan, past_handlers=True)
+                    self.emit_loop_cond(s, shape, tokens, settings, ends_method=ends)
                     return True
             if self.goto_end_if(s):
                 # `if (x) goto L; R` inside the Y part of a join: `if (!x) { R }` (jvm-90)
@@ -4825,17 +4900,25 @@ if _HAVE_BN:
 
         def implicit_return(self, x, plan):
             """x is the root list's `return;` the method's end implies (emit_statement drops it there)"""
-            return bool(plan.get("root")) and not isinstance(x, _ExcBranch) and x.operation == Op.HLIL_RET and \
+            return bool(plan.get("ends_method")) and not isinstance(x, _ExcBranch) and x.operation == Op.HLIL_RET and \
                 (len(x.src) == 0 or self.returns_void and not self.void_return_call(x))
 
-        def rest_hidden(self, body, idx, plan):
-            """nothing after body[idx] is printed (handler code moved to a catch, plumbing, ...)"""
+        def rest_hidden(self, body, idx, plan, past_handlers=False):
+            """nothing after body[idx] is printed (handler code moved to a catch, plumbing, ...). past_handlers:
+            the code of the open tries' handlers (their catch clauses) and the method's final `return;` count as
+            hidden too -- nothing runs after the try statement (a `return;` ending its body is javac's jump past the
+            handlers; jvm-119)"""
+            covered = self.open_handler_code() if past_handlers else ()
             for k in range(idx + 1, len(body)):
                 s = body[k]
                 if k in plan["skip"] or (s.expr_index in self.consumed and s.expr_index not in plan.get("own", ())):
                     continue
+                if past_handlers and ((s.instr if isinstance(s, _ExcBranch) else s).expr_index in covered or
+                                      not isinstance(s, _ExcBranch) and (s.operation == Op.HLIL_LABEL or
+                                                                         self.implicit_return(s, plan))):
+                    continue
                 if isinstance(s, _ExcBranch):
-                    if s.branch.expr_index in self.consumed:
+                    if s.branch.expr_index in self.consumed or self.exc_rest_returns(s, plan):
                         continue
                     cls = self.branch_class(s.branch, s.address - self.function.start)
                     if cls[0] in ('hide', 'rethrow') or (cls[0] == 'handler' and cls[1] in self.placed_handlers):
@@ -4843,6 +4926,32 @@ if _HAVE_BN:
                     return False
                 if self.is_exc_plumbing(s) or self.in_monitor_code(s) or \
                         s.operation in (Op.HLIL_NOP, Op.HLIL_NORET, Op.HLIL_UNREACHABLE):
+                    continue
+                return False
+            return True
+
+        def open_handler_code(self):
+            """expr_index of every statement in the handler code of the open tries"""
+            covered = set()
+            for g in self.active_tries:
+                for h, _ in g[2]:
+                    for r in self.handler_region(h) or []:
+                        covered.update(i.expr_index for i in _walk(r))
+            return covered
+
+        def exc_rest_returns(self, item, plan):
+            """item is the exceptional rest of `if (exc == 0) { ..; return; } rest` (flatten) in the root list of a
+            void method, and rest is only the code of the open (or printed) try's handlers, which its catch
+            clauses print, and the method's final `return;`: javac's jump past the handlers to the method's end
+            (`try { A } catch (E e) { B }` ending the method; TestCatchVariable.test1, jvm-119)"""
+            if not plan.get("ends_method") or not self.returns_void or item.kind != 'exc' or \
+                    not isinstance(item.branch, _StmtList):
+                return False
+            covered = self.open_handler_code()
+            for x in self.flatten(item.branch.body):
+                xi = x.instr if isinstance(x, _ExcBranch) else x
+                if xi.expr_index in covered or xi.expr_index in self.consumed or \
+                        (not isinstance(x, _ExcBranch) and (self.hidden_item(x) or self.implicit_return(x, plan))):
                     continue
                 return False
             return True
@@ -4857,7 +4966,7 @@ if _HAVE_BN:
                 if k in plan["skip"] or (s.expr_index in self.consumed and s.expr_index not in plan.get("own", ())):
                     continue
                 if isinstance(s, _ExcBranch):
-                    if s.branch.expr_index in self.consumed:
+                    if s.branch.expr_index in self.consumed or self.exc_rest_returns(s, plan):
                         continue
                     cls = self.branch_class(s.branch, s.address - self.function.start)
                     if cls[0] in ('hide', 'rethrow') or (cls[0] == 'handler' and cls[1] in self.placed_handlers):
@@ -7479,7 +7588,7 @@ if _HAVE_BN:
                 return self._names
             names = {}
             try:
-                seen, auto, taken = set(), [], {"this"}
+                seen, auto, results, taken = set(), [], [], {"this"}
                 for i in _walk(self.hlil.root):
                     o = i.operation
                     v = i.dest if o == Op.HLIL_VAR_INIT else i.var if o in (Op.HLIL_VAR_DECLARE, Op.HLIL_VAR,
@@ -7493,8 +7602,18 @@ if _HAVE_BN:
                         auto.append(v)
                     else:
                         taken.add(java_var_name(v.name))
+                        if BN_RESULT_NAME.match(v.name) and not self.function.is_var_user_defined(v):
+                            results.append(v)
                 for v in self.function.parameter_vars:
                     taken.add(java_var_name(v.name))
+                for v in results:
+                    # BN names a returned value `result`; the local javac stored it into has a better name: the
+                    # try-with-resources resource `scanner` of `return scanner` (jvm-118)
+                    defs = self.var_defs(v)
+                    stored = self.stored_local_name(defs + self.init_calls(v, defs))
+                    if stored and stored not in taken:
+                        names[v] = stored
+                        taken.add(stored)
                 for v in auto:
                     hint = self.name_hint(v)
                     if hint:
@@ -7504,13 +7623,16 @@ if _HAVE_BN:
             self._names = names
             return names
 
+        def var_defs(self, var):
+            try:
+                return [d for d in self.hlil.get_var_definitions(var) if d.operation in (Op.HLIL_VAR_INIT, Op.HLIL_ASSIGN)]
+            except Exception:
+                return []
+
         def name_hint(self, var):
             if var in self.exc_copies():
                 return "e"
-            try:
-                defs = [d for d in self.hlil.get_var_definitions(var) if d.operation in (Op.HLIL_VAR_INIT, Op.HLIL_ASSIGN)]
-            except Exception:
-                defs = []
+            defs = self.var_defs(var)
             # a counter: set to a constant, then stepped (`i = 0` ... `i = i + 1`)
             if len(defs) >= 2 and any(d.src.operation == Op.HLIL_CONST for d in defs) and \
                     any(d.src.operation in (Op.HLIL_ADD, Op.HLIL_SUB) and self.refs(d.src, var) for d in defs):

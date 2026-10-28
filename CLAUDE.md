@@ -44,7 +44,11 @@ the outer one and back: `jarload.class_roots`; `tests/bn_jar_check.py`), jvm-115
 break path's close HLIL put behind the loop; `new` resources named from the LVT store after `<init>`; a loop body's trailing
 `continue` dropped), jvm-116 (try/catch/finally whose finally handler HLIL nests in the catch's code -- plain
 `finally { if (c) .. }` lost its body before; merged `type == 0 || exc != 0` tests, synchronized in catch / finally, ECJ's
-nested catch/finally ranges merged) -> suite 6175, mdg 2013, compare_all 251/251. Open: jvm-92 rest (AssertionError thrown in a try range), jvm-99 (unreachable finally, test4/5, and
+nested catch/finally ranges merged) -> suite 6175, mdg 2013, compare_all 251/251. 2026-10-28 (later): jvm-118 (BN's
+`result` gives way to the LVT name of the slot javac stores the value into: TWR resources print as `scanner`), jvm-117
+(`T x; if (c) x = a; else x = b;` HLIL joined behind the resource close + `return x` -> `return c ? a : b;`), jvm-119
+(javac's jump past the handlers to a void method's end: no `return;` ending a try body or after a loop that ends the
+method, no `/* on exception */ { return; }` after the catch; `ends_method` plan flag) -> suite 6160, mdg 2010. Open: jvm-92 rest (AssertionError thrown in a try range), jvm-99 (unreachable finally, test4/5, and
 loopInFinally from jvm-90: all paths end in an endless loop), jvm-83 rest left on purpose (testFinallyNested; Vineflower fails too). Under load BN can still hit its analysis time limit (`analysis skipped` in a
 dump: redump with RESUME=1). jvm-15 waits for Patrick's GUI
 click-through (BN restarted 2026-10-14 with the symlinked plugin, so jarload.py is loaded).
@@ -129,7 +133,7 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
    **Pseudo Java gates** (after any `pseudo_java.py` change; wiki `vineflower-comparison.md`):
    `python3 tests/vineflower_compare.py --decompile` (once: Vineflower, the decompiler Recaf uses, local fork),
  `tests/bn_dump_all.sh pj` (4 parallel engine processes, ~1 min; jvm-74), then
- `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=1 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0 skipped=0 ref_zero=0 double_casts=0 type_mismatch=0 if_else_assign=0 stmts=2013`
+ `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=1 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0 skipped=0 ref_zero=0 double_casts=0 type_mismatch=0 if_else_assign=0 stmts=2010`
  (exit 1 on a regression; `stmts` is the statement count, lower it as tickets land; `--excess N` lists where the
  extra statements against Vineflower come from); and `tests/bn_pseudo_java_compare_all.sh` (~4 min):
  every mdg method with an exception table against HLIL -- must stay 251/251; the script exits non-zero unless every batch
