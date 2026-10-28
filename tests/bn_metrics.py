@@ -12,7 +12,7 @@ DUMP = globals().get("DUMP", [])
 SHOW = globals().get("SHOW", 0)  # print up to SHOW accessor lines per class
 FIELDREF = re.compile(r"&[\w/$<>]+\.[\w$<>]+")  # &pkg/Class.field (a field may be called d or q)
 ACCESSOR = re.compile(r"[\w\]\)](:\d+)?(?<!sx)(?<!zx)\.[dq]\b(?!\()")  # var.d / var:4.q, not sx.q(...) or a method X.d(...)
-vt = b.BinaryViewType[globals().get("VIEW", b._jvm_dev["ns"]["VIEW_NAME"])]  # VIEW = "JVM Class devN": pin your own dev load (other sessions load too)
+vt = b.BinaryViewType[globals().get("VIEW", b._jvm_dev["ns"]["VIEW_NAME"] if hasattr(b, "_jvm_dev") else "JVM Class")]  # VIEW: another view type
 paths = sorted(os.path.join(d, f) for d, _, fs in os.walk(CLASS_DIR) for f in fs if f.endswith(".class"))
 paths = paths[START:START + LIMIT]
 if globals().get("FILES"):  # FILES = ["com/x/Y.class", ...] relative to CLASS_DIR instead of a slice

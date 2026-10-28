@@ -6,7 +6,7 @@ import os, sys
 import binaryninja as b
 
 REPO = globals().get("JVM_REPO", "/Users/patrick/dev/binary-jvm")
-PKG = globals().get("DEV_PKG") or (b._jvm_dev["pkg"].__name__ if hasattr(b, "_jvm_dev") else None)
+PKG = globals().get("DEV_PKG") or (b._jvm_dev["pkg"].__name__ if hasattr(b, "_jvm_dev") else "binary-jvm")
 if not PKG:
     raise SystemExit("FAIL bn_dev_load.py has not registered a dev view")
 path = os.path.join(REPO, "tests/synthetic/classes/jvmtest/RareOps.class")

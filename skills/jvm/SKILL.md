@@ -13,7 +13,7 @@ since 2026-10-12; `/opt/anaconda3/bin/minitick|miniwiki` work as configured). Th
 git-ignored `sample/`, `.scratch/` and `~/dev/vineflower` must be rsynced from MusicMac (ssh MusicMac -> MacBook
 only). Push `main` to both remotes: `git push origin main && git push github main`.
 
-Generic Binary Ninja mechanics (`bnrun` bridge, bundled scripts, usage lock) are in the global
+Generic Binary Ninja mechanics (bnengine: BN in the script's own process, the `bn` launcher) are in the global
 `binaryninja-bridge` skill — load it for any BN work. This skill is the project layer on top.
 
 ## Where things live
@@ -49,39 +49,29 @@ Universal view active — switch to "JVM Class" (GUI: view dropdown; bridge: `--
 1. `python3 tests/offline_lift_check.py` (~1–2 s, mdg.jar plus the rare-opcode class; `--all` = every
    sample jar). Must report 0 decode/lift/unimplemented/stack/tiling failures. Run it after every lifter
    change. `python3 tests/synthetic_opcode_check.py` requires nop, swap, goto_w, jsr_w and each wide form.
-2. Live, no restart: `bnrun tests/bn_dev_load.py` (serialized lane: registers `JVM-devN` /
-   `JVM Class devN` globally; BN can't unregister types), then `bnrun --parallel
-   tests/bn_batch_check.py` (20 classes), `--parallel tests/bn_golden.py` or a one-class dump. These
-   only use their own views: **no usage lock** (it would only block other sessions). The lock is
-   needed only for UI tabs (`bv`/`bvs`/`--view`/`--main-thread`).
-   Gates (CLAUDE.md has the `--max` lines): `tests/bn_dump_all.sh pj|cv [jvm_devN]` (dumps in 4 parallel
-   batches, a few minutes), then `vineflower_compare.py` / `class_view_compare.py`; and
-   `tests/bn_pseudo_java_compare_all.sh` (~15 min, background). Java 8 constructs: `tests/vineflower_suite.py prep`, `bn_dump_all.sh suite`,
-   `vineflower_suite.py compare` (Vineflower's own tests, jvm-77). The dump scripts take `JOBS=N` (default 4 = bridge
-   `scriptbridge.maxParallel`; more batches are slower, GIL-bound). Warn sessions sharing the BN instance
-   (binary-cpp) before a gate round — a heavy job alongside made compare_all time out; with the instance shared by
-   heavy jobs pass `TIMEOUT=7200` (per batch, dump scripts and compare_all; default 1800 / 2400). A run that was cut
-   off continues with `RESUME=1` (jvm-106); heed the compare scripts' stamp `WARNING`s (stale / mixed outputs, jvm-105)
-   and use `--save-ref NAME` / `--ref NAME` for a ticket's before / after numbers (jvm-107). Two suite runs are
-   identical since jvm-97 (LVT names applied before rendering via `view.analyze_now`, lambda HLIL built on demand). Run all of them before resolving a ticket
-   that touches `view.py`, `classfile.py`, `classui.py` or `pseudo_java.py`, not only the ones for the file you changed.
-3. Real install (**installed**): symlink the
-   repo as `plugins/binary-jvm` and set the Universal exclusion; after changing
-   the plugin, restart BN with `/Users/patrick/dev/bn-script-bridge/bnrestart` (saves modified
-   views, reopens files, waits for the bridge) — with the user's OK; see the binaryninja-bridge skill.
-   A restart (also one for binary-cpp's plugin, which shares the BN instance) drops every dev load and bridge view:
-   redo `bn_dev_load.py` before the next gate round. Smoke test of the installed plugin: `tests/bn_pseudo_java_dump.py`
-   without `DEV_PKG` (prints `package binary-jvm`) on one or two `CLASSES`, `OUT_DIR` in a scratch dir.
+2. In BN (bnengine, jvm-113): `B=/Users/patrick/dev/bn-script-bridge; $B/bn --timeout 300 tests/bn_exec.py SCRIPT
+   [NAME=VALUE ...]` runs a check script (NAME=VALUE = its globals). The engine loads the installed plugin (the repo
+   symlink) at every start, so each run sees the working tree: no dev load, no restart, no lock, no lanes; parallel
+   = several processes. Don't edit plugin files during a gate round (later processes would load the edit).
+   Gates (CLAUDE.md has the `--max` lines): `tests/bn_dump_all.sh pj|cv|suite` (~1 / 1 / 2 min), then
+   `vineflower_compare.py` / `class_view_compare.py` / `vineflower_suite.py compare`; `tests/bn_pseudo_java_compare_all.sh`
+   (~4 min, 251/251); `bn_exec.py tests/bn_anon_check.py` and `tests/bn_shapes_check.py`. `JOBS=N` engine processes
+   (default 4), `TIMEOUT=S` per batch. A run that was cut off continues with `RESUME=1` (jvm-106); heed the compare
+   scripts' stamp `WARNING`s (stale / mixed outputs, jvm-105) and use `--save-ref NAME` / `--ref NAME` for a ticket's
+   before / after numbers (jvm-107). Run all of them before resolving a ticket that touches `view.py`, `classfile.py`,
+   `classui.py` or `pseudo_java.py`, not only the ones for the file you changed.
+3. Real install (**installed**): symlink the repo as `plugins/binary-jvm` and set the Universal exclusion (for the
+   GUI). The engine needs nothing more; the GUI app needs a restart to see plugin changes.
 
 ## Gotchas (learned the hard way)
-- **bnrun lanes:** serialized by default (one at a time), `--parallel` for own-view scripts (up to 4
-  at once). Always use `bnrun --timeout N …`; stop a runaway script with
-  `bnrun --cancel` (Ctrl-C on the client also cancels), check with `bnrun --status`. A long native
-  call (`update_analysis_and_wait()`) can't be cut short, so keep live batches to a few classes and
-  put long runs in background subagents.
+- **Engine traps (jvm-113):** before bn-script-bridge d47734e, `update_analysis_and_wait()` on the script's main thread
+  logged "UI threads are not permitted to wait for analysis completion" and returned on a half-analysed view
+  (`int32_t()` method types, `p1` parameters, other folds) -- a dump that looks like that is from a broken engine.
+  `is_main_thread()` is True on every thread in the engine: the plugin's guard is `_on_ui_thread()`. A long native
+  call can't be interrupted: `bn --timeout N` kills the process (exit 124).
 - `bn.load()` picks Raw (or pops a dialog in the GUI) for a view type
   registered after startup — use `BinaryViewType[name].create(BinaryView.open(path))`.
-- Views created through the bridge are in-process, **not UI tabs**; open in the GUI for visual checks.
+- Engine views are not GUI tabs; open the class in the app for visual checks.
 - BN does not track a `pop` inside an `if` condition → always pop into an LLIL temp first.
 - Pool pseudo-addresses are `0xF0000000 + idx*8`; static fields need a typed data var there or HLIL
   shows `.d` accessors.

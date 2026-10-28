@@ -38,12 +38,11 @@ break;`), jvm-92 part (assert at a loop body's start, concatenated message) -> s
 mdg 2014, compare_all 251/251. 2026-10-27/28: jvm-68 (`shared/` split, output identical; binary-cpp took our folding.py /
 regions.py back in its 2499ebd, bncpp-88 adds a `fold_skip` hook next), jvm-112 (finally copy in a trailing if of the root
 list), jvm-111 (no else after a terminal branch; left inside try/finally and synchronized), `tests/bn_shapes_check.py`
--> suite 6212, mdg 2013, compare_all 251/251. The script bridge once stopped with BN alive (jobs had finished; restart it
-with Plugins > Script Bridge > Start, no bnrestart). Open: jvm-92 rest (AssertionError thrown in a try range), jvm-99 (unreachable finally, test4/5, and
-loopInFinally from jvm-90: all paths end in an endless loop), jvm-83 rest left on purpose (testFinallyNested; Vineflower fails too). On the Intel MacBook a full gate round takes ~1.5 h and
-overlapping bnrun jobs slow each other ~10x (classes then hit BN's analysis time limit: `analysis skipped` in a dump is load,
-redump the class alone) -- run the gates one at a time. jvm-15 waits for Patrick's GUI
-click-through (BN restarted 2026-10-14 with the symlinked plugin, so jarload.py is loaded). Use a dev load for live tests.
+-> suite 6212, mdg 2013, compare_all 251/251. 2026-10-28: bnrun / the shared app replaced by bnengine (jvm-113: `tests/bn_exec.py`, gates
+~10 min in all instead of ~1 h). Open: jvm-92 rest (AssertionError thrown in a try range), jvm-99 (unreachable finally, test4/5, and
+loopInFinally from jvm-90: all paths end in an endless loop), jvm-83 rest left on purpose (testFinallyNested; Vineflower fails too). Under load BN can still hit its analysis time limit (`analysis skipped` in a
+dump: redump with RESUME=1). jvm-15 waits for Patrick's GUI
+click-through (BN restarted 2026-10-14 with the symlinked plugin, so jarload.py is loaded).
 
 **Project tracking:** tickets live in minitick project **`jvm`** (`jvm-N`) — use the **minitick MCP
 tools** (`ticket` / `tickets` / `update` / `create`, registered user-scope; `update("jvm-N", {fields}, comment=…)` resolves with its verification comment in one
@@ -78,10 +77,9 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
 
 - **Binary Ninja 6.1** — version string `6.1.10815-dev_personal`, **Personal license**, macOS
   (Apple Silicon, `darwin`).
-- ⚠️ **Personal license = no headless API.** You cannot `import binaryninja` from a plain
-  Python interpreter (that needs a Commercial/Enterprise license). All testing happens in the
-  **running GUI**, driven via MCP / the script bridge. Do not try to write a standalone
-  `import binaryninja` test harness — it will fail to license.
+- Binary Ninja runs **in-process** through bn-script-bridge's `bnengine` (since 2026-10-28): scripts run with
+  `/Users/patrick/dev/bn-script-bridge/bn script.py` (the app's bundled python; a plain `python3` cannot
+  `import binaryninja` under the Personal license). No GUI, bridge or shared app is involved.
 - BN app bundle: `/Applications/Binary Ninja.app`
 - **Installed API source** (authoritative for this exact version — grep it instead of
   guessing): `/Applications/Binary Ninja.app/Contents/Resources/python/binaryninja/`
@@ -90,17 +88,20 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
 
 ## Binary Ninja + the skill
 
-- BN work goes through the **`bnrun` script bridge** (the `binaryninja-bridge` skill —
-  install a `.claude/skills/binaryninja-bridge/` symlink into `~/dev/bn-script-bridge/skills/`
-  per project; there are no `bn_*` MCP tools any more). It covers the full Python API
-  inside the running app, the shared usage lock across sessions, and the
-  Personal-license workarounds.
-- Typical loop: load a `.class` in the GUI, pick the view (`--view <name>`), then inspect
-  with one-liners (`bv.functions`, `fn.hlil`, `bv.strings`, `bv.get_symbols()`) — the
-  skill's Common recipes cover all of it.
-- ⚠️ A view type registered after startup (dev loads) is **not** picked by `bn.load()`
-  (Raw / a GUI dialog instead) — create it explicitly with
-  `BinaryViewType[name].create(BinaryView.open(path))`. Such views are not UI tabs.
+- BN work goes through the **`binaryninja-bridge` skill** (bnengine; `.claude/skills/binaryninja-bridge/` symlink into
+  `~/dev/bn-script-bridge/skills/`): every script is its own process with its own Binary Ninja, so parallel runs are
+  just several processes, and there is no usage lock / lane / job queue any more. `bn --timeout N` kills a run.
+- The engine loads the **installed plugin** (the repo symlinked into BN's plugin directory) as package `binary-jvm`
+  at start: every run sees the working tree, so there is no dev load. Don't edit plugin files while a gate round
+  runs -- each new process loads them.
+- Our check scripts run through `tests/bn_exec.py` (starts the engine, NAME=VALUE pairs become the script's globals,
+  like bnrun's prepended lines): `bn --timeout 300 tests/bn_exec.py tests/bn_shapes_check.py SHOW=True`.
+- Create views explicitly: `BinaryViewType["JVM Class"].create(BinaryView.open(path))`, then
+  `view.analyze_now(v)`.
+- Engine traps (jvm-113): `update_analysis_and_wait()` works on every thread only since bn-script-bridge d47734e
+  (before, on the main thread it logged "UI threads are not permitted to wait" and returned on a half-analysed view:
+  `int32_t()` method types, `p1` parameter names); `binaryninja.mainthread.is_main_thread()` is True on *every*
+  thread in the engine -- the plugin's UI-thread guard is `_on_ui_thread()` (also Python's main thread).
 - **File > Load Whole JAR...** unpacks `foo.jar` to `foo/` beside it and asks which classes to open
   (jvm-13; filter + multi-select, inner classes hidden by default, jvm-76). `Main-Class` from the manifest
   is preselected. Nested `.jar` entries can be unpacked the same way (`lib/bar.jar` → `foo/lib/bar/`, jvm-15);
@@ -109,8 +110,8 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
 
 ## Testing workflow (fast → slow)
 
-0. **Lint** (no BN, ~1 s): `python3 tests/lint.py` -- pyflakes over the plugin and `tests/` (bnrun's `bv`/`bvs`/`env`
-   are builtins there); 0 findings. `vineflower_compare.py` / `class_view_compare.py` run it with `--max` and fail on a
+0. **Lint** (no BN, ~1 s): `python3 tests/lint.py` -- pyflakes over the plugin and `tests/` (`bv`/`bvs`/`env` are builtins
+   there, from the bnrun days); 0 findings. `vineflower_compare.py` / `class_view_compare.py` run it with `--max` and fail on a
    finding (jvm-108). A method BN skipped under load counts as `skipped` (gate 0), not as `lost_calls`; the dumps leave
    such a class unstamped, so `RESUME=1` redumps just those (jvm-103).
 1. **Offline check first** (no BN, ~1 s): `python3 tests/offline_lift_check.py` stubs `binaryninja`,
@@ -118,52 +119,40 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
    no `unimplemented`, and the per-instruction stack effect against an independent table.
    `--all` runs every jar under `sample/` in parallel (≈47k classes, 11.6M instructions).
    `python3 tests/synthetic_opcode_check.py` lifts the committed rare-opcode class (nop, swap, goto_w, jsr_w, wide).
-2. **Live in BN without restart**: `bnrun tests/bn_dev_load.py` copies the package to
-   `/tmp/jvm_devN/`, renames arch/view to `JVM-devN` / `JVM Class devN` and registers them
-   (BN cannot unregister types, so every reload needs fresh names; older dev views are disabled).
-   Then `bnrun --parallel tests/bn_batch_check.py` (20 classes from `lib/mdg/` by default, per-class
-   timing); `bnrun --parallel tests/bn_golden.py` dumps reference HLIL + readability metrics. Views created this way are in-process but **not UI tabs**.
+2. **In BN** (engine, see above): `bn --timeout 300 tests/bn_exec.py tests/bn_batch_check.py` (20 classes from
+   `lib/mdg/`), `tests/bn_golden.py` (reference HLIL + readability metrics) the same way.
    **Pseudo Java gates** (after any `pseudo_java.py` change; wiki `vineflower-comparison.md`):
    `python3 tests/vineflower_compare.py --decompile` (once: Vineflower, the decompiler Recaf uses, local fork),
- `tests/bn_dump_all.sh pj [jvm_devN]` (4 parallel batches, ~3 min; jvm-74), then
+ `tests/bn_dump_all.sh pj` (4 parallel engine processes, ~1 min; jvm-74), then
  `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=1 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0 skipped=0 ref_zero=0 double_casts=0 type_mismatch=0 if_else_assign=0 stmts=2013`
  (exit 1 on a regression; `stmts` is the statement count, lower it as tickets land; `--excess N` lists where the
- extra statements against Vineflower come from); and `tests/bn_pseudo_java_compare_all.sh [jvm_devN]` (~18-25 min):
- every mdg method with an exception table against HLIL -- must stay 251/251 (~15 min on an idle machine); the
- script exits non-zero unless every batch is ok == with_table (jvm-95). Both
- scripts fill the 4 parallel bnrun slots, so run them one after the other (compare_all in the background).
+ extra statements against Vineflower come from); and `tests/bn_pseudo_java_compare_all.sh` (~4 min):
+ every mdg method with an exception table against HLIL -- must stay 251/251; the script exits non-zero unless every batch
+ is ok == with_table (jvm-95). `JOBS=N` sets the number of engine processes (default 4).
  **Vineflower's test corpus** (Java 8 constructs mdg lacks; jvm-77): `python3 tests/vineflower_suite.py prep` (once),
- `tests/bn_dump_all.sh suite [jvm_devN]` (~12 min), `python3 tests/vineflower_suite.py compare` (gate at the current
+ `tests/bn_dump_all.sh suite` (~2 min), `python3 tests/vineflower_suite.py compare` (gate at the current
  totals; wiki `vineflower-comparison.md` has the per-family table).
- **Class view gate** (after a `classui.py` / class metadata change): `tests/bn_dump_all.sh cv [jvm_devN]`
- (~4 min), then `python3 tests/class_view_compare.py --max imports=2 headers=0 fields=0 override=0 head=0 throws=0 missing=0`
+ **Class view gate** (after a `classui.py` / class metadata change): `tests/bn_dump_all.sh cv`
+ (~1 min), then `python3 tests/class_view_compare.py --max imports=2 headers=0 fields=0 override=0 head=0 throws=0 missing=0`
  (declarations against Vineflower; the 2 imports are types Vineflower names for locals we fold away), and
- `bnrun --parallel --timeout 300 tests/bn_anon_check.py` (anonymous classes at their `new`, javac 8 + 21; jvm-69;
- exits non-zero on failure, as do the other bnrun check scripts -- jvm-94).
- **Statement shapes** (synthetic, seconds): `bnrun --parallel --timeout 300 tests/bn_shapes_check.py` (prepend
- `DEV_PKG = "jvm_devN"`) checks `tests/synthetic/shapes` (jvmtest.Shapes: finally copies in trailing ifs, no else after
+ `bn --timeout 300 tests/bn_exec.py tests/bn_anon_check.py` (anonymous classes at their `new`, javac 8 + 21; jvm-69;
+ exits non-zero on failure, as do the other check scripts -- jvm-94).
+ **Statement shapes** (synthetic, seconds): `bn --timeout 300 tests/bn_exec.py tests/bn_shapes_check.py` checks `tests/synthetic/shapes` (jvmtest.Shapes: finally copies in trailing ifs, no else after
  an exit, a lambda in a condition; jvm-111/112) against expected / forbidden snippets; add a method there with each shape fix.
  **Stamps / RESUME / REF** (`tests/gate_state.py`): every dump output carries a stamp (plugin / dump-script / class
  hashes, `<dump>/.stamps.json`; jvm-105); the compare scripts print `WARNING` lines for outputs that are unstamped,
- from several plugin states or not from the working tree (an old `jvm_devN`, edits since the dev load) -- rerun the
+ from several plugin states or not from the working tree (edits during or since the run) -- rerun the
  dump before resolving a ticket on such numbers; `--strict` makes that exit 1. `RESUME=1 tests/bn_dump_all.sh ...` /
  `RESUME=1 tests/bn_pseudo_java_compare_all.sh ...` continue a cut-off run (classes with the current stamp are skipped
  / replayed; jvm-106). Before / after numbers (jvm-107): `--save-ref before` on the compare scripts before a ticket,
  `--ref before` after it prints `REF` + `DELTA` under `TOTAL` (refs in `.scratch/vfcmp/refs/`, `.scratch/vfsuite/refs/`).
-3. bnrun has two lanes: serialized (default; UI work and global registration like `bn_dev_load.py`)
-   and `--parallel` (scripts on their own views, up to 4 at once, no lock). Always pass **`--timeout N`**; a running script can be stopped
-   with `bnrun --cancel` (or Ctrl-C on the client), `bnrun --status` shows what is running.
-   Cancellation lands between Python bytecodes — a long native call (`update_analysis_and_wait()`)
-   finishes first — so keep batches small. The usage lock is only needed for UI tabs
-   (`bv`/`bvs`/`--view`/`--main-thread` are refused without it).
-
 ### Installing for real
 ```bash
 ln -s /Users/patrick/dev/binary-jvm "$HOME/Library/Application Support/Binary Ninja/plugins/binary-jvm"
 ```
-Then restart Binary Ninja (architecture/view registration happens once at startup) — with the
-user's OK via `/Users/patrick/dev/bn-script-bridge/bnrestart` (saves modified views, reopens files,
-waits for the bridge). **Installed** (re-linked 2026-10-06 when the project resumed); a fresh install also needs `files.container.excludedTransforms = ["Universal"]` (jvm-39).
+The engine picks it up at the next run (registration happens at engine start); the GUI app needs a restart. **Installed**
+(re-linked 2026-10-06 when the project resumed); a fresh install also needs `files.container.excludedTransforms =
+["Universal"]` (jvm-39) for opening `.class` files in the GUI.
 
 ## Samples
 
@@ -195,7 +184,7 @@ used by `tests/vineflower_compare.py`).
   on one side is ported in the same session or noted in the wiki table, and the other session is told (bncpp).
   Shared passes come with a small synthetic test case where there is one (`tests/pseudo_java_check.py` covers
   regions / condgraph).
-- `tests/bn_dev_load.py` copies `shared/` into the dev load, `tests/gate_state.py` hashes it into the stamps and
+- `tests/gate_state.py` hashes `shared/` into the stamps and
   `tests/lint.py` checks it.
 - When you add or change a language-neutral part in `pseudo_java.py`, put it in `shared/` with a hook for the
   JVM specifics instead of inlining them into the general logic.

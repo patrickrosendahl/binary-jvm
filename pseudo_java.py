@@ -8475,8 +8475,7 @@ if _HAVE_BN:
                 return False
             hlil = lf.hlil_if_available
             if hlil is None:
-                from binaryninja.mainthread import is_main_thread
-                if not is_main_thread():
+                if not _on_ui_thread():
                     # not generated yet, or dropped from BN's IL cache (a busy instance): off the UI thread
                     # it can be built here -- otherwise the lambda printed as the invokedynamic in some runs
                     # and not in others (jvm-97)
@@ -9040,6 +9039,14 @@ if _HAVE_BN:
 
     _anon_local = threading.local()  # off: classui is rendering, it embeds anonymous classes itself
 
+    def _on_ui_thread():
+        """the app's UI thread, where opening / analysing another view would block the UI. BNIsMainThread alone is
+        not enough: in the in-process engine (bnengine) it is True on every thread, and there is no UI to block --
+        binaryninjaui is not even loadable there, while the app always has it imported (jvm-113)"""
+        import sys
+        from binaryninja.mainthread import is_main_thread
+        return "binaryninjaui" in sys.modules and is_main_thread()
+
     class class_view_rendering:
         """while classui renders a class: no anonymous classes embedded in method bodies (it does that itself)"""
         def __enter__(self):
@@ -9058,7 +9065,6 @@ if _HAVE_BN:
         (opening and analysing another class there would block the UI)"""
         import os
         from binaryninja import BinaryView, BinaryViewType
-        from binaryninja.mainthread import is_main_thread
         from . import classui
         own = (meta or {}).get("name") if isinstance(meta, dict) else None
         path = view.file.original_filename if view.file else None
@@ -9073,7 +9079,7 @@ if _HAVE_BN:
         with _anon_lock:
             if key in _anon_cache:
                 return _anon_cache[key]
-        if is_main_thread():
+        if _on_ui_thread():
             return None
         lines = None
         try:

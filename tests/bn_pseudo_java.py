@@ -11,7 +11,7 @@ CLASSES = globals().get("CLASSES", ["com/is_teledata/cache/HashCache.class"])
 FUNCS = globals().get("FUNCS", None)
 HLIL = globals().get("HLIL", True)
 # DEV_PKG = "jvm_devN" picks a specific dev load (other sessions may have loaded newer ones since)
-PKG = globals().get("DEV_PKG") or b._jvm_dev["pkg"].__name__
+PKG = globals().get("DEV_PKG") or (b._jvm_dev["pkg"].__name__ if hasattr(b, "_jvm_dev") else "binary-jvm")
 pj = sys.modules[PKG + ".pseudo_java"]
 vt = b.BinaryViewType[sys.modules[PKG + ".constants"].VIEW_NAME]
 print("language:", pj.LANGUAGE_NAME, "registered:", pj.LANGUAGE_NAME in b.LanguageRepresentationFunctionType)

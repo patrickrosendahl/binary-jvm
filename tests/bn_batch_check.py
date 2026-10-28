@@ -9,7 +9,7 @@ import binaryninja as b
 CLASS_DIR = globals().get("CLASS_DIR", "/Users/patrick/dev/binary-jvm/sample/ActiveTraderDE_app/Contents/WorkingDir/current/lib/mdg")
 LIMIT = globals().get("LIMIT", 20)
 CHECK_LLIL = globals().get("CHECK_LLIL", False)
-vt = b.BinaryViewType[b._jvm_dev["ns"]["VIEW_NAME"]]
+vt = b.BinaryViewType[b._jvm_dev["ns"]["VIEW_NAME"] if hasattr(b, "_jvm_dev") else "JVM Class"]
 paths = sorted(os.path.join(d, f) for d, _, fs in os.walk(CLASS_DIR) for f in fs if f.endswith(".class"))[:LIMIT]
 stats = {"classes": 0, "functions": 0, "unimpl": [], "sp": [], "hlil": [], "fail": []}
 t0 = time.time()

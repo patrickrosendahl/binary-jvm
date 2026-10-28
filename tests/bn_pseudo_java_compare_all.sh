@@ -1,14 +1,14 @@
 #!/bin/bash
 # Pseudo Java vs HLIL check (tests/bn_pseudo_java_compare.py) on every mdg method with an exception table:
-# 108 classes in 4 parallel bnrun batches (~20-30 min). Prints the four TOTAL lines and every problem.
+# 108 classes in 4 parallel engine processes (~20-30 min). Prints the four TOTAL lines and every problem.
 # Exits non-zero unless every batch reported ok == with_table (a missing TOTAL line means the batch died;
 # a method without HLIL counts as a problem since jvm-95).
-#   tests/bn_pseudo_java_compare_all.sh [DEV_PKG]     (no argument: the installed plugin)
+#   tests/bn_pseudo_java_compare_all.sh [DEV_PKG]     (default: the installed plugin = the working tree)
 # Per-class results with stamps go to .scratch/compare_all/classes/ (jvm-105); RESUME=1 replays the classes whose
 # result carries the current stamp instead of analysing them again (jvm-106).
 set -e
-JOBS=${JOBS:-4}   # parallel bnrun batches; above 4 needs scriptbridge.maxParallel >= JOBS
-TIMEOUT=${TIMEOUT:-2400}   # per batch, seconds (raise it when the BN instance is shared with heavy jobs)
+JOBS=${JOBS:-4}   # parallel engine processes (one Binary Ninja each)
+TIMEOUT=${TIMEOUT:-2400}   # per batch, seconds
 RESUME=${RESUME:-0}
 REPO=/Users/patrick/dev/binary-jvm
 OUT=$REPO/.scratch/compare_all
@@ -29,7 +29,9 @@ for i in $(seq 0 $((JOBS - 1))); do
     [ "$RESUME" = 1 ] && echo "RESUME=True"
     python3 -c "print('CLASSES=' + repr(open('$OUT/batch_$i.txt').read().split()))"
     cat "$REPO/tests/bn_pseudo_java_compare.py"; } > "$OUT/run_$i.py"
-  /Users/patrick/dev/bn-script-bridge/bnrun --parallel --timeout $TIMEOUT "$OUT/run_$i.py" > "$OUT/result_$i.txt" 2>&1 &
+  # one engine process per batch (bnengine, jvm-113)
+  /Users/patrick/dev/bn-script-bridge/bn --timeout $TIMEOUT "$REPO/tests/bn_exec.py" \
+    "$OUT/run_$i.py" > "$OUT/result_$i.txt" 2>&1 &
 done
 wait
 grep -h "TOTAL" "$OUT"/result_*.txt

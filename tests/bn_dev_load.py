@@ -1,3 +1,5 @@
+# OBSOLETE for testing since jvm-113 (2026-10-28): tests run on bnengine (tests/bn_exec.py), which loads the working tree
+# at every start. Kept for iterating inside a long-running GUI app (it was run through the removed bnrun bridge).
 # Run inside Binary Ninja via the script bridge:  bnrun tests/bn_dev_load.py
 # Copies the plugin package to /tmp/jvm_devN/, renames the architecture/view to "JVM-devN" / "JVM Class devN"
 # and imports it, so the lifter can be iterated without restarting Binary Ninja (BN can't unregister an
