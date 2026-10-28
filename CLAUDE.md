@@ -35,12 +35,15 @@ gotos) -> suite 6226, gotos 4, labels 3; mdg 2014, compare_all 251/251. 2026-10-
 resolved, jvm-90 rest moved to jvm-99), jvm-89 test12 (synchronized whose tail HLIL put at the loop's end: releases print as
 `break`), jvm-91 item 3 (String-switch hash test left apart in a try), jvm-100 (`do { .. } while (c)` from a trailing `if (c)
 break;`), jvm-92 part (assert at a loop body's start, concatenated message) -> suite 6215, gotos 3, labels 2, sync_comments 0;
-mdg 2014, compare_all 251/251. Open: jvm-112 (finally copy in a trailing if of the root list), jvm-111 (no else after a
-terminal branch), jvm-92 rest (AssertionError thrown in a try range), jvm-99 (unreachable finally, test4/5, and
+mdg 2014, compare_all 251/251. 2026-10-27/28: jvm-68 (`shared/` split, output identical; binary-cpp took our folding.py /
+regions.py back in its 2499ebd, bncpp-88 adds a `fold_skip` hook next), jvm-112 (finally copy in a trailing if of the root
+list), jvm-111 (no else after a terminal branch; left inside try/finally and synchronized), `tests/bn_shapes_check.py`
+-> suite 6212, mdg 2013, compare_all 251/251. The script bridge once stopped with BN alive (jobs had finished; restart it
+with Plugins > Script Bridge > Start, no bnrestart). Open: jvm-92 rest (AssertionError thrown in a try range), jvm-99 (unreachable finally, test4/5, and
 loopInFinally from jvm-90: all paths end in an endless loop), jvm-83 rest left on purpose (testFinallyNested; Vineflower fails too). On the Intel MacBook a full gate round takes ~1.5 h and
 overlapping bnrun jobs slow each other ~10x (classes then hit BN's analysis time limit: `analysis skipped` in a dump is load,
 redump the class alone) -- run the gates one at a time. jvm-15 waits for Patrick's GUI
-click-through (BN restarted 2026-10-14 with the symlinked plugin, so jarload.py is loaded). jvm-68 still waits on binary-cpp. Use a dev load for live tests.
+click-through (BN restarted 2026-10-14 with the symlinked plugin, so jarload.py is loaded). Use a dev load for live tests.
 
 **Project tracking:** tickets live in minitick project **`jvm`** (`jvm-N`) — use the **minitick MCP
 tools** (`ticket` / `tickets` / `update` / `create`, registered user-scope; `update("jvm-N", {fields}, comment=…)` resolves with its verification comment in one
