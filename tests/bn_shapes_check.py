@@ -30,6 +30,23 @@ CHECKS = {
     # jvm-92: an assert whose AssertionError is thrown inside a try range (to the handler, not __propagate)
     "assertInTry": (['assert i > 0 : "positive";\nwork(i);'], ["AssertionError", "goto", "__propagate", "exc"]),
     "assertInTryAll": (["assert i > 0;\nwork(i);"], ["AssertionError", "goto", "__propagate", "exc"]),
+    # jvm-115: the try-with-resources is the loop body; the break path's close HLIL put behind the loop is implicit
+    "twrLoopBreak": (["while (true) {\ntry (FileReader r = new FileReader(f)) {\nif (r.read() < 0) {\nbreak;\n}\nwork(1);\n}\n}"],
+                     ["close", "catch", "Throwable"]),
+    # jvm-116: try / catch / finally whose catch-all handler HLIL nests in the catch's code, a synchronized block in
+    # the catch or the finally: the finally body prints once, its copies after the catch body and the try are gone
+    "catchSyncFinally": (["} catch (Throwable t) {\nsynchronized (Shapes.lock) {\nif (Shapes.failure == null) {\n"
+                          "Shapes.failure = t;\n}\n}\n} finally {\nif (Shapes.pending.decrementAndGet() == 0) {\n"
+                          "synchronized (Shapes.lock) {\nShapes.lock.notifyAll();\n}\n}\n}\n}"],
+                         ["on exception", "goto", "label_", "!= 0", "catch (Throwable e)"]),
+    "catchFinallyIf": (["work(1);\n} finally {\nif (Shapes.pending.decrementAndGet() == 0) {\n"
+                        "work(3);\n}\n}\n}"], ["handler at pc", "work(3);\n}\n}\nif"]),
+    "catchFinallyIfSync": (["work(1);\n} finally {\nif (Shapes.pending.decrementAndGet() == 0) {"
+                            "\nsynchronized (Shapes.lock) {\nShapes.lock.notifyAll();\n}\n}\n}\n}"],
+                           ["on exception", "!= 0", "throw"]),
+    # (the catch's `return;` before the method end is jvm-119's redundant return)
+    "catchFinallySync": (["work(1);", "} finally {\nsynchronized (Shapes.lock) {\n"
+                          "Shapes.lock.notifyAll();\n}\n}\n}"], ["synchronized (Shapes.lock) {\n}"]),
 }
 pj = sys.modules[PKG + ".pseudo_java"]
 vt = b.BinaryViewType[sys.modules[PKG + ".constants"].VIEW_NAME]

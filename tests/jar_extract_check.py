@@ -108,4 +108,16 @@ assert jarload.nested_left_message(["lib/a.jar"]) == "left nested JARs packed: l
 assert jarload.manifest_main_class(jarload.jar_dest(outer_path)) == (
     "com/example/VeryLongNameThatKeepsGoingAndGoing")
 assert jarload.manifest_main_class(os.path.join(tmp, "no-such-dir")) is None
+
+# jvm-120: a class finds the others of the outer jar and of its unpacked nested jars, both ways
+outer_dir, bar_dir = jarload.jar_dest(outer_path), os.path.join(tmp, "outer", "lib", "bar")
+roots = jarload.class_roots(outer_dir + os.sep)
+assert roots[0] == outer_dir and bar_dir in roots, roots
+roots = jarload.class_roots(bar_dir)
+assert roots[:2] == [bar_dir, outer_dir], roots
+assert jarload.jar_tree(bar_dir)[0] == outer_dir
+# not a jar's tree (a package directory inside one, a plain directory): only itself
+assert jarload.class_roots(os.path.join(outer_dir, "com")) == [os.path.join(outer_dir, "com")]
+assert jarload.jar_tree(os.path.join(outer_dir, "com")) is None
+assert jarload.class_roots(tmp) == [os.path.abspath(tmp)]
 print("ok")

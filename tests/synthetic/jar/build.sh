@@ -1,7 +1,8 @@
 #!/bin/bash
 # jvm-15 GUI click-through fixture: app.jar with a Main-Class (app.Main), a README.txt resource and a nested
-# lib/helper.jar. In Binary Ninja: File > Load Whole JAR... on app.jar (Main-Class label + preselect, nested-jar
-# dialog: Unpack -> app/lib/helper/), then JVM > Open class from this JAR. The jar is committed.
+# lib/helper.jar (lib.Helper, lib.Base; app.Other uses both, checked by tests/bn_jar_check.py, jvm-120). In Binary
+# Ninja: File > Load Whole JAR... on app.jar (Main-Class label + preselect, nested-jar dialog: Unpack ->
+# app/lib/helper/), then JVM > Open class from this JAR. The jar is committed.
 set -e
 cd "$(dirname "$0")"
 rm -rf build app.jar app

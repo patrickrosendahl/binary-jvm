@@ -16,6 +16,7 @@ from .javatypes import (ACC_STATIC, ACC_ENUM, ACC_SYNTHETIC, ACC_BRIDGE, ACC_PRI
                         java_type_name, java_version, modifiers, split_method_descriptor, simple_name, source_class_name,
                         package_of, dotted, class_signature, field_signature, method_signature)
 from .constants import ARCH_NAME
+from .jarload import class_roots
 try:
     from .pseudo_java import class_supertypes, class_method_flags, accessor_shape
 except ImportError:
@@ -161,6 +162,7 @@ def supertype_methods(bv, info):
     """name + descriptor of every instance method the class's supertypes declare: from the class files of the
     same unpacked jar, else JDK_TYPES (Object's methods for any other type)"""
     base = class_dir(bv, info)
+    roots = class_roots(base) if base else []  # with the jars unpacked beside it (jvm-120)
     queue = [n.replace(".", "/") for n in [info["super"]] + list(info["interfaces"]) if n]
     seen, out = set(), set(JDK_TYPES["java/lang/Object"][2])
     while queue:
@@ -168,8 +170,8 @@ def supertype_methods(bv, info):
         if t in seen:
             continue
         seen.add(t)
-        path = os.path.join(base, t + ".class") if base else None
-        if path and os.path.isfile(path) and class_method_flags is not None:
+        path = next((p for p in (os.path.join(r, t + ".class") for r in roots) if os.path.isfile(p)), None)
+        if path and class_method_flags is not None:
             with open(path, "rb") as fh:
                 data = fh.read()
             out.update(n + d for (n, d), f in (class_method_flags(data) or {}).items()

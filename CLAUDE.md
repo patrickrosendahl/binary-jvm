@@ -39,7 +39,12 @@ mdg 2014, compare_all 251/251. 2026-10-27/28: jvm-68 (`shared/` split, output id
 regions.py back in its 2499ebd, bncpp-88 adds a `fold_skip` hook next), jvm-112 (finally copy in a trailing if of the root
 list), jvm-111 (no else after a terminal branch; left inside try/finally and synchronized), `tests/bn_shapes_check.py`
 -> suite 6212, mdg 2013, compare_all 251/251. 2026-10-28: bnrun / the shared app replaced by bnengine (jvm-113: `tests/bn_exec.py`, gates
-~10 min in all instead of ~1 h). 2026-10-28 (MacBook): jvm-114 item 2 (locals never named after access$/this$/lambda$; an accessor's value is named after its member), jvm-83 (guarded close before a loop's continue / break; `try { try (R r) {..} } catch` -> `try (R r) {..} catch`), jvm-92 (assert whose AssertionError is thrown in a try range), jvm-114 item 1 (lambda bodies inert: no click / rename into the lambda$ function), jvm-15 click-through fixture `tests/synthetic/jar/app.jar` -> suite 6200; follow-ups jvm-115 / jvm-116. Open: jvm-92 rest (AssertionError thrown in a try range), jvm-99 (unreachable finally, test4/5, and
+~10 min in all instead of ~1 h). 2026-10-28 (MacBook): jvm-114 item 2 (locals never named after access$/this$/lambda$; an accessor's value is named after its member), jvm-83 (guarded close before a loop's continue / break; `try { try (R r) {..} } catch` -> `try (R r) {..} catch`), jvm-92 (assert whose AssertionError is thrown in a try range), jvm-114 item 1 (lambda bodies inert: no click / rename into the lambda$ function), jvm-15 click-through fixture `tests/synthetic/jar/app.jar` -> suite 6200; follow-ups jvm-115 / jvm-116. 2026-10-28 (MacBook, later): jvm-120 (classes of an unpacked nested jar found from
+the outer one and back: `jarload.class_roots`; `tests/bn_jar_check.py`), jvm-115 (TWR as the whole `while (true)` body, the
+break path's close HLIL put behind the loop; `new` resources named from the LVT store after `<init>`; a loop body's trailing
+`continue` dropped), jvm-116 (try/catch/finally whose finally handler HLIL nests in the catch's code -- plain
+`finally { if (c) .. }` lost its body before; merged `type == 0 || exc != 0` tests, synchronized in catch / finally, ECJ's
+nested catch/finally ranges merged) -> suite 6175, mdg 2013, compare_all 251/251. Open: jvm-92 rest (AssertionError thrown in a try range), jvm-99 (unreachable finally, test4/5, and
 loopInFinally from jvm-90: all paths end in an endless loop), jvm-83 rest left on purpose (testFinallyNested; Vineflower fails too). Under load BN can still hit its analysis time limit (`analysis skipped` in a
 dump: redump with RESUME=1). jvm-15 waits for Patrick's GUI
 click-through (BN restarted 2026-10-14 with the symlinked plugin, so jarload.py is loaded).
@@ -135,6 +140,7 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
  **Class view gate** (after a `classui.py` / class metadata change): `tests/bn_dump_all.sh cv`
  (~1 min), then `python3 tests/class_view_compare.py --max imports=2 headers=0 fields=0 override=0 head=0 throws=0 missing=0`
  (declarations against Vineflower; the 2 imports are types Vineflower names for locals we fold away), and
+ `bn --timeout 300 tests/bn_exec.py tests/bn_jar_check.py` (Whole JAR with a nested jar: classes found across them; jvm-120), and
  `bn --timeout 300 tests/bn_exec.py tests/bn_anon_check.py` (anonymous classes at their `new`, javac 8 + 21; jvm-69;
  exits non-zero on failure, as do the other check scripts -- jvm-94).
  **Statement shapes** (synthetic, seconds): `bn --timeout 300 tests/bn_exec.py tests/bn_shapes_check.py` checks `tests/synthetic/shapes` (jvmtest.Shapes: finally copies in trailing ifs, no else after

@@ -1022,15 +1022,22 @@ if _HAVE_BN:
             self._flags = {}
             self._supers = {}
             self._internal = None
+            self._roots = None
 
         def sibling_class(self, owner):
-            """bytes of another class file of the same unpacked jar / directory (None if not found)"""
+            """bytes of another class file of the same unpacked jar / directory, or of a jar unpacked with it
+            (outer / nested, jvm-120); None if not found"""
             try:
                 import os
-                path = self.view.file.original_filename
-                own = self.class_name
-                if path and own and path.endswith(own + ".class"):
-                    other = os.path.join(path[:-len(own + ".class")], owner + ".class")
+                if self._roots is None:
+                    self._roots = []
+                    path = self.view.file.original_filename
+                    own = self.class_name
+                    if path and own and path.endswith(own + ".class"):
+                        from .jarload import class_roots
+                        self._roots = class_roots(path[:-len(own + ".class")])
+                for root in self._roots:
+                    other = os.path.join(root, owner + ".class")
                     if os.path.isfile(other):
                         with open(other, "rb") as fh:
                             return fh.read()
@@ -1385,6 +1392,8 @@ if _HAVE_BN:
             self.array_lits = {}    # array variable -> (new instr, element values, other uses) (jvm-49)
             self.hidden_vars = set()  # lock variables whose definition moved into a synchronized header
             self.twr_labels = set()  # labels of folded try-with-resources tails (jvm-78)
+            self.twr_after = {}      # expr_index of a resource's close behind a loop -> its try range (jvm-115)
+            self.twr_folded = set()  # try ranges folded as try-with-resources
             self.goto_continue = {}  # label id -> (loop label, expr_index of gotos in nested loops) (jvm-82)
             self.goto_break = {}     # label id -> name of the labeled block a goto to it leaves (jvm-82)
             self.twr_open = []       # resources whose try-with-resources body is being printed
@@ -1623,6 +1632,8 @@ if _HAVE_BN:
                 return None
             test = self.exc_test(s.condition)
             if test is None:
+                test = self.merged_exc_test(s.condition)
+            if test is None:
                 # a condition mixing the exception register into an ordinary test (`r != 0 && exc != 0`,
                 # `exc != 0 && instanceof(exc, T) == 0`, `r == 0 || exc == 0`): on the normal path (exc == 0)
                 # it has a fixed value, so the other branch is only taken on an exception
@@ -1632,6 +1643,26 @@ if _HAVE_BN:
                 test = ('exc', not normal)
             kind, exc_true = test
             return (kind, s.true, s.false) if exc_true else (kind, s.false, s.true)
+
+        def merged_exc_test(self, c):
+            """('exc', True) for `temp == 0 || exc != 0` -- every operand of an || holds only on an exceptional path
+            (a handler's type test failed, or its body threw): HLIL merges two edges into one handler, here a catch
+            body's own exception and the types the catch does not take, both going to the finally (jvm-116).
+            ('exc', False) for the && of operands that each hold only on the normal path. None otherwise"""
+            if c.operation not in (Op.HLIL_AND, Op.HLIL_OR) or c.size != 0:
+                return None
+            want = c.operation == Op.HLIL_OR
+            todo, kinds = [c], set()
+            while todo:
+                x = todo.pop()
+                if x.operation == c.operation and x.size == 0:
+                    todo += [x.left, x.right]
+                    continue
+                t = self.exc_test(x)
+                if t is None or t[1] != want:
+                    return None
+                kinds.add(t[0])
+            return ('exc', want) if kinds == {'exc', 'type'} else None
 
         def normal_value(self, c):
             """value of a condition on the normal path (no exception pending: exc == 0), None if it depends on
@@ -1860,6 +1891,11 @@ if _HAVE_BN:
             for h, (blk, idx, whole) in self.sites().items():
                 s = blk.body[idx] if blk.operation == Op.HLIL_BLOCK else blk
                 if s.operation == Op.HLIL_LABEL and s.target.label_id == label.label_id:
+                    return h
+                # (the label right before a site whose statement is not the label: HLIL folded the handler's first
+                # loads, so the label carries a later pc -- a synchronized cleanup's rethrow falls into it, jvm-116)
+                p = blk.body[idx - 1] if blk.operation == Op.HLIL_BLOCK and idx > 0 else None
+                if p is not None and p.operation == Op.HLIL_LABEL and p.target.label_id == label.label_id:
                     return h
             return None
 
@@ -2426,6 +2462,8 @@ if _HAVE_BN:
                 self.array_lits = {}
                 self.hidden_vars = set()
                 self.twr_labels = set()
+                self.twr_after = {}
+                self.twr_folded = set()
                 self.goto_continue = {}
                 self.goto_break = {}
                 self.twr_open = []
@@ -2585,6 +2623,8 @@ if _HAVE_BN:
                         pcs.append([self.jump_pc(body, lo + len(pcs), hi)])
                 # a try range is printed once per function, where it first fits
                 runs = try_runs(pcs, self.try_groups, {(g[0], g[1]) for g in self.active_tries} | self.placed)
+                if TRY_WITH_RESOURCES:
+                    runs = [r for r in runs if not self.twr_after_loop(body, lo, r[0] + lo, r[1] + lo, r[2])]
             run_at = {r[0] + lo: (r[0] + lo, r[1] + lo, r[2]) for r in runs}
             sync_at = {}
             if SYNC_BLOCKS and block.as_ast:
@@ -2717,6 +2757,21 @@ if _HAVE_BN:
                     if run is not None and idx + run - 1 >= sync_at[idx][0]:
                         idx += run  # javac's copy of a printed finally (here a synchronized block)
                         continue
+                    k = idx - 1  # the copy starts at the lock's init, folded into the header (jvm-116)
+                    while k >= lo and (isinstance(body[k], _ExcBranch) or self.is_exc_plumbing(body[k])):
+                        k -= 1
+                    if k >= lo and not isinstance(body[k], _ExcBranch) and body[k].operation == Op.HLIL_VAR_INIT and \
+                            body[k].dest == sync_at[idx][1]:
+                        run = self.finally_copy_len(body, k, plan)
+                        if run is not None and k + run - 1 >= sync_at[idx][0]:
+                            idx = k + run
+                            continue
+                if idx in sync_at and idx in plan["skip"] and \
+                        all(k in plan["skip"] or isinstance(body[k], _ExcBranch) or self.is_exc_plumbing(body[k]) or
+                            self.monitor_var(body[k], "monitorexit") is not None
+                            for k in range(idx, sync_at[idx][0] + 1)):
+                    idx = sync_at[idx][0] + 1  # inside a copy of a finally that starts before it (jvm-116)
+                    continue
                 if idx in sync_at and body[idx].expr_index in self.consumed and \
                         body[idx].expr_index not in plan.get("own", ()) and \
                         all(isinstance(x, _ExcBranch) or self.hidden_item(x) or self.in_monitor_code(x) or
@@ -3224,6 +3279,12 @@ if _HAVE_BN:
             if p.operation in (Op.HLIL_CONST, Op.HLIL_CONST_PTR):
                 return _ConstLock(p)
             return None
+
+        def lock_vars(self):
+            """the variables monitorenter locks in this function (cached)"""
+            if getattr(self, "_lock_vars", None) is None:
+                self._lock_vars = {self.monitor_var(i, "monitorenter") for i in _walk(self.hlil.root)} - {None}
+            return self._lock_vars
 
         def monitor_exits(self, roots, lock):
             """monitorexit(lock) statements below roots that are not javac's cleanup-handler code; an _ExcBranch
@@ -4419,6 +4480,10 @@ if _HAVE_BN:
                     return need_separator
             if isinstance(s, _ExcBranch):
                 return self.emit_exc_branch(s, tokens, settings, need_separator)
+            if s.operation == Op.HLIL_CONTINUE and plan.get("list_kind") == 'loop' and \
+                    all(k in plan["skip"] or k in plan.get("done", ()) or self.hidden_item(body[k])
+                        for k in range(idx + 1, len(body))):
+                return need_separator  # the end of the loop body: its implicit continue (`r.close(); continue;`, jvm-115)
             if s.operation == Op.HLIL_BREAK and s.expr_index in self.break_subst:
                 items, blk = self.break_subst[s.expr_index]
                 self.break_used.add(s.expr_index)
@@ -4647,6 +4712,8 @@ if _HAVE_BN:
                     return True
             if self.twr_open and self.twr_hidden_close(body, idx):
                 return need_separator  # the resource's implicit close (jvm-78)
+            if self.twr_after.get(s.expr_index) in self.twr_folded:
+                return need_separator  # the break path's close, folded into the loop's try header (jvm-115)
             if s.operation == Op.HLIL_GOTO and s.target.label_id in self.twr_labels:
                 return need_separator  # into a folded try-with-resources tail: the close is implicit
             if s.operation == Op.HLIL_GOTO and s.target.label_id in self.goto_continue:
@@ -4920,12 +4987,13 @@ if _HAVE_BN:
             return bool(shape and shape[2] == "<init>" and shape[1] != self.info.class_name and not shape[5]
                         and shape[4] is not None and shape[4].operation == Op.HLIL_VAR and shape[4].var == self.this_var)
 
-        def emit_new(self, entry, tokens, settings):
+        def emit_new(self, entry, tokens, settings, declare=False):
+            """`[C] v = new C(..)`; declare: with the type also for an assignment (a try-with-resources header)"""
             s, var, cls_idx, shape = entry
             cls = decl = java_class_name(self.info.class_ref(cls_idx) or "?")
             if ANONYMOUS_CLASSES and self.info.anonymous_class(self.info.class_ref(cls_idx) or "?") is not None:
                 decl = self.info.anonymous_supertype(self.info.class_ref(cls_idx)) or cls  # Outer$1 has no name
-            if s.operation == Op.HLIL_VAR_INIT and var not in self.hoisted:
+            if (s.operation == Op.HLIL_VAR_INIT or declare) and var not in self.hoisted:
                 self.type_tok(tokens, decl)
                 self.txt(tokens, " ")
             self.emit_var(var, s, tokens)
@@ -5458,6 +5526,36 @@ if _HAVE_BN:
                     return c.left.var
             return None
 
+        def twr_after_loop(self, body, lo, first, last, group):
+            """body[first..last] is only `if (r != null) r.close();` right behind a loop, r the resource of group's
+            close handler: javac's close on a break out of the try-with-resources the loop body holds, which HLIL
+            moved behind the loop (`while (true) { try (R r = e) { if (c) break; .. } }`, jvm-115). Its range
+            reaches it only because the group's ranges join over it; the try belongs to the loop body. Recorded in
+            twr_after (hidden there once the loop's try folds); True when body[first..last] is such a close"""
+            if len(group[2]) != 1 or group[2][0][1] != "java/lang/Throwable":
+                return False
+
+            def plain(x):
+                return isinstance(x, _ExcBranch) or self.is_exc_plumbing(x) or \
+                    x.operation in (Op.HLIL_LABEL, Op.HLIL_NOP)
+            real = [k for k in range(first, last + 1) if not plain(body[k])]
+            k = first - 1
+            while k >= lo and plain(body[k]):
+                k -= 1
+            if len(real) != 1 or k < lo or body[k].operation not in (Op.HLIL_WHILE, Op.HLIL_DO_WHILE, Op.HLIL_FOR):
+                return False
+            r = self.twr_close_var(group[2][0][0])
+            if r is None:
+                return False
+            self.twr_open.append(r)
+            try:
+                if self.twr_guard_close(body[real[0]]) != r:
+                    return False
+            finally:
+                self.twr_open.pop()
+            self.twr_after[body[real[0]].expr_index] = (group[0], group[1])
+            return True
+
         def twr_tail(self, body, j, hi, r):
             """the guarded normal-path close after the try -- `if (r != null) r.close();`, or
             `if (r == null) <exit>; r.close(); [<exit>]` -- as the indices it covers, else None"""
@@ -5572,6 +5670,7 @@ if _HAVE_BN:
                     ret = j  # (also `T v = ..;` in the body, `return v;` after it: v is out of scope there)
             # the group travels with the mark: two try regions can share a start pc (jvm-78)
             plan.setdefault("twr", {})[(first, group[0], group[1])] = {"var": r, "init": init, "ret": ret}
+            self.twr_folded.add((group[0], group[1]))
             done = plan.setdefault("done", set())
             done.add(k)
             done.update(tail)
@@ -5738,7 +5837,7 @@ if _HAVE_BN:
                 kind, init = twr["init"]
                 if kind == 'new':
                     self.hoisted.discard(twr["var"])
-                    self.emit_new(init, tokens, settings)
+                    self.emit_new(init, tokens, settings, declare=True)
                 else:
                     self.emit_var_decl(twr["var"], init, tokens, init.src)
                     self.op(tokens, " = ")
@@ -5790,6 +5889,20 @@ if _HAVE_BN:
             if twr is not None:
                 merged = (first, start, end) in self.__dict__.setdefault("_twr_merged", set())
                 self.emit_twr(body, first, last, group, plan, twr, tokens, settings, block, merged=merged)
+                return
+            inner = self.catch_merge(body, first, last, group, plan)
+            if inner is not None:
+                # `try { try { A } catch (E e) { B } } finally { C }` is `try { A } catch (E e) { B } finally { C }`:
+                # the inner try prints its catches without closing, this finally continues it (jvm-116)
+                self.__dict__.setdefault("_catch_merged", set()).add(inner)
+                self.active_tries.append(group)
+                self.plan_finally_exit(body, last, group, plan)
+                try:
+                    self.emit_range(body, first, last, plan, tokens, settings, block)
+                finally:
+                    self.active_tries.pop()
+                self._try_tail_loops.append(None)
+                self.emit_try_clauses(body, first, last, handlers, plan, tokens, settings)
                 return
             merge = self.twr_merge(body, first, last, group, plan)
             if merge is not None:
@@ -5851,10 +5964,35 @@ if _HAVE_BN:
                 tokens.end_scope(ScopeType.BlockScopeType)
                 self.active_tries.pop()
                 plan["copy_end_ok"] = saved_end_ok
-            self.emit_try_clauses(body, first, last, handlers, plan, tokens, settings)
+            self.emit_try_clauses(body, first, last, handlers, plan, tokens, settings,
+                                  close=(first, start, end) not in self.__dict__.get("_catch_merged", ()))
 
-        def emit_try_clauses(self, body, first, last, handlers, plan, tokens, settings):
-            """the catch / finally clauses after a try block (pops the _try_tail_loops entry of the try)"""
+        def catch_merge(self, body, first, last, group, plan):
+            """(first, start, end) of the try run that is the only statement of the finally-only try `group` and has
+            catch clauses only, starting at the same pc: the Eclipse compiler's table for `try { A } catch (E e) { B }
+            finally { C }` gives the catches the range of A and the finally that of A and B (javac: one range for
+            both), so the ranges nest (felix ResolverImpl$EnhancedExecutor$1.run, jvm-116). None otherwise"""
+            if not group[2] or any(t for _, t in group[2]):
+                return None
+            active = {(g[0], g[1]) for g in self.active_tries} | self.placed | {(group[0], group[1])}
+            runs = self._twr_runs_of(body, first, last, active)
+            if len(runs) != 1:
+                return None
+            a, z, g = runs[0]
+            if g[0] != group[0] or not g[2] or not all(t for _, t in g[2]) or \
+                    (a, g[0], g[1]) in plan.get("twr", {}):
+                return None
+            for k in list(range(first, a)) + list(range(z + 1, last + 1)):
+                x = body[k]
+                if k in plan["skip"] or isinstance(x, _ExcBranch) or self.is_exc_plumbing(x) or \
+                        x.operation in (Op.HLIL_LABEL, Op.HLIL_NOP):
+                    continue
+                return None
+            return a, g[0], g[1]
+
+        def emit_try_clauses(self, body, first, last, handlers, plan, tokens, settings, close=True):
+            """the catch / finally clauses after a try block (pops the _try_tail_loops entry of the try); close=False:
+            the clauses of an enclosing try follow (catch_merge)"""
             clauses = [(h, t) for h, t in handlers if t or not self.empty_finally(h)]
             for hpc, _ in handlers:
                 self.printed_handlers.add(hpc)
@@ -5876,8 +6014,9 @@ if _HAVE_BN:
             finally:
                 self._tail_ret_hide.pop()
                 self._try_tail_loops.pop()
-            tokens.finalize_scope()
-            tokens.new_line()
+            if close:
+                tokens.finalize_scope()
+                tokens.new_line()
 
         def try_ends_list(self, body, last):
             """nothing but exception plumbing follows body[last]"""
@@ -5925,10 +6064,34 @@ if _HAVE_BN:
                     if v is not None:
                         var = v
                         continue
-                if not isinstance(s, _ExcBranch) and not self.is_exc_plumbing(s):
+                if not isinstance(s, _ExcBranch) and not self.is_exc_plumbing(s) and \
+                        s.operation != Op.HLIL_VAR_DECLARE:  # (HLIL may declare the catch variable first, jvm-116)
                     entry = False
                 out.append(s)
+            if var is not None:
+                out = [s for s in out if isinstance(s, _ExcBranch) or s.operation != Op.HLIL_VAR_DECLARE or
+                       self.twr_var(s.var) != self.twr_var(var)]
             return out, var, blk
+
+        def finally_in_catch(self, hpc):
+            """region_items of catch-all handler hpc when its code lies inside the region of a catch of the same
+            try (HLIL nests the finally handler in the catch's exceptional branch, whose whole block is the catch
+            region): the catch consumed it, printing it as its rethrow path only (jvm-116). (None, None, None)
+            otherwise"""
+            site = self.sites().get(hpc)
+            fb = self.finally_bodies().get(hpc)
+            group = next((g for g in self.try_groups if any(h == hpc for h, _ in g[2])), None)
+            if site is None or not fb or not fb[0] or group is None:
+                return None, None, None
+            first = self.stmts_of(site[0])[site[1]].expr_index
+            for h, t in group[2]:
+                if not t or h == hpc:
+                    continue
+                if any(x.expr_index == first for top in self.handler_region(h) or [] for x in _walk(top)):
+                    region = self.handler_region(hpc)
+                    self.claimed.update(x.expr_index for x in region)
+                    return list(fb[0]), fb[1], site[0]
+            return None, None, None
 
         def catch_header(self, word, ctype, var, tokens):
             self.kw(tokens, word + " ")
@@ -6030,6 +6193,8 @@ if _HAVE_BN:
                 items = None  # printed in place (see plan_finally_exit)
             else:
                 items, var, blk = self.region_items(hpc)
+                if items is None:
+                    items, var, blk = self.finally_in_catch(hpc)
             if items is not None:
                 if self.handler_is_finally(hpc, items):
                     self.kw(tokens, "finally")
@@ -6079,7 +6244,7 @@ if _HAVE_BN:
             if hpc in self._inline_handlers or \
                     (self.loose_jumps(items) and (not self._try_in_loop.get(hpc) or self.has_labels(items))):
                 exits = []  # not printed from its own code (see emit_finally_body)
-            if self.needs_finally_exit(items) and self._finally_exit.get(hpc) is None:
+            if self.needs_finally_exit(items, hpc) and self._finally_exit.get(hpc) is None:
                 exits = []  # its fall-through path can't be written as a finally: catch (Throwable)
             if exits:
                 if all(k == 'rethrow' for k in exits):
@@ -6157,6 +6322,8 @@ if _HAVE_BN:
                 if isinstance(s, _ExcBranch):
                     stack.extend(self.stmts_of(s.branch))
                     continue
+                if s.operation in (Op.HLIL_LABEL, Op.HLIL_GOTO) and s.target.label_id in self.monitor_labels():
+                    continue  # a synchronized block's cleanup entry and the jumps there: hidden (jvm-116)
                 if s.operation == Op.HLIL_LABEL and s.target.label_id in self.join_labels():
                     continue
                 if s.operation in (Op.HLIL_BREAK, Op.HLIL_CONTINUE, Op.HLIL_LABEL):
@@ -6168,6 +6335,13 @@ if _HAVE_BN:
                     continue  # its own jumps
                 stack.extend(_children(s))
             return False
+
+        def monitor_labels(self):
+            """label ids of labels in synchronized-cleanup handler code (cached)"""
+            if getattr(self, "_monitor_labels", None) is None:
+                self._monitor_labels = {i.target.label_id for i in _walk(self.hlil.root)
+                                        if i.operation == Op.HLIL_LABEL and self.in_monitor_code(i)}
+            return self._monitor_labels
 
         def has_labels(self, items):
             for s in items:
@@ -6181,10 +6355,14 @@ if _HAVE_BN:
                         return True
             return False
 
-        def needs_finally_exit(self, items):
-            """printing this finally body needs an explicit jump after its else part (see emit_finally_items)"""
+        def needs_finally_exit(self, items, hpc=None):
+            """printing this finally body needs an explicit jump after its else part (see emit_finally_items) -- not
+            when handler hpc's code ends by rethrowing: the else part falls into that rethrow, like the then part
+            (`if (c) { throw e; } B; throw e;` is `finally { if (!c) { B } }`, jvm-116)"""
             k = self.split_rethrow_if(items)
-            return k is not None and 'fall' in self.exit_kinds(items[k + 1:])
+            if k is None or hpc is not None and hpc in self._fb_rethrows:
+                return False
+            return 'fall' in self.exit_kinds(items[k + 1:])
 
         def plan_finally_exit(self, body, last, group, plan):
             """the jump that leaves a try statement that ends its list: `continue` in a loop body,
@@ -6330,6 +6508,8 @@ if _HAVE_BN:
                 return 'exc'
             if v in self.type_temps():
                 return 'type'
+            if v in self.lock_vars():
+                return 'temp'  # a synchronized block's lock: each copy of a finally has its own (jvm-116)
             if self.def_count(v) >= 2 and self.var_count(v) <= self.def_count(v) + 1:
                 return 'temp'  # defined once per copy, read within it
             if scope is not None and self.scope_covers(v, scope):
@@ -6390,6 +6570,8 @@ if _HAVE_BN:
                 return ('var', self.var_role(e.var, scope))
             if o in (Op.HLIL_CONST, Op.HLIL_CONST_PTR):
                 return ('const', e.constant)
+            if o == Op.HLIL_VAR_INIT:  # (its dest is a Variable, not an expression: by role too, jvm-116)
+                return (o.name, ('var', self.var_role(e.dest, scope)), self.expr_key(e.src, scope))
             parts = [o.name]
             for x in e.operands:
                 if isinstance(x, list):
@@ -6557,10 +6739,14 @@ if _HAVE_BN:
             match one of the catch-all handler bodies (javac duplicates the body before every exit of
             the try) and an abrupt completion -- or the end of a loop body / the root -- follows.
             A handler body (own_hpc) may hold a copy of another handler's finally, never of its own"""
+            own = plan.get("own_hpc")
+            # a catch body ends where javac copies its try's finally (falling out of the try statement, jvm-116)
+            catch_of = {h for g in self.try_groups if any(t and hh == own for hh, t in g[2]) for h, t in g[2] if not t} \
+                if own is not None else ()
             for h, (items, _, keys) in self.finally_bodies().items():
-                if h == plan.get("own_hpc") or not keys or not self.handler_is_finally(h, items):
+                if h == own or not keys or not self.handler_is_finally(h, items):
                     continue
-                m = self.copy_window(body, idx, keys, plan.get("copy_end_ok"))
+                m = self.copy_window(body, idx, keys, plan.get("copy_end_ok") or h in catch_of)
                 if m is not None:
                     return m
             return None
@@ -6569,7 +6755,7 @@ if _HAVE_BN:
             """length m of body[idx:idx+m] whose normalized keys equal a finally body's, followed by an
             abrupt exit (or by the end of the list when end_ok) -- the shapes of the copy and the
             handler can differ in statement count (`if (c) {A; throw} B` against `if (c) A else B`)"""
-            real = 0
+            real, limit = 0, self.keys_size(keys) + 3
             for m in range(1, len(body) - idx + 1):
                 window = body[idx:idx + m]
                 x = window[-1]
@@ -6578,7 +6764,7 @@ if _HAVE_BN:
                         return None  # (a synchronized block's cleanup branches inside the copy are no exit)
                 elif not self.is_exc_plumbing(x):
                     real += 1
-                    if real > len(keys) + 3:
+                    if real > limit:
                         return None
                 after = body[idx + m] if idx + m < len(body) else None
                 if after is None:
@@ -6596,24 +6782,41 @@ if _HAVE_BN:
                     wk = self._copy_keys[ident] = self.norm_keys(window, False)
                 if wk == keys or after is None and self.strip_tail_continue(wk) == keys:
                     return m
+                if (after is None and end_ok and self.returns_void or after is not None and
+                        not isinstance(after, _ExcBranch) and after.operation == Op.HLIL_RET and not after.src) and \
+                        self.strip_tail_continue(wk, ('ret', ())) == keys:
+                    return m  # `if (c) return; B` before a void method's return: the handler's `if (c) throw e; B`
             return None
+
+        @staticmethod
+        def keys_size(keys):
+            """statements in norm_keys output, those an `if` absorbed included (fold_keys moves the statements after an
+            `if (c) { throw e; }` into it: a copy's window is longer than its top-level keys, jvm-116)"""
+            n, todo = 0, [keys]
+            while todo:
+                for k in todo.pop():
+                    n += 1
+                    if k and k[0] == 'if':
+                        todo += [k[2], k[3]]
+            return n
 
         def monitor_branch(self, x):
             """x is an exceptional branch only to synchronized-cleanup handlers"""
             covering = self.covering_handlers(x.address - self.function.start) if self.monitor_handlers else None
             return bool(covering) and all(h in self.monitor_handlers for h in covering)
 
-        def strip_tail_continue(self, keys):
+        def strip_tail_continue(self, keys, exit=('continue',)):
             """keys of a copy that ends its loop body with a `continue` in a tail position dropped: there it is the
             end of the finally, where the handler copy's dropped rethrow goes -- `if (c) continue; break` equals the
-            handler's `if (c) throw e; break` (TestSynchronizedLoop.test12, jvm-89)"""
+            handler's `if (c) throw e; break` (TestSynchronizedLoop.test12, jvm-89). exit: the jump that is the end,
+            ('ret', ()) for a copy before a void method's return (jvm-116)"""
             if not keys:
                 return keys
             k = keys[-1]
-            if k == ('continue',):
+            if k == exit:
                 return keys[:-1]
             if k[0] == 'if':
-                tk, fk = self.strip_tail_continue(k[2]), self.strip_tail_continue(k[3])
+                tk, fk = self.strip_tail_continue(k[2], exit), self.strip_tail_continue(k[3], exit)
                 if (tk, fk) != (k[2], k[3]):
                     if not tk and fk and isinstance(k[1], tuple) and k[1] and k[1][0] in _NEG_NAMES:
                         k = ('if', (_NEG_NAMES[k[1][0]],) + k[1][1:], fk, ())
@@ -7312,7 +7515,7 @@ if _HAVE_BN:
             if len(defs) >= 2 and any(d.src.operation == Op.HLIL_CONST for d in defs) and \
                     any(d.src.operation in (Op.HLIL_ADD, Op.HLIL_SUB) and self.refs(d.src, var) for d in defs):
                 return "i"
-            stored = self.stored_local_name(defs)
+            stored = self.stored_local_name(defs + self.init_calls(var, defs))
             if stored:
                 return stored
             for d in defs:
@@ -7320,6 +7523,23 @@ if _HAVE_BN:
                 if hint:
                     return hint
             return name_from_type(self.named_type(self.defs_java_type(var) or java_type_of(var.type)))
+
+        def init_calls(self, var, defs):
+            """the constructor calls `C.<init>(var, ..)` of a `var = new(C)`: javac stores the object after them
+            (`new; dup; ..; invokespecial <init>; astore`), not after the new (stored_local_name)"""
+            if not any(self.new_assignment(d) for d in defs):
+                return []
+            out = []
+            try:
+                for u in self.hlil.get_var_uses(var):
+                    c = u.parent
+                    shape = self.call_shape(c) if c is not None else None
+                    if shape and shape[2] == "<init>" and shape[4] is not None and \
+                            shape[4].operation == Op.HLIL_VAR and shape[4].var == var:
+                        out.append(c)
+            except Exception:
+                pass
+            return out
 
         def stored_local_name(self, defs):
             """the LocalVariableTable name of the local javac stores a temporary's value into right after computing it:

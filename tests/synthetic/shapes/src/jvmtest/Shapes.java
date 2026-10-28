@@ -157,4 +157,81 @@ public class Shapes {
             work(-1);
         }
     }
+
+    // jvm-115: try-with-resources as the whole body of while (true) with a break; HLIL puts the break path's
+    // close behind the loop
+    static void twrLoopBreak(java.io.File f) throws java.io.IOException {
+        while (true) {
+            try (java.io.FileReader r = new java.io.FileReader(f)) {
+                if (r.read() < 0) {
+                    break;
+                }
+                work(1);
+            }
+        }
+    }
+
+    static final Object lock = new Object();
+    static Throwable failure;
+    static final java.util.concurrent.atomic.AtomicInteger pending = new java.util.concurrent.atomic.AtomicInteger();
+
+    // jvm-116: a finally around a catch whose body is a synchronized block (felix ResolverImpl$EnhancedExecutor$1,
+    // there from the Eclipse compiler); the synchronized block's cleanup handler lies in the finally's range
+    static void catchSyncFinally(Runnable r) {
+        try {
+            r.run();
+        } catch (Throwable t) {
+            synchronized (lock) {
+                if (failure == null) {
+                    failure = t;
+                }
+            }
+        } finally {
+            if (pending.decrementAndGet() == 0) {
+                synchronized (lock) {
+                    lock.notifyAll();
+                }
+            }
+        }
+    }
+
+    // jvm-116: the same pieces apart -- a finally that is one if (HLIL nests its handler in the catch's), with a
+    // synchronized block in it (its cleanup labels move with the finally), and a finally that is only one
+    static void catchFinallyIf(Runnable r) {
+        try {
+            r.run();
+        } catch (Throwable t) {
+            work(1);
+        } finally {
+            if (pending.decrementAndGet() == 0) {
+                work(3);
+            }
+        }
+    }
+
+    static void catchFinallyIfSync(Runnable r) {
+        try {
+            r.run();
+        } catch (Throwable t) {
+            work(1);
+        } finally {
+            if (pending.decrementAndGet() == 0) {
+                synchronized (lock) {
+                    lock.notifyAll();
+                }
+            }
+        }
+    }
+
+    static void catchFinallySync(Runnable r) {
+        try {
+            r.run();
+        } catch (Throwable t) {
+            work(1);
+        } finally {
+            synchronized (lock) {
+                lock.notifyAll();
+            }
+        }
+    }
 }

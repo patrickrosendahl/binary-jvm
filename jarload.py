@@ -209,6 +209,49 @@ def unpack_nested_jar(outer_jar, entry, dest_root=None):
     return written, nested, unsafe
 
 
+_nested_cache = {}
+
+
+def _nested_entries(jar_path):
+    """the nested .jar entry names of jar_path ([] if unreadable), cached per file + mtime"""
+    try:
+        key = (jar_path, os.path.getmtime(jar_path))
+    except OSError:
+        return []
+    if key not in _nested_cache:
+        try:
+            with zipfile.ZipFile(jar_path) as zf:
+                _nested_cache[key] = classify_names(zf.namelist())[1]
+        except (OSError, zipfile.BadZipFile):
+            _nested_cache[key] = []
+    return _nested_cache[key]
+
+
+def jar_tree(root):
+    """(outer, nested dirs) when root is an unpacked jar foo/ (beside foo.jar) or one of the directories its
+    nested jars were unpacked to (foo/lib/bar/), else None"""
+    root = os.path.abspath(root)
+    outer = root
+    while not os.path.isfile(outer + ".jar"):
+        parent = os.path.dirname(outer)
+        if parent == outer:
+            return None
+        outer = parent
+    nested = [nested_unpack_dir(outer + ".jar", e, outer) for e in _nested_entries(outer + ".jar")]
+    nested = [d for d in nested if d and os.path.isdir(d)]
+    return (outer, nested) if root == outer or root in nested else None
+
+
+def class_roots(root):
+    """the package roots to look for another class in, root first: with jar_tree, the outer jar's and every
+    unpacked nested jar's directory (jvm-120)"""
+    root = os.path.abspath(root)
+    tree = jar_tree(root)
+    if tree is None:
+        return [root]
+    return [root] + [d for d in [tree[0]] + tree[1] if d != root]
+
+
 def classes_in(dest):
     """(binary name, absolute path) of every .class under an unpacked jar directory"""
     dest = os.path.abspath(dest)
@@ -536,6 +579,9 @@ def open_class_in_same_tree(bv):
     if not root or not os.path.isdir(root):
         log_error("Open class: this file is not inside an unpacked JAR directory")
         return
+    tree = jar_tree(root)
+    if tree:
+        root = tree[0]  # from a nested jar's class too: the whole outer tree (jvm-120)
     found = classes_in(root)
     binary = manifest_main_class(root)
     match = find_main_class(found, binary) if binary else None
