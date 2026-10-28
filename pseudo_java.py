@@ -4956,14 +4956,22 @@ if _HAVE_BN:
                 return False
             return True
 
-        def tail_is_hidden(self, body, idx, plan):
+        def tail_is_hidden(self, body, idx, plan, handlers=()):
             """rest_hidden, but javac's finally copies count as hidden (they drop when printed) and so
             does a final valueless `return`: the shape a method ends in when its last statement is a
             try whose catch handlers run the finally before completing the method (jvm-86). A single
-            pass: anything printable after the return still fails the check"""
-            for k in range(idx + 1, len(body)):
+            pass: anything printable after the return still fails the check. handlers: the try's (pc, type)
+            clauses -- their code, printed as the clauses, is no statement after the try (jvm-122)"""
+            covered = set()
+            for h, _ in handlers:
+                for r in self.handler_region(h) or []:
+                    covered.update(i.expr_index for i in _walk(r))
+            k = idx
+            while k + 1 < len(body):
+                k += 1
                 s = body[k]
-                if k in plan["skip"] or (s.expr_index in self.consumed and s.expr_index not in plan.get("own", ())):
+                if k in plan["skip"] or (s.expr_index in self.consumed and s.expr_index not in plan.get("own", ())) or \
+                        (s.instr if isinstance(s, _ExcBranch) else s).expr_index in covered:
                     continue
                 if isinstance(s, _ExcBranch):
                     if s.branch.expr_index in self.consumed or self.exc_rest_returns(s, plan):
@@ -4972,8 +4980,10 @@ if _HAVE_BN:
                     if cls[0] in ('hide', 'rethrow') or (cls[0] == 'handler' and cls[1] in self.placed_handlers):
                         continue
                     return False
-                if self.finally_copy_len(body, k, plan) is not None:
-                    continue  # an inline copy of a finally, dropped when this list prints
+                n = self.finally_copy_len(body, k, plan)
+                if n is not None:
+                    k += max(n, 1) - 1  # an inline copy of a finally, dropped when this list prints (all of it)
+                    continue
                 if s.operation == Op.HLIL_RET and \
                         (len(s.src) == 0 or (self.returns_void and not self.void_return_call(s))):
                     continue  # the implicit return of a method ending in this try
@@ -6108,7 +6118,7 @@ if _HAVE_BN:
             # a catch body's trailing valueless return is javac's completion of the method when this
             # try ends it: the handler runs the finally, then returns (jvm-86)
             self._tail_ret_hide.append(bool(plan.get("root")) and self._loop_depth == 0 and
-                                       self.tail_is_hidden(body, last, plan))
+                                       self.tail_is_hidden(body, last, plan, handlers))
             try:
                 for hpc, ctype in clauses or handlers:  # an empty finally next to a catch prints nothing
                     tokens.scope_continuation(False)

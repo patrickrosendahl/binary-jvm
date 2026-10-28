@@ -53,9 +53,9 @@ CHECKS = {
     "catchFinallyIfSync": (["work(1);\n} finally {\nif (Shapes.pending.decrementAndGet() == 0) {"
                             "\nsynchronized (Shapes.lock) {\nShapes.lock.notifyAll();\n}\n}\n}\n}"],
                            ["on exception", "!= 0", "throw"]),
-    # (the catch's `return;` before the method end is jvm-119's redundant return)
-    "catchFinallySync": (["work(1);", "} finally {\nsynchronized (Shapes.lock) {\n"
-                          "Shapes.lock.notifyAll();\n}\n}\n}"], ["synchronized (Shapes.lock) {\n}"]),
+    # jvm-122: no `return;` ending the catch body (the finally copy after it and the method's end are implicit)
+    "catchFinallySync": (["work(1);\n} finally {\nsynchronized (Shapes.lock) {\n"
+                          "Shapes.lock.notifyAll();\n}\n}\n}"], ["synchronized (Shapes.lock) {\n}", "return;"]),
 }
 pj = sys.modules[PKG + ".pseudo_java"]
 vt = b.BinaryViewType[sys.modules[PKG + ".constants"].VIEW_NAME]

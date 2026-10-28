@@ -48,7 +48,9 @@ nested catch/finally ranges merged) -> suite 6175, mdg 2013, compare_all 251/251
 `result` gives way to the LVT name of the slot javac stores the value into: TWR resources print as `scanner`), jvm-117
 (`T x; if (c) x = a; else x = b;` HLIL joined behind the resource close + `return x` -> `return c ? a : b;`), jvm-119
 (javac's jump past the handlers to a void method's end: no `return;` ending a try body or after a loop that ends the
-method, no `/* on exception */ { return; }` after the catch; `ends_method` plan flag) -> suite 6160, mdg 2010. Open: jvm-92 rest (AssertionError thrown in a try range), jvm-99 (unreachable finally, test4/5, and
+method, no `/* on exception */ { return; }` after the catch; `ends_method` plan flag) -> suite 6160, mdg 2010; jvm-122
+(no `return;` ending a catch body when the try ends the method: tail_is_hidden skips a whole finally copy and the
+try's handler code) -> suite 6159. Open: jvm-92 rest (AssertionError thrown in a try range), jvm-99 (unreachable finally, test4/5, and
 loopInFinally from jvm-90: all paths end in an endless loop), jvm-83 rest left on purpose (testFinallyNested; Vineflower fails too). Under load BN can still hit its analysis time limit (`analysis skipped` in a
 dump: redump with RESUME=1). jvm-15 waits for Patrick's GUI
 click-through (BN restarted 2026-10-14 with the symlinked plugin, so jarload.py is loaded).
