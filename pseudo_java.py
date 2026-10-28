@@ -79,6 +79,7 @@ SWITCH_KEYS = True           # $SwitchMap$..[e.ordinal()] / String hashCode+equa
 SYNTHETIC_ACCESS = True      # Outer.access$002(o, v) -> o.f = v; this.this$0 -> Outer.this in a member class (jvm-44)
 LAMBDAS = True               # invokedynamic LambdaMetafactory -> `x -> body` from the lambda$ method, `Type::m` (jvm-79)
 ANONYMOUS_CLASSES = True     # new Outer$1(this, x) -> new Super(..) { members } from Outer$1.class beside this one (jvm-81)
+NO_ELSE_AFTER_EXIT = True    # if (c) { ..; break; } else { B } -> if (c) { ..; break; } B when the if ends its list (jvm-111)
 LAMBDA_FACTORIES = ("java/lang/invoke/LambdaMetafactory.metafactory", "java/lang/invoke/LambdaMetafactory.altMetafactory")
 # intrinsics without side effects (reordering them past a call is still not allowed: they read memory)
 PURE_INTRINSICS = {"getfield", "arraylength", "checkcast", "instanceof", "new", "newarray", "anewarray",
@@ -1407,7 +1408,8 @@ if _HAVE_BN:
             self._loop_depth = 0         # >0 while a loop's body is being printed (jvm-85)
             self._tail_ret_hide = []     # try statements whose catch clauses may hide the implicit final return (jvm-86)
             self._loop_pending = False   # the next emit_list is that loop's body list
-            self._tail_blocks = set()    # branch blocks of an if that ends a loop body list (copy_end_ok, jvm-89)
+            self._tail_blocks = set()    # branch blocks of an if that ends a loop body / the root list (copy_end_ok)
+            self._no_else = set()        # ifs whose else part prints after them, one level up (jvm-111)
             self._finally_exit = {}      # catch-all handler pc -> 'continue' / 'return' after its try
             self._try_in_loop = {}       # catch-all handler pc -> its try statement is inside a printed loop
             self._finally_clause = False  # printing a `finally { }` body: its rethrow is implicit
@@ -2448,6 +2450,7 @@ if _HAVE_BN:
                 self._var_occ_stmt = {}
                 self._copy_keys = {}
                 self._tail_blocks = set()
+                self._no_else = set()
                 for text in self.unreachable_tries():
                     self.note(tokens, text)
                     tokens.new_line()
@@ -2523,11 +2526,12 @@ if _HAVE_BN:
             # or a handler, and not a list that merely falls through to following statements
             plan["copy_end_ok"] = not own and (is_root or self._loop_pending or
                                                block is not None and block.expr_index in self._tail_blocks)
-            if plan["copy_end_ok"] and not is_root:
+            if plan["copy_end_ok"]:
                 # the branches of a trailing if end where this list ends: before the loop's implicit continue
-                # (TestSynchronizedLoop.test12, jvm-89)
+                # (TestSynchronizedLoop.test12, jvm-89) or the method's implicit return (jvm-112)
                 last = next((x for x in reversed(body) if not isinstance(x, _ExcBranch) and
-                             not self.hidden_item(x) and not self.is_exc_plumbing(x)), None)
+                             not self.hidden_item(x) and not self.is_exc_plumbing(x) and
+                             not self.implicit_return(x, plan)), None)
                 if last is not None and last.operation == Op.HLIL_IF and last.as_ast:
                     self._tail_blocks.update(b.expr_index for b in (last.true, last.false) if b is not None)
             plan["list_kind"] = None if own else 'root' if is_root else 'loop' if self._loop_pending else None
@@ -4697,8 +4701,16 @@ if _HAVE_BN:
                 if real_loop:
                     self._loop_depth += 1     # a copy ending the body is the loop's implicit continue
                     self._loop_pending = True
+                lift = self.else_after_exit(body, idx, plan)
+                if lift:
+                    self._no_else.add(s.expr_index)
                 try:
                     self.perform_get_expr_text(s, tokens, settings, P.TopLevelOperatorPrecedence, True)
+                    if lift:
+                        tokens.new_line()
+                        tokens.scope_separator()
+                        self.emit_list(self.flatten(self.stmts_of(s.false)), tokens, settings, s.false)
+                        return True
                 finally:
                     if real_loop:
                         self._loop_depth -= 1
@@ -4707,6 +4719,40 @@ if _HAVE_BN:
                     tokens.append_semicolon()
             tokens.new_line()
             return has_blocks
+
+        def else_after_exit(self, body, idx, plan):
+            """body[idx] is `if (c) { ..; break; } else { B }` ending its list: B prints after the if, one level up
+            (TestSynchronizedLoop.test12; jvm-111). Only at the list's end, so B's declarations meet no later ones;
+            the then-branch must end in a printed exit (not a goto, a substituted break or a hidden void return)"""
+            s = body[idx]
+            if not NO_ELSE_AFTER_EXIT or isinstance(s, _ExcBranch) or s.operation != Op.HLIL_IF or not s.as_ast or \
+                    s.false is None or s.false.operation in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE) or \
+                    self.exc_if_parts(s) is not None or self.function.is_instruction_collapsed(s, 1):
+                return False
+            items = [x for x in self.flatten(self.stmts_of(s.true)) if not isinstance(x, _ExcBranch) and
+                     not self.hidden_item(x) and not self.is_exc_plumbing(x)]
+            if not items:
+                return False
+            last = items[-1]
+            if last.operation == Op.HLIL_BREAK and last.expr_index in self.break_subst:
+                return False
+            if last.operation == Op.HLIL_RET and not last.src and self._tail_ret_hide and self._tail_ret_hide[-1]:
+                return False
+            if not (last.operation in (Op.HLIL_RET, Op.HLIL_BREAK, Op.HLIL_CONTINUE) or self.is_rethrow(last) or
+                    last.operation == Op.HLIL_INTRINSIC and last.intrinsic.name == "athrow" or
+                    last.expr_index in self.release_breaks):
+                return False
+            end = len(body)  # (a jump to the join after it declares nothing B's names could meet: Setup)
+            while end > idx + 1 and (self.implicit_return(body[end - 1], plan) or
+                                     not isinstance(body[end - 1], _ExcBranch) and
+                                     body[end - 1].operation in (Op.HLIL_GOTO, Op.HLIL_LABEL)):
+                end -= 1
+            return self.rest_hidden(body[:end], idx, plan)
+
+        def implicit_return(self, x, plan):
+            """x is the root list's `return;` the method's end implies (emit_statement drops it there)"""
+            return bool(plan.get("root")) and not isinstance(x, _ExcBranch) and x.operation == Op.HLIL_RET and \
+                (len(x.src) == 0 or self.returns_void and not self.void_return_call(x))
 
         def rest_hidden(self, body, idx, plan):
             """nothing after body[idx] is printed (handler code moved to a catch, plumbing, ...)"""
@@ -6808,7 +6854,7 @@ if _HAVE_BN:
                 if not instr.as_ast:
                     return
                 self._scoped(instr, instr.true, tokens, settings)
-                chain = instr.false
+                chain = instr.false if instr.expr_index not in self._no_else else None
                 n = 1
                 while chain is not None and chain.operation not in (Op.HLIL_NOP, Op.HLIL_UNREACHABLE):
                     tokens.scope_continuation(False)

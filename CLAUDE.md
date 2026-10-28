@@ -123,7 +123,7 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
    **Pseudo Java gates** (after any `pseudo_java.py` change; wiki `vineflower-comparison.md`):
    `python3 tests/vineflower_compare.py --decompile` (once: Vineflower, the decompiler Recaf uses, local fork),
  `tests/bn_dump_all.sh pj [jvm_devN]` (4 parallel batches, ~3 min; jvm-74), then
- `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=1 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0 skipped=0 ref_zero=0 double_casts=0 type_mismatch=0 if_else_assign=0 stmts=2014`
+ `python3 tests/vineflower_compare.py --max temps=0 gotos=0 labels=0 sync_comments=0 offset_stores=0 while_true=1 plumbing=0 dead_code=0 leaked_catch_var=0 lost_calls=0 lost_strings=0 skipped=0 ref_zero=0 double_casts=0 type_mismatch=0 if_else_assign=0 stmts=2013`
  (exit 1 on a regression; `stmts` is the statement count, lower it as tickets land; `--excess N` lists where the
  extra statements against Vineflower come from); and `tests/bn_pseudo_java_compare_all.sh [jvm_devN]` (~18-25 min):
  every mdg method with an exception table against HLIL -- must stay 251/251 (~15 min on an idle machine); the
@@ -137,6 +137,9 @@ port** (and lifter rewrite) of `Pusty/BinaryNinjaPlugins`'s `binary-jvm` (0BSD).
  (declarations against Vineflower; the 2 imports are types Vineflower names for locals we fold away), and
  `bnrun --parallel --timeout 300 tests/bn_anon_check.py` (anonymous classes at their `new`, javac 8 + 21; jvm-69;
  exits non-zero on failure, as do the other bnrun check scripts -- jvm-94).
+ **Statement shapes** (synthetic, seconds): `bnrun --parallel --timeout 300 tests/bn_shapes_check.py` (prepend
+ `DEV_PKG = "jvm_devN"`) checks `tests/synthetic/shapes` (jvmtest.Shapes: finally copies in trailing ifs, no else after
+ an exit, a lambda in a condition; jvm-111/112) against expected / forbidden snippets; add a method there with each shape fix.
  **Stamps / RESUME / REF** (`tests/gate_state.py`): every dump output carries a stamp (plugin / dump-script / class
  hashes, `<dump>/.stamps.json`; jvm-105); the compare scripts print `WARNING` lines for outputs that are unstamped,
  from several plugin states or not from the working tree (an old `jvm_devN`, edits since the dev load) -- rerun the
