@@ -119,6 +119,16 @@ public class Shapes {
         }
     }
 
+    // jvm-93: javac's null check of a bound method reference (o.getClass() in Java 8) inside a try: the call's
+    // exception test sits between it and the statement creating o::toString
+    static java.util.function.Supplier<String> boundRefInTry(Object o) {
+        try {
+            return o::toString;
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
     // jvm-93: a lambda in an if condition capturing a computed value (BN propagates it into the invokedynamic)
     static void lambdaInCondition(java.util.List<Integer> list) {
         int bottom = list.size() * 2;

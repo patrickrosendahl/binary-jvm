@@ -22,9 +22,11 @@ CHECKS = {
     "throwNoElse": (['throw new IllegalArgumentException("negative");\n}'], ["} else {"]),
     "syncLoopElse": (["break;\n}\ni--;"], ["} else {"]),
     "loopReturnElse": (["while (i > 0) {"], ["} else {"]),
-    # jvm-93: the computed capture declared before the if, the lambda inline
-    # (the capture prints as `n`, not its LVT name `bottom`: noted on jvm-93)
-    "lambdaInCondition": (["= list.size() * 2;", "anyMatch(x -> x > "], ["invokedynamic"]),
+    # jvm-93: the lambda inline in the if; its capture, a stack temporary HLIL kept instead of the local, is named
+    # after that local
+    "lambdaInCondition": (["int bottom = list.size() * 2;", "anyMatch(x -> x > bottom)"], ["invokedynamic"]),
+    # jvm-93: the bound reference's null check is part of `o::toString`, also inside a try
+    "boundRefInTry": (["o::toString;"], ["getClass", "requireNonNull", "invokedynamic"]),
 }
 pj = sys.modules[PKG + ".pseudo_java"]
 vt = b.BinaryViewType[sys.modules[PKG + ".constants"].VIEW_NAME]

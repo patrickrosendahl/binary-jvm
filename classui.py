@@ -556,8 +556,10 @@ def _render_class(bv, nested=None, refs=None, cache=None):
         init = " = " + value if value else ""
         out.append(INDENT + " ".join(words) + init + ";" +
                    ("  // synthetic" if f["access_flags"] & ACC_SYNTHETIC else ""))
-    # javac's lambda bodies print at their invokedynamic (jvm-79); kept when a lambda there could not be inlined
-    lambdas_inlined = not any("/* invokedynamic */" in l for b in bodies.values() for l in b)
+    # javac's lambda bodies print at their invokedynamic (jvm-79); kept when a lambda there could not be inlined: the
+    # fallback names its lambda$ method (`/* invokedynamic: lambda$main$0 */`, jvm-93)
+    kept_lambdas = {m.group(1) for b in bodies.values() for l in b
+                    for m in re.finditer(r"/\* invokedynamic: (lambda\$[\w$]+) \*/", l)}
     own_data = None
     try:
         base = class_dir(bv, info)
@@ -568,7 +570,7 @@ def _render_class(bv, nested=None, refs=None, cache=None):
         pass
     inherited = supertype_methods(bv, info)
     for m in info["methods"]:
-        if lambdas_inlined and m["name"].startswith("lambda$") and m["access_flags"] & ACC_SYNTHETIC:
+        if m["name"].startswith("lambda$") and m["name"] not in kept_lambdas and m["access_flags"] & ACC_SYNTHETIC:
             continue
         if own_data and m["name"].startswith("access$") and m["access_flags"] & ACC_SYNTHETIC and \
                 accessor_shape(own_data, m["name"], m["descriptor"]) is not None:

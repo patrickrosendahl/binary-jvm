@@ -443,6 +443,8 @@ _ACCESSORS = {
     ("getstatic", "R"): ("get", True, None),
     ("L0", "L1", "DUPX", "putfield", "R"): ("put", False, None),
     ("L0", "DUP", "putstatic", "R"): ("put", True, None),
+    ("L0", "L1", "putfield", "R"): ("put", False, None),  # the Eclipse compiler's void setters (felix ResolverImpl;
+    ("L0", "putstatic", "R"): ("put", True, None),        # jvm-93): `p0.f = p1` without javac's value
     ("L0", "DUP", "getfield", "DUPX", "ONE", "OP", "putfield", "R"): ("inc", False, False),
     ("L0", "DUP", "getfield", "ONE", "OP", "DUPX", "putfield", "R"): ("inc", False, True),
     ("getstatic", "DUP", "ONE", "OP", "putstatic", "R"): ("inc", True, False),
@@ -7262,11 +7264,40 @@ if _HAVE_BN:
             if len(defs) >= 2 and any(d.src.operation == Op.HLIL_CONST for d in defs) and \
                     any(d.src.operation in (Op.HLIL_ADD, Op.HLIL_SUB) and self.refs(d.src, var) for d in defs):
                 return "i"
+            stored = self.stored_local_name(defs)
+            if stored:
+                return stored
             for d in defs:
                 hint = self.expr_name_hint(d.src)
                 if hint:
                     return hint
             return name_from_type(self.named_type(self.defs_java_type(var) or java_type_of(var.type)))
+
+        def stored_local_name(self, defs):
+            """the LocalVariableTable name of the local javac stores a temporary's value into right after computing it:
+            `int bottom = list.size() * 2;` whose istore HLIL dropped, keeping the stack temporary (the value then only
+            feeds a lambda's capture; jvm-93)"""
+            m = self.info.method_at(self.function.start)
+            found = self.info.method_named(m[0], m[1]) if m is not None else None
+            if not found or not found[2]:
+                return None
+            from .opcodes import decode_instruction
+            view, base = self.function.view, self.function.start
+            for d in defs:
+                cur = decode_instruction(view.read(d.address, 8), d.address)
+                if cur[0] is None:
+                    continue
+                at = d.address + cur[2]
+                st = decode_instruction(view.read(at, 8), at)
+                store = re.match(r"[ilfda]store(?:_(\d))?$", st[0] or "")
+                if store is None:
+                    continue
+                slot = int(store.group(1)) if store.group(1) is not None else st[3]
+                after = at + st[2] - base
+                names = {n for start, _, n, _, s in found[2] if s == slot and start == after and n}
+                if len(names) == 1:
+                    return java_var_name(names.pop())
+            return None
 
         def named_type(self, t):
             """an anonymous class (Outer$1) is named after its supertype: `new ArrayList<String>() {..}` -> arrayList"""
@@ -7708,7 +7739,9 @@ if _HAVE_BN:
                 if LAMBDAS and self.emit_lambda(instr, idx, args, tokens, settings, precedence):
                     return
                 tokens.append(_tok(TT.CodeSymbolToken, name, value=slot))
-                self.annotation(tokens, " /* invokedynamic */")
+                impl = self.info.lambda_impl(idx)  # the lambda$ method stays in the class view (jvm-93)
+                self.annotation(tokens, " /* invokedynamic: %s */" % impl[2] if impl and impl[2].startswith("lambda$")
+                                else " /* invokedynamic */")
                 self.args(tokens, settings, args)
                 return
             if SYNTHETIC_ACCESS and recv is None and desc and name.startswith("access$") and \
@@ -8431,7 +8464,12 @@ if _HAVE_BN:
             """javac's `Objects.requireNonNull(x)` (Java 9+) / `x.getClass()` (8) right before a statement that
             creates the bound method reference `x::m`: part of the `x::m` expression"""
             s = self.stmt_call(body[idx])
-            if s.operation != Op.HLIL_CALL or idx + 1 >= len(body) or isinstance(body[idx + 1], _ExcBranch):
+            # the next printed statement: inside a try the call's exception test comes first (jvm-93)
+            nxt = idx + 1
+            while nxt < len(body) and (isinstance(body[nxt], _ExcBranch) or self.hidden_item(body[nxt]) or
+                                       self.is_exc_plumbing(body[nxt])):
+                nxt += 1
+            if s.operation != Op.HLIL_CALL or nxt >= len(body):
                 return False
             shape = self.call_shape(s)
             if shape is None:
@@ -8442,7 +8480,7 @@ if _HAVE_BN:
                 x = shape[4]
             else:
                 return False
-            for call in _walk(body[idx + 1]):
+            for call in _walk(body[nxt]):
                 if call.operation != Op.HLIL_CALL:
                     continue
                 c = self.call_shape(call)
