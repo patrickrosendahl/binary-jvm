@@ -633,6 +633,7 @@ TYPE_VAR_NAMES = {"String": "str", "Object": "obj", "int": "n", "long": "n", "sh
                   "char": "c", "boolean": "flag", "float": "f", "double": "d", "Class": "cls",
                   "StringBuffer": "sb", "StringBuilder": "sb", "Integer": "n", "Long": "n", "Boolean": "flag"}
 
+CAPTURE_OPEN, CAPTURE_CLOSE = 0x4A564D43, 0x4A564D44  # markers around a captured value in a lambda body (jvm-114)
 SYNTHETIC_NAME = re.compile(r"^(access|this|lambda)\$|^\$|\$SwitchMap\$")  # never a local's name (jvm-114)
 
 
@@ -7391,7 +7392,10 @@ if _HAVE_BN:
             captures = getattr(self, "captures", None)
             if captures and var in captures:  # a lambda$ parameter holding a captured value (jvm-79)
                 outer, value, settings = captures[var]
+                # the value's tokens are the outer method's: bracketed so inert_lambda_tokens keeps them (jvm-114)
+                tokens.append(_tok(TT.TextToken, "", value=CAPTURE_OPEN))
                 outer.perform_get_expr_text(value, tokens, settings, P.MemberAndFunctionOperatorPrecedence)
+                tokens.append(_tok(TT.TextToken, "", value=CAPTURE_CLOSE))
                 return
             if self.this_var is not None and var == self.this_var:
                 tokens.append(_tok(TT.KeywordToken, "this"))
@@ -8605,7 +8609,7 @@ if _HAVE_BN:
             finally:
                 active.discard(key)
             body = []
-            for line in lines:
+            for line in inert_lambda_tokens(lines):
                 toks = [t for t in line if t.type != TT.AddressSeparatorToken]
                 if toks:
                     body.append(toks)
@@ -9123,6 +9127,33 @@ if _HAVE_BN:
                 out.append(InstructionTextToken._from_core_struct(lines[i].tokens, lines[i].count))
             core.BNFreeDisassemblyTextLines(lines, count.value)
         return out
+    def inert_lambda_tokens(lines):
+        """a lambda$ method's lines, printed inside the method that creates the lambda: their tokens refer to the
+        lambda$ function (its instructions, IL expressions, variables), so click / rename there would act on the
+        wrong function. Those references are cleared -- the body is inert, renaming happens in the lambda$
+        method; pool symbols (calls, fields) are view-wide and stay. A captured value's tokens, between the
+        CAPTURE_OPEN / CAPTURE_CLOSE markers, are the outer method's own and stay as they are (jvm-114)"""
+        from binaryninja.function import InstructionTextToken
+        local_types = (TT.LocalVariableToken, TT.ArgumentNameToken)
+        depth, out = 0, []
+        for line in lines:
+            toks = []
+            for t in line:
+                if t.type == TT.TextToken and not t.text and t.value in (CAPTURE_OPEN, CAPTURE_CLOSE):
+                    depth += 1 if t.value == CAPTURE_OPEN else -1
+                    continue
+                if depth > 0:
+                    toks.append(t)
+                    continue
+                own = t.type in local_types or t.context in (InstructionTextTokenContext.LocalVariableTokenContext,
+                                                             InstructionTextTokenContext.InstructionAddressTokenContext,
+                                                             InstructionTextTokenContext.ILInstructionIndexTokenContext)
+                toks.append(InstructionTextToken(t.type, t.text, 0 if own else t.value, t.size, 0xffffffff,
+                                                 InstructionTextTokenContext.NoTokenContext if own else t.context,
+                                                 0, t.confidence, t.typeNames, t.width, 0xffffffffffffffff))
+            out.append(toks)
+        return out
+
     _lambda_local = threading.local()
 
     def _lambda_active():

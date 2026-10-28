@@ -56,6 +56,24 @@ for f in sorted(v.functions, key=lambda f: f.start):
         print("PASS %s" % name)
         if SHOW:
             print(text)
+# jvm-114: a lambda body printed into its method is inert -- its tokens carry no variable of the lambda$ function --
+# while a captured value's tokens are the method's own (rename works there)
+for f in v.functions:
+    if f.name.split("(")[0].split(".")[-1] != "lambdaInCondition":
+        continue
+    LV = b.InstructionTextTokenContext.LocalVariableTokenContext
+    for line in pj.linear_line_tokens(pj.representation(f), f.hlil.root, None):
+        texts = [t.text for t in line]
+        if " -> " not in texts:
+            continue
+        arrow = texts.index(" -> ")
+        body = [t for t in line[arrow - 1:] if t.type == b.InstructionTextTokenType.LocalVariableToken]
+        own = [t.text for t in body if t.context == LV and t.value]
+        if own != ["bottom"]:
+            failed += 1
+            print("FAIL lambda tokens: locals with a variable identity %r, expected only the capture ['bottom']" % own)
+        else:
+            print("PASS lambda tokens")
 for name in sorted(set(CHECKS) - seen):
     failed += 1
     print("FAIL %s: method not found" % name)
