@@ -27,6 +27,9 @@ CHECKS = {
     "lambdaInCondition": (["int bottom = list.size() * 2;", "anyMatch(x -> x > bottom)"], ["invokedynamic"]),
     # jvm-93: the bound reference's null check is part of `o::toString`, also inside a try
     "boundRefInTry": (["o::toString;"], ["getClass", "requireNonNull", "invokedynamic"]),
+    # jvm-92: an assert whose AssertionError is thrown inside a try range (to the handler, not __propagate)
+    "assertInTry": (['assert i > 0 : "positive";\nwork(i);'], ["AssertionError", "goto", "__propagate", "exc"]),
+    "assertInTryAll": (["assert i > 0;\nwork(i);"], ["AssertionError", "goto", "__propagate", "exc"]),
 }
 pj = sys.modules[PKG + ".pseudo_java"]
 vt = b.BinaryViewType[sys.modules[PKG + ".constants"].VIEW_NAME]

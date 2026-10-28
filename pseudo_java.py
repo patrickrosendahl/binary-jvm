@@ -633,12 +633,16 @@ TYPE_VAR_NAMES = {"String": "str", "Object": "obj", "int": "n", "long": "n", "sh
                   "char": "c", "boolean": "flag", "float": "f", "double": "d", "Class": "cls",
                   "StringBuffer": "sb", "StringBuilder": "sb", "Integer": "n", "Long": "n", "Boolean": "flag"}
 
+SYNTHETIC_NAME = re.compile(r"^(access|this|lambda)\$|^\$|\$SwitchMap\$")  # never a local's name (jvm-114)
+
 
 def name_from_method(method):
     """a local's name from the method that produced it: getValue -> value, isOpen -> open, toLowerCase ->
     lowerCase, nextElement -> element, elementAt -> element; None when nothing sensible is left"""
-    if not method or method.startswith("<") or len(method) < 2:
+    if not method or method.startswith("<") or len(method) < 2 or SYNTHETIC_NAME.search(method):
         return None
+    if method.startswith("val$"):  # a captured local's copy in an anonymous / local class
+        method = method[4:]
     m = re.match(r"^(get|is|has|to|create|new|read|next|find|load|fetch|build|make|parse|as)([A-Z0-9_$].*)$", method)
     name = m.group(2) if m else method
     if name.endswith("At") and len(name) > 2:
@@ -5472,15 +5476,17 @@ if _HAVE_BN:
                     c.left.operation == Op.HLIL_VAR and c.left.var == r):
                 return None
             inner = self.twr_real(self.flatten(self.stmts_of(body[j].true)))
-            if eq:  # if (r == null) <exit>; r.close(); [<exit>]
-                if len(inner) != 1 or inner[0].operation != Op.HLIL_RET:
+            if eq:  # if (r == null) <exit>; r.close(); [<exit>]  (in a loop the exit is a continue / break)
+                exits = (Op.HLIL_RET, Op.HLIL_CONTINUE, Op.HLIL_BREAK)
+                if len(inner) != 1 or inner[0].operation not in exits:
                     return None
                 k = skip_plumbing(j + 1)
                 if k > hi or not self.twr_is_close(body[k], r):
                     return None
                 end = k
                 k2 = skip_plumbing(k + 1)
-                if k2 <= hi and body[k2].operation == Op.HLIL_RET and len(body[k2].src) == len(inner[0].src):
+                if k2 <= hi and body[k2].operation == inner[0].operation and (
+                        inner[0].operation != Op.HLIL_RET or len(body[k2].src) == len(inner[0].src)):
                     end = k2  # the close's fall-through exit mirrors the guarded one
                 return list(range(j0, end + 1))
             if len(inner) == 1 and self.twr_is_close(inner[0], r):
@@ -5709,9 +5715,10 @@ if _HAVE_BN:
                 inner = open_ | {(group[0], group[1])}
                 work.extend((a, z, g, inner) for a, z, g in self._twr_runs_of(body, first, last, inner))
 
-        def emit_twr(self, body, first, last, group, plan, twr, tokens, settings, block):
+        def emit_twr(self, body, first, last, group, plan, twr, tokens, settings, block, merged=False):
             """`try (R r = e) { ... }`: the resource assignment moves into the header, the Throwable close
-            handler and the guarded close after the try disappear"""
+            handler and the guarded close after the try disappear. merged: the caller prints catch clauses
+            after the block (twr_merge)"""
             self.active_tries.append(group)
             for k in range(first, last + 1):  # a variable used after the try is declared before it
                 s = body[k]
@@ -5750,14 +5757,50 @@ if _HAVE_BN:
                     tokens.end_scope(ScopeType.BlockScopeType)
             finally:
                 self.active_tries.pop()
-            tokens.finalize_scope()
-            tokens.new_line()
+            if not merged:
+                tokens.finalize_scope()
+                tokens.new_line()
+
+        def twr_merge(self, body, first, last, group, plan):
+            """`try { try (R r = e) { .. } } catch (E x) { .. }` -- a try whose only statement is a
+            try-with-resources (its resource init included) and that has catch clauses only -- is javac's
+            `try (R r = e) { .. } catch (E x) { .. }` (jvm-83): (first, last, group, twr) of the inner run, else None"""
+            if not TRY_WITH_RESOURCES or not group[2] or not all(t for _, t in group[2]) or not plan.get("twr"):
+                return None
+            active = {(g[0], g[1]) for g in self.active_tries} | self.placed | {(group[0], group[1])}
+            runs = [r for r in self._twr_runs_of(body, first, last, active)
+                    if (r[0], r[2][0], r[2][1]) in plan["twr"]]
+            if len(runs) != 1:
+                return None
+            a, z, g = runs[0]
+            twr = plan["twr"][(a, g[0], g[1])]
+            done = plan.get("done", set())
+            for k in list(range(first, a)) + list(range(z + 1, last + 1)):
+                x = body[k]
+                if k in plan["skip"] or k in done or k == twr["ret"] or isinstance(x, _ExcBranch) or \
+                        self.is_exc_plumbing(x) or x.operation in (Op.HLIL_LABEL, Op.HLIL_NOP):
+                    continue
+                return None
+            return a, z, g, twr
 
         def emit_try(self, body, first, last, group, plan, tokens, settings, block):
             start, end, handlers = group
             twr = plan.get("twr", {}).get((first, start, end))
             if twr is not None:
-                self.emit_twr(body, first, last, group, plan, twr, tokens, settings, block)
+                merged = (first, start, end) in self.__dict__.setdefault("_twr_merged", set())
+                self.emit_twr(body, first, last, group, plan, twr, tokens, settings, block, merged=merged)
+                return
+            merge = self.twr_merge(body, first, last, group, plan)
+            if merge is not None:
+                # the range prints only the try-with-resources, whose block the catches continue
+                self.__dict__.setdefault("_twr_merged", set()).add((merge[0], merge[2][0], merge[2][1]))
+                self.active_tries.append(group)
+                try:
+                    self.emit_range(body, first, last, plan, tokens, settings, block)
+                finally:
+                    self.active_tries.pop()
+                self._try_tail_loops.append(None)
+                self.emit_try_clauses(body, first, last, handlers, plan, tokens, settings)
                 return
             self.active_tries.append(group)
             self.plan_finally_exit(body, last, group, plan)
@@ -5807,6 +5850,10 @@ if _HAVE_BN:
                 tokens.end_scope(ScopeType.BlockScopeType)
                 self.active_tries.pop()
                 plan["copy_end_ok"] = saved_end_ok
+            self.emit_try_clauses(body, first, last, handlers, plan, tokens, settings)
+
+        def emit_try_clauses(self, body, first, last, handlers, plan, tokens, settings):
+            """the catch / finally clauses after a try block (pops the _try_tail_loops entry of the try)"""
             clauses = [(h, t) for h, t in handlers if t or not self.empty_finally(h)]
             for hpc, _ in handlers:
                 self.printed_handlers.add(hpc)
@@ -7329,7 +7376,12 @@ if _HAVE_BN:
                     return "str"
                 shape = self.call_shape(e)
                 if shape is not None:
-                    return name_from_method(shape[2]) or name_from_type(self.expr_java_type(e))
+                    name = shape[2]
+                    if name.startswith("access$") and shape[3]:
+                        # named after the member javac's accessor stands for (jvm-114)
+                        a = self.info.accessor(shape[1], name, shape[3])
+                        name = a["member"][1] if a is not None and a["kind"] in ("get", "call") else None
+                    return name_from_method(name) or name_from_type(self.expr_java_type(e))
             if o in (Op.HLIL_DEREF, Op.HLIL_CONST_PTR, Op.HLIL_IMPORT):
                 m = re.search(r"[./]([A-Za-z_$][\w$]*)\W*$", str(e))
                 return name_from_method(m.group(1)) if m else None
@@ -8115,9 +8167,16 @@ if _HAVE_BN:
             if not items:
                 return None
             last = items[-1]
-            if last.operation != Op.HLIL_INTRINSIC or last.intrinsic.name != "__propagate" or len(last.params) != 1:
+            if last.operation in (Op.HLIL_ASSIGN, Op.HLIL_VAR_INIT):
+                if not self.is_exc_var(self.twr_var(last.dest)):
+                    return None
+                v = self.throw_value(last)  # in a try range: `exc = v; goto handler` (jvm-92)
+                if v is None:
+                    return None
+            elif last.operation != Op.HLIL_INTRINSIC or last.intrinsic.name != "__propagate" or len(last.params) != 1:
                 return None
-            v = last.params[0]
+            else:
+                v = last.params[0]
             if len(items) == 1:
                 call = v  # new folded into its constructor call
                 recv_ok = lambda r: r.operation == Op.HLIL_INTRINSIC and r.intrinsic.name == "new"

@@ -137,4 +137,24 @@ public class Shapes {
         }
         work(2);
     }
+
+    // jvm-92: an assert inside a try range: its AssertionError is thrown to the handler dispatch, not propagated
+    static void assertInTry(int i) {
+        try {
+            assert i > 0 : "positive";
+            work(i);
+        } catch (IllegalStateException e) {
+            work(-1);
+        }
+    }
+
+    // jvm-92: the same under a catch-all, which catches the AssertionError too
+    static void assertInTryAll(int i) {
+        try {
+            assert i > 0;
+            work(i);
+        } catch (Throwable t) {
+            work(-1);
+        }
+    }
 }
